@@ -1,0 +1,23 @@
+# UI-TARS Desktop preset — DeepInfra OpenAI-compatible API
+# Import via Settings → Import Preset Config → choose this file.
+# Replace YOUR_DEEPINFRA_API_KEY before importing (or edit it after in Settings).
+#
+# Schema: docs/preset.md + apps/ui-tars PresetSchema
+# (vlmProvider / vlmBaseUrl / vlmApiKey / vlmModelName / useResponsesApi / operator / …)
+# No dedicated DeepInfra provider — Hugging Face for UI-TARS-1.5 is the closest label;
+# the real endpoint is whatever you put in vlmBaseUrl.
+
+name: DeepInfra OpenAI-compatible (GLM-5.3-Flash)
+language: en
+vlmProvider: Hugging Face for UI-TARS-1.5
+vlmBaseUrl: https://api.deepinfra.com/v1/openai
+vlmApiKey: YOUR_DEEPINFRA_API_KEY
+vlmModelName: zai-org/GLM-5.3-Flash
+useResponsesApi: false
+operator: Local Computer Operator
+maxLoopCount: 100
+loopIntervalInMs: 1000
+
+# Alternatives (swap vlmModelName only):
+#   Qwen/Qwen2.5-VL-32B-Instruct
+#   zai-org/GLM-5.3-Flash

@@ -1,32 +1,71 @@
-# Hands Application Core Elements
+# Hands
 
-This repository contains the main components you need to stitch together the new Hands application, capable of multi-lane, live computer-use, and agent/voice functionality.
+This repo is a pile of parts to stitch, not a running product yet. These are the elements of the new Hands application. They still need to be wired together. Nothing here starts as a finished app.
 
-## What's included
+## Stitch rule
 
-- **persona/**: The complete Persona mind source code (from sawii-persona). This is the core brain: shared context, lane management, reasoning, history, and all agent mind logic.
-- **sawii_hands.py**: The UI-TARS engine/agent script. Each R-lane runs a copy to execute delegated tasks, browser/computer actions, and interface with tools/APIs.
+Persona stays the single mind: one shared context, one conversation history, one line of thought. It coordinates the lanes.
 
-## How to use
+Each delegated R-lane gets its own engine instance. When the engine has no native sub-agent feature, spawn a new process of `sawii_hands.py` and connect it to that lane.
 
-- **Persona** is run as a server/backend or imported as a module. It manages context, turns, and task routing.
-- Each time Persona delegates to an R-lane, you spawn an instance of **sawii_hands.py** and supply it the needed lane context, endpoint, and API key.
-- All context/interactions are tracked in Persona, and events/results are surfaced there.
+The UI, the voice orb, the phone dialer, and the sketchboards attach around that. Do not rebuild any component. Do not edit Persona mind logic.
 
-## Stitching Notes
+## sawii_hands.py
 
-These elements are separated intentionally—no stitched product is provided yet. Stitching requires:
-- Wiring Persona's lane delegation to spawn `sawii_hands.py` with appropriate arguments.
-- Surfacing UI (voice, dialer, sketchboard, overlays) as components connected to Persona and engine states.
-- Ensuring all context and turns are routed through Persona for shared memory.
+The UI-TARS execution engine. One process instance per R-lane.
 
-## Element Descriptions
+It is configured with a UI-TARS / DeepInfra style preset: an operator URL and an API key. See `presets/ui-tars-deepinfra.yaml`. The key in that file is a placeholder. Put a real key in your own copy when you run it. Do not commit one.
 
-- **persona/**: Core agent mind, memory, logic.
-- **sawii_hands.py**: Engine/worker script for execution, external tooling, computer/browser use.
+The engine does computer and browser tool work. It is the hands, not the mind.
 
-Add any other services (Voice Orb UI, Dialer, Global/Per-lane Sketchboard) as needed to your shell (Tauri/Electron/React/etc) and wire their state to Persona and the appropriate lane or engine worker.
+## persona/
 
----
+A copy of the sawii-persona source. Persona is the one shared mind. It holds shared context, shared conversation history, and the shared line of thought. It coordinates lanes.
 
-**These components are NOT a complete product until stitched together as described above.**
+When it delegates to an R-lane and the engine has no native sub-agent feature, a new instance of `sawii_hands.py` is spawned and connected to that lane.
+
+Key files:
+
+### mind.py
+
+The mind. This is the piece that thinks and coordinates. Leave its logic as it is.
+
+### inference_lanes.py
+
+The R-lane book and delegation. This is where lines of work are tracked and handed off.
+
+### timesense.py
+
+Timestamps and durations. It measures time passed and time spent. It does not invent clocks.
+
+### sketch_graph.py
+
+Sketchboard data: boxes and arrows as data. A global project view and per-lane private boards are intended to be built on this. The boards themselves are not built yet.
+
+### shared_timeline.py
+
+The shared event log. Every lane reads the same ordered stream of conversation and tool events.
+
+## presets/ui-tars-deepinfra.yaml
+
+The UI-TARS preset for a DeepInfra-style OpenAI-compatible endpoint. It names the operator, the base URL, the model, and a placeholder API key (`YOUR_DEEPINFRA_API_KEY`). The original file lives in the sawii-persona repo at `presets/ui-tars-deepinfra.yaml`. This copy is here so the engine can be configured without hunting for it. Replace the placeholder locally when you run the engine. Do not put a real key in this repo.
+
+## Not in this folder
+
+These pieces are part of the product and must be stitched in. They are not copied here. Do not rebuild them. Attach them around Persona and the per-lane engine instances.
+
+### Voice orb
+
+Vocode Web UI: https://github.com/vocodedev/vocode-web
+
+Pulsating orb, waveform, transcript, and mic.
+
+### Phone dialer
+
+CoreUI React dialer: https://github.com/coreui/coreui-free-react-admin-template
+
+### Desktop shell
+
+Tauri wrapping a React UI: https://tauri.app
+
+The shell is the window the other UI pieces sit in. It is not a new app to design from scratch.
