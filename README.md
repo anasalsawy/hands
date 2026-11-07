@@ -1,14 +1,60 @@
 # Hands
 
-This repo is a pile of parts to stitch, not a running product yet. These are the elements of the new Hands application. They still need to be wired together. Nothing here starts as a finished app.
+Desktop app that gives Persona hands on your computer. Persona is the mind; this repo is the body.
 
-## Stitch rule
+## Architecture
+
+```
+                    ┌─────────────────────────┐
+                    │      Persona (mind)      │
+                    │  shared context, history │
+                    │    L (voice) + R (work)  │
+                    └────┬──────────┬──────────┘
+                         │          │
+              ┌──────────┘          └──────────┐
+              ▼                                ▼
+    ┌──────────────────┐            ┌──────────────────┐
+    │  Link adapter    │            │  Link adapter    │
+    │ (hijack or spawn)│            │ (hijack or spawn)│
+    └────────┬─────────┘            └────────┬─────────┘
+             ▼                               ▼
+    ┌──────────────────┐            ┌──────────────────┐
+    │ sawii_hands R1   │            │ sawii_hands R2   │
+    │ (engine instance)│            │ (engine instance)│
+    └──────────────────┘            └──────────────────┘
+```
 
 Persona stays the single mind: one shared context, one conversation history, one line of thought. It coordinates the lanes.
 
-Each delegated R-lane gets its own engine instance. When the engine has no native sub-agent feature, spawn a new process of `sawii_hands.py` and connect it to that lane.
+Each delegated R-lane gets its own engine instance. The **Link** adapter connects Persona to the engine (or any external agent) using one of two strategies:
+
+1. **Hijack** — the agent supports delegation/sub-agents natively (Hermes `delegate_task`, Cursor `Task`, Claude Code `Agent`). Link uses that pathway to inject R-lane work.
+2. **Spawn** — the agent has no delegation. Link launches a new `sawii_hands.py` process per R-lane, connected via WebSocket.
 
 The UI, the voice orb, the phone dialer, and the sketchboards attach around that. Do not rebuild any component. Do not edit Persona mind logic.
+
+## Quick start
+
+**Local mode** (Persona + engine in one process):
+
+```bash
+pip install -r persona/requirements.txt  # if present, or install starlette uvicorn httpx
+python stitch.py local --root ~/Projects --deepinfra-key YOUR_KEY --port 8800
+```
+
+**Remote mode** (connect to an existing Persona server):
+
+```bash
+python stitch.py remote --persona-url https://your-persona --persona-key sp_... --root ~/Projects
+```
+
+## stitch.py
+
+The entry point. Wires Persona, the engine, and the Link adapter together. See `python stitch.py --help`.
+
+## persona/link.py
+
+The Link adapter. Connects Persona to any external agent. Two strategies, chosen automatically from what the agent advertises. See the module docstring for the full API.
 
 ## sawii_hands.py
 
