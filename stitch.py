@@ -458,17 +458,24 @@ def _register_agent_from_spec(links, spec: str) -> None:
     if api_key.startswith("$"):
         api_key = os.environ.get(api_key[1:], "")
 
-    config = {
+    config: dict = {
         "name": name,
-        "api_url": api_url,
         "api_key": api_key,
         "model": model,
         "agent_type": agent_type,
     }
 
+    # Native drivers (e.g. browser_use_native) don't need an API URL —
+    # they import the library directly. api_url is optional for them.
+    if agent_type == "browser_use_native":
+        if api_url:
+            config["base_url"] = api_url  # optional LLM endpoint override
+    else:
+        config["api_url"] = api_url
+
     link = links.register(config)
     log.info("Registered external agent: %s (%s via %s)",
-             name, link.agent.strategy, api_url)
+             name, link.agent.strategy, api_url or "(native in-process)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -498,7 +505,13 @@ def main():
 Examples:
   python stitch.py local --root ~/Projects --deepinfra-key di-...
   python stitch.py local --root ~/Projects --agent browser-use:http://localhost:7860:$KEY:model
+  python stitch.py local --root ~/Projects --agent bu-native:_:$OPENAI_API_KEY:gpt-4o:browser_use_native
   python stitch.py remote --persona-url https://my-persona --persona-key sp_... --root ~/Projects
+
+Native browser-use (browser-use as in-process library, not API bridge):
+  --agent bu:_:$OPENAI_API_KEY:gpt-4o-mini:browser_use_native
+  The _ placeholder means no API URL is needed — browser-use runs in-process.
+  The api_key is the LLM key (OpenAI/Anthropic), NOT a browser-use cloud key.
 """,
     )
     sub = ap.add_subparsers(dest="mode")

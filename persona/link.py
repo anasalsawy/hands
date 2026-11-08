@@ -158,6 +158,8 @@ class LinkedLane:
             return False
         if self.agent.strategy == "spawn":
             return self.process is not None and self.process.returncode is None
+        if self.agent.strategy == "native":
+            return self._bridge_task is not None and not self._bridge_task.done()
         return True
 
 
@@ -882,12 +884,214 @@ class BrowserUseDriver(OpenAIBridgeDriver):
         await OpenAIBridgeDriver.run_bridge(linked, hub, persona_id)
 
 
+class BrowserUseNativeDriver:
+    """Native in-process browser-use integration.
+
+    This is the proof of concept: Persona imports browser-use's own Agent and
+    Browser classes and spawns ``agent.run()`` coroutines directly as R-lanes.
+    Each lane gets its own Browser instance and its own Agent — browser-use's
+    own concurrency model (asyncio.gather over Agent.run) is exactly what
+    Persona's LaneBook manages.
+
+    How the hijack works:
+        1. Persona's Mind decides work should be split into R-lanes
+        2. For each R-lane, Link creates a browser-use Agent with its own Browser
+        3. Agent.run() runs as an asyncio task — one task per R-lane
+        4. LaneBook tracks all of them concurrently
+        5. The LLM endpoint is configurable: Persona can even BE the LLM that
+           browser-use calls, intercepting every inference call
+
+    This proves: Persona creates concurrency INSIDE browser-use by spawning
+    multiple Agent instances through browser-use's own Agent class. browser-use
+    thinks each Agent is independent. Persona knows they are all R-lanes of
+    one conversation, steered by one Mind.
+
+    Config keys:
+        agent_type: "browser_use_native"
+        model: LLM model name (default: "gpt-4o-mini")
+        api_key: LLM API key (for ChatOpenAI or the configured provider)
+        base_url: optional LLM base URL (if using a custom/local endpoint)
+        headless: bool (default True) — run browsers headless
+        user_data_dir: base dir for browser profiles (each lane gets its own)
+        max_actions_per_step: int (default 10)
+        max_failures: int (default 3)
+        use_vision: bool (default True)
+    """
+    name = "browser_use_native"
+
+    @staticmethod
+    def detect_from_config(config: dict) -> AgentProfile | None:
+        if config.get("agent_type") != "browser_use_native":
+            return None
+        return AgentProfile(
+            name=config.get("name", "browser-use-native"),
+            strategy="native",
+            agent_type="browser_use_native",
+            model=str(config.get("model") or "gpt-4o-mini"),
+            key=str(config.get("api_key") or config.get("key") or ""),
+            url=str(config.get("base_url") or ""),
+            extra_headers={
+                "headless": str(config.get("headless", True)),
+                "user_data_dir": str(config.get("user_data_dir") or ""),
+                "max_actions_per_step": str(config.get("max_actions_per_step", 10)),
+                "max_failures": str(config.get("max_failures", 3)),
+                "use_vision": str(config.get("use_vision", True)),
+            },
+            tools=list(config.get("tools") or []),
+        )
+
+    @staticmethod
+    async def run_native(linked: LinkedLane, hub, persona_id: int):
+        """Run a browser-use Agent.run() as one R-lane.
+
+        This is the core proof: we import browser-use, create an Agent with its
+        own Browser, and run it. Persona manages this as an R-lane through
+        LaneBook. Multiple of these running concurrently = Persona creating
+        concurrency inside browser-use.
+        """
+        try:
+            from browser_use import Agent, Browser
+        except ImportError:
+            log.error("browser-use is required for native driver (pip install browser-use)")
+            linked.status = "failed"
+            linked.error = "browser-use not installed — pip install browser-use"
+            return
+
+        profile = linked.agent
+        opts = profile.extra_headers  # we stash config in extra_headers
+
+        # Build the LLM — browser-use accepts any LangChain ChatModel.
+        # Try ChatOpenAI first (most common), fall back to others.
+        llm = None
+        try:
+            from langchain_openai import ChatOpenAI
+            llm_kwargs: dict[str, Any] = {"model": profile.model or "gpt-4o-mini"}
+            if profile.key:
+                llm_kwargs["api_key"] = profile.key
+            if profile.url:
+                llm_kwargs["base_url"] = profile.url
+            llm = ChatOpenAI(**llm_kwargs)
+        except ImportError:
+            pass
+
+        if llm is None:
+            try:
+                from langchain_anthropic import ChatAnthropic
+                llm_kwargs = {"model": profile.model or "claude-sonnet-4-20250514"}
+                if profile.key:
+                    llm_kwargs["api_key"] = profile.key
+                llm = ChatAnthropic(**llm_kwargs)
+            except ImportError:
+                pass
+
+        if llm is None:
+            linked.status = "failed"
+            linked.error = ("no LLM provider found — install langchain-openai or "
+                            "langchain-anthropic")
+            return
+
+        # Each lane gets its own browser instance and profile directory.
+        # This is how browser-use does parallelism: separate Browser per Agent.
+        headless = opts.get("headless", "True").lower() != "false"
+        base_dir = opts.get("user_data_dir") or ""
+        profile_dir = (os.path.join(base_dir, f"persona-lane-{linked.lane_id}")
+                       if base_dir else f"/tmp/persona-bu-{linked.lane_id}")
+
+        browser = None
+        agent = None
+        try:
+            browser = Browser(
+                config={
+                    "headless": headless,
+                    "user_data_dir": profile_dir,
+                }
+            )
+
+            # Build the Agent with the lane instruction as the task.
+            agent_kwargs: dict[str, Any] = {
+                "task": linked.instruction,
+                "llm": llm,
+                "browser": browser,
+                "use_vision": opts.get("use_vision", "True").lower() != "false",
+                "max_actions_per_step": int(opts.get("max_actions_per_step", "10")),
+                "max_failures": int(opts.get("max_failures", "3")),
+            }
+
+            # If Persona has tools available via HandsHub, expose them to the Agent
+            if hub:
+                try:
+                    from browser_use import Tools
+                    persona_tools = Tools()
+
+                    available = hub.schemas(persona_id) if persona_id else []
+                    for tool_schema in available:
+                        fn = (tool_schema.get("function")
+                              if isinstance(tool_schema, dict) else None)
+                        if not fn or not fn.get("name"):
+                            continue
+                        tool_name = fn["name"]
+                        tool_desc = fn.get("description", tool_name)
+
+                        # Create a closure that calls the tool via HandsHub
+                        async def _make_hub_tool(name=tool_name):
+                            async def _call(**kwargs):
+                                try:
+                                    return await hub.call(persona_id, name, kwargs)
+                                except Exception as exc:
+                                    return json.dumps({"error": str(exc)[:500]})
+                            return _call
+
+                        fn_impl = await _make_hub_tool(tool_name)
+                        fn_impl.__name__ = tool_name
+                        fn_impl.__doc__ = tool_desc
+                        persona_tools.action(description=tool_desc)(fn_impl)
+
+                    agent_kwargs["tools"] = persona_tools
+                except (ImportError, Exception) as exc:
+                    log.debug("Could not expose HandsHub tools to browser-use: %s", exc)
+
+            agent = Agent(**agent_kwargs)
+            linked.status = "active"
+            log.info("Link: browser-use native agent started for lane %s "
+                     "(model=%s, headless=%s, profile=%s)",
+                     linked.lane_id, profile.model, headless, profile_dir)
+
+            # This is it: Agent.run() IS the R-lane execution.
+            # Persona spawns as many of these as it needs concurrently.
+            history = await agent.run()
+
+            linked.status = "done"
+            # Extract final result if available
+            try:
+                final = history.final_result()
+                if final:
+                    log.info("Link: lane %s completed: %s", linked.lane_id, str(final)[:200])
+            except Exception:
+                pass
+
+        except asyncio.CancelledError:
+            linked.status = "stopped"
+            log.info("Link: browser-use native agent stopped for lane %s", linked.lane_id)
+        except Exception as exc:
+            linked.status = "failed"
+            linked.error = str(exc)[:400]
+            log.exception("Link: browser-use native agent failed for lane %s", linked.lane_id)
+        finally:
+            # Clean up the browser instance
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # The Link — one instance per registered external agent
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Detection order: specific agents first, then generic fallback
 _HIJACK_DRIVERS = [HermesDriver, CursorDriver, ClaudeCodeDriver, ClineDriver, GenericHijackDriver]
+_NATIVE_DRIVERS = [BrowserUseNativeDriver]
 _API_DRIVERS = [BrowserUseDriver, OpenAIBridgeDriver]
 
 
@@ -944,7 +1148,15 @@ class Link:
                          profile.supports_steer, profile.supports_stop)
                 return cls(profile, driver)
 
-        # 2. Try API bridge: does the config have an API URL?
+        # 2. Try native: agent used as an in-process library (e.g. browser-use)
+        for NativeClass in _NATIVE_DRIVERS:
+            profile = NativeClass.detect_from_config(config)
+            if profile is not None:
+                log.info("Link: %s detected as %s (native in-process)",
+                         name, profile.agent_type)
+                return cls(profile)
+
+        # 3. Try API bridge: does the config have an API URL?
         for BridgeClass in _API_DRIVERS:
             profile = BridgeClass.detect_from_config(config)
             if profile is not None:
@@ -952,7 +1164,7 @@ class Link:
                          name, profile.agent_type, profile.url)
                 return cls(profile)
 
-        # 3. Fall back to spawn: launch engine instances per lane
+        # 4. Fall back to spawn: launch engine instances per lane
         binary = str(config.get("binary") or "")
         if not binary:
             binary = str(Path(__file__).parent.parent / "sawii_hands.py")
@@ -996,6 +1208,8 @@ class Link:
 
         if self.agent.strategy == "hijack":
             self._hijack_delegate(linked, instruction)
+        elif self.agent.strategy == "native":
+            await self._native_delegate(linked, instruction)
         elif self.agent.strategy == "api_bridge":
             await self._bridge_delegate(linked, instruction)
         else:
@@ -1032,7 +1246,7 @@ class Link:
             if call:
                 linked._prepared_calls.append(call)
 
-        elif self.agent.strategy == "api_bridge":
+        elif self.agent.strategy in ("api_bridge", "native"):
             if linked._bridge_task and not linked._bridge_task.done():
                 linked._bridge_task.cancel()
                 try:
@@ -1079,7 +1293,7 @@ class Link:
                     linked.status = "failed"
                     linked.error = linked.error or f"engine exited with code {rc} without working"
 
-        if self.agent.strategy == "api_bridge" and linked._bridge_task:
+        if self.agent.strategy in ("api_bridge", "native") and linked._bridge_task:
             if linked._bridge_task.done():
                 exc = linked._bridge_task.exception()
                 linked.status = "failed" if exc else "done"
@@ -1164,6 +1378,26 @@ class Link:
         linked.status = "active"
         log.info("Link: started API bridge for lane %s via %s (%s)",
                  linked.lane_id, self.agent.name, self.agent.url)
+
+    # ────────────────────────────────────────────────────── native internals
+
+    async def _native_delegate(self, linked: LinkedLane, instruction: str):
+        """Launch an in-process native agent for this lane.
+
+        The native strategy imports the agent library directly and runs its
+        agent loop as an asyncio task. This is how Persona creates concurrency
+        inside browser-use: each R-lane is a browser-use Agent.run() coroutine.
+        """
+        if self.agent.agent_type == "browser_use_native":
+            linked._bridge_task = asyncio.create_task(
+                BrowserUseNativeDriver.run_native(linked, self._hub, self._persona_id))
+        else:
+            linked.status = "failed"
+            linked.error = f"no native driver for {self.agent.agent_type}"
+            return
+        linked.status = "active"
+        log.info("Link: started native agent for lane %s via %s",
+                 linked.lane_id, self.agent.name)
 
     # ────────────────────────────────────────────────────── spawn internals
 
