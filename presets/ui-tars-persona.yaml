@@ -1,0 +1,32 @@
+# UI-TARS Desktop preset — provider = Persona (the mind, hosted on Railway)
+#
+# WHO THIS FILE IS FOR: the UI-TARS Desktop operator app
+# (engine/ui-tars-desktop in this repo; ByteDance's app). The engine has no
+# model of its own — it is an OpenAI-compatible client. This preset points it
+# at the HOSTED Persona server, so the engine's LLM is Persona (R).
+#
+# Import via:  Settings -> Import Preset Config  (paste this YAML)
+# Schema: apps/ui-tars PresetSchema (vlmProvider / vlmBaseUrl / vlmApiKey /
+# vlmModelName / useResponsesApi / operator / maxLoopCount / loopIntervalInMs).
+#
+# Hosted Persona (Railway):  https://dl-companion-production.up.railway.app
+#   GET  /health                 -> 200
+#   GET  /v1/models              -> "sawii-persona"
+#   POST /v1/chat/completions    -> requires Authorization: Bearer sp_...
+#
+# vlmApiKey is your Persona identity key (sp_...). Keep the real key out of git;
+# import this preset and paste your key in the app, or edit the local copy.
+#
+# NOTE: this file is only for the standalone UI-TARS Desktop operator. It is
+# not read by sawii_hands.py / stitch.py / the Persona server.
+
+name: Persona (Railway)
+language: en
+vlmProvider: Persona
+vlmBaseUrl: https://dl-companion-production.up.railway.app/v1
+vlmApiKey: sp_your_persona_key
+vlmModelName: sawii-persona
+useResponsesApi: false
+operator: Local Computer Operator
+maxLoopCount: 100
+loopIntervalInMs: 1000

@@ -32,6 +32,11 @@ export const getModelVersion = (
       return UITarsModelVersion.DOUBAO_1_5_15B;
     case VLMProviderV2.doubao_1_5_vl:
       return UITarsModelVersion.DOUBAO_1_5_20B;
+    case VLMProviderV2.persona:
+      // Persona (the mind) serves the LLM. It is OpenAI-compatible and
+      // answers in the standard UI-TARS action format, so the engine uses the
+      // V1.0 contract (factors [1000,1000], base system prompt).
+      return UITarsModelVersion.V1_0;
     default:
       return UITarsModelVersion.V1_0;
   }

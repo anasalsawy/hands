@@ -20,6 +20,16 @@ Nothing here is reimplemented, paraphrased, or "the same thing" — it is their 
 - everything else in the upstream tree, exactly as shipped
 
 ## What is NOT modified
-No file under `ui-tars-desktop/` is edited. To update, re-copy from the commit above.
-The Hands <-> engine seam (the "Link") lives in `hands/persona/link.py` and points the
-engine's `model.baseURL` at Persona's R-lane endpoint — the engine's own loop is used as-is.
+No file under `ui-tars-desktop/` is edited, **except one additive seam** that
+makes Persona a first-class provider (the change you asked for):
+
+- `apps/ui-tars/src/main/store/types.ts` — adds one enum member `persona = 'Persona'` to `VLMProviderV2`.
+- `apps/ui-tars/src/main/utils/agent.ts` — maps that member to `UITarsModelVersion.V1_0`.
+
+Everything else is byte-for-byte upstream. These two edits only *add* a provider;
+they do not alter the engine's loop, parser, operator, or overlays. To update,
+re-copy from the commit above and re-apply these two additions.
+
+The Hands <-> engine seam (the "Link") lives in `hands/persona/link.py` and points
+the engine's `model.baseURL` at Persona's R-lane endpoint — the engine's own loop is
+used as-is.

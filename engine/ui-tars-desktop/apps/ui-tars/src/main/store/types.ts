@@ -46,6 +46,11 @@ export enum VLMProviderV2 {
   ui_tars_1_5 = 'Hugging Face for UI-TARS-1.5',
   doubao_1_5 = 'VolcEngine Ark for Doubao-1.5-UI-TARS',
   doubao_1_5_vl = 'VolcEngine Ark for Doubao-1.5-thinking-vision-pro',
+  // Persona is the mind (R lanes). The engine takes its LLM from Persona,
+  // not from a VLM provider directly; base URL is the HOSTED Persona OpenAI-
+  // compatible endpoint (https://dl-companion-production.up.railway.app/v1),
+  // model id "sawii-persona".
+  persona = 'Persona',
 }
 
 export enum SearchEngineForSettings {
