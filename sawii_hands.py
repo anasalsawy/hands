@@ -25,7 +25,6 @@ import asyncio
 import fnmatch
 import json
 import os
-import platform
 from pathlib import Path
 import re
 import socket
@@ -73,18 +72,44 @@ TOOLS = [
 # GUI schemas are discovered from the installed Open Computer Use MCP server.
 READS = {"read_file", "list_files", "search_files", "ocu_list_apps", "ocu_get_app_state"}
 
+OCU_FILE = Path(__file__).with_name("ocu_mcp.py")
+
+
+def load_ocu(path: str | None = None):
+    """Load the Open Computer Use client that sits beside this script.
+
+    Returns ``(instance_or_None, error_string)`` so a missing or broken
+    ``ocu_mcp.py`` degrades to "computer use disabled" instead of crashing the
+    engine at start-up. The engine still serves shell/file tools without it.
+    """
+    import importlib.util
+
+    target = Path(path) if path else OCU_FILE
+    if not target.is_file():
+        return None, (f"{target.name} not found beside {Path(__file__).name}; "
+                      f"no ocu_* screen/mouse/keyboard tools (restore it from "
+                      f"the sawii-persona repo at scripts/ocu_mcp.py)")
+    try:
+        spec = importlib.util.spec_from_file_location("sawii_ocu_mcp", target)
+        if spec is None or spec.loader is None:
+            return None, f"cannot import {target} (no import spec for this file)"
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.OcuMCP(), ""
+    except Exception as exc:  # noqa: BLE001 - a broken OCU must not kill the engine
+        return None, f"{target.name} failed to start ({type(exc).__name__}: {exc})"
+
 
 class Hands:
     def __init__(self, roots: list[str], approve: str = "ask", ask=None, computer_use: bool = False):
         self.computer_use = computer_use
         self.ocu = None
+        self.ocu_error = ""
         if computer_use:
             # Import beside this script, also when loaded by the test runner.
-            import importlib.util
-            spec = importlib.util.spec_from_file_location('sawii_ocu_mcp', Path(__file__).with_name('ocu_mcp.py'))
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            self.ocu = module.OcuMCP()
+            self.ocu, self.ocu_error = load_ocu()
+            if self.ocu is None:
+                print(f"computer use OFF - {self.ocu_error}", file=sys.stderr)
         self.roots = [os.path.realpath(os.path.expanduser(r)) for r in roots]
         if not self.roots:
             raise SystemExit("give at least one --root folder")
@@ -116,8 +141,10 @@ class Hands:
     # ---- tools ------------------------------------------------------------
     def run(self, name: str, a: dict, stop=None) -> str:
         if name.startswith('ocu_'):
-            if not self.computer_use or self.ocu is None:
-                return json.dumps({'error':'computer use is disabled'})
+            if not self.computer_use:
+                return json.dumps({"error": "computer use is disabled (start with --computer-use)"})
+            if self.ocu is None:
+                return json.dumps({"error": f"computer use is unavailable: {self.ocu_error or 'ocu_mcp.py not loaded'}"})
             if not self.allowed(name, f'use Open Computer Use: {name}'):
                 return json.dumps({'error':'the person declined'})
             try:
@@ -137,7 +164,18 @@ class Hands:
             return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
 
     def tools(self) -> list[dict]:
-        return TOOLS + (self.ocu.tools() if self.computer_use else [])
+        # A degraded computer-use start (ocu_mcp.py missing/broken, or the
+        # open-computer-use server refusing to boot) advertises only the file
+        # and shell tools rather than crashing the connection.
+        if not self.computer_use or self.ocu is None:
+            return TOOLS
+        try:
+            return TOOLS + self.ocu.tools()
+        except Exception as exc:  # noqa: BLE001 - no GUI tools is not a reason to die
+            self.ocu_error = f"Open Computer Use unavailable ({type(exc).__name__}: {exc})"
+            self.ocu = None
+            print(f"computer use OFF - {self.ocu_error}", file=sys.stderr)
+            return TOOLS
 
     def t_shell(self, command: str, cwd: str | None = None, timeout_s: int = 120) -> str:
         where = self.resolve(cwd)
@@ -224,6 +262,24 @@ class Hands:
         return "\n".join(hits) or "(no matches)"
 
 
+def _host_label() -> str:
+    """This machine's name for the ``hello`` frame, without ever blocking.
+
+    ``platform.system()`` on Windows answers from a WMI query
+    (``platform._wmi_query``), and a process spawned by a service does not
+    always get one back: it can sit there for minutes. That is the real reason
+    an engine Persona started never showed up on ``/v1/hands`` while the very
+    same command worked when a person typed it in a terminal — the terminal's
+    session has WMI warm, the spawned child's does not. The label is cosmetic,
+    so it is taken from ``os.name``/the hostname, which cannot hang.
+    """
+    try:
+        name = socket.gethostname() or "unknown"
+    except OSError:
+        name = "unknown"
+    return f"{name} ({'Windows' if os.name == 'nt' else 'posix'})"
+
+
 async def serve(url: str, key: str, hands: Hands, place: str = "computer", lane: str = "") -> None:
     import websockets  # pip install websockets
     ws_url = url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + "/v1/hands"
@@ -233,7 +289,7 @@ async def serve(url: str, key: str, hands: Hands, place: str = "computer", lane:
             async with websockets.connect(ws_url, max_size=2 ** 24) as ws:
                 await ws.send(json.dumps({"type": "hello", "key": key, "tools": hands.tools(), "place": place,
                                           "lane": lane[:32],
-                                          "host": f"{socket.gethostname()} ({platform.system()})"}))
+                                          "host": _host_label()}))
                 ready = json.loads(await ws.recv())
                 if ready.get("type") != "ready":
                     raise SystemExit(f"refused: {ready}")

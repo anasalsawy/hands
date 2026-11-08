@@ -238,6 +238,10 @@ class Mind:
         self.execution_blueprint = ExecutionBlueprint(self.shared_timeline, self.bus)
         from .inference_lanes import LaneBook
         self.lanes = LaneBook(self.shared_timeline)
+        # The court deck: the UI-agnostic layer of concurrent desktop cards
+        # (persona/court.py). Holds no view; any front end binds to it.
+        from .court import HandsDeck
+        self.deck = HandsDeck(self)
         self.scratch: dict[int, Scratch] = {}
         self._turn_locks: dict[int, asyncio.Lock] = {}
         # First-turn semantic grounding is retained for the active conversation.
@@ -717,8 +721,11 @@ vision=self.s.vision, models=models)
         tool protocol, task and step results there; without them she cannot
         do step 3 of anything. Her memory still comes along (recall)."""
         t_req = time.monotonic()
-        if realtime_voice and (channel != "voice" or input_audio is None or not home):
-            raise ValueError("Realtime voice requires original native companion audio")
+        # realtime_voice = fast companion voice path (slim/reuse memory, no
+        # verify-hold). Native audio is optional; when present it still requires
+        # dual audio-capable lobes. Text-over-/v1/voice uses the same fast path.
+        if realtime_voice and (channel != "voice" or not home):
+            raise ValueError("Realtime voice requires the companion voice channel")
         if voice_responder is not None and (voice_responder not in ('L','R') or channel != 'voice' or input_audio is None or not home):
             raise ValueError('Voice responder roles require native Companion voice input')
         if input_audio is not None:
@@ -1362,7 +1369,14 @@ vision=self.s.vision, models=models)
             # Tasker, Companion, any untagged surface - alias_model is ignored,
             # because the alias changes the model provider, not the Persona mind.
             if alias_model and worker is self.cursor_infer:
-                worker = worker.with_model(alias_model)
+                # Defence in depth: re-resolve through the closed table for the
+                # provider this worker actually talks to, so nothing that is not
+                # a table row can reach the provider even if a caller upstream
+                # forgot to validate. "" (not a row) keeps the configured model.
+                from .config import cursor_alias_for
+                safe = cursor_alias_for(alias_model,
+                                        getattr(self.cursor_infer.endpoint, "base_url", ""))
+                worker = worker.with_model(safe) if safe else worker
             delta_times: list[float] = []
             delta_chars: list[int] = []
             kernel_stats: dict = {}
@@ -1577,7 +1591,13 @@ models=None if input_audio is not None else self.speaking.models(pid),
             live_lobes.finish(result.heard, failed)
             # Ordinary weight readers select nonempty reply_text, not kind.
             # Keep native candidates out of that text-only training journal.
-            await self.memory.finish_turn(turn_id, "" if input_audio is not None or purpose == "observation" else reply)
+            # A failed turn must not enter the record as if it were said. The
+            # apology is for this moment only; persisting it poisons recall and
+            # hands every later turn a fake assistant line. Empty means "nothing
+            # was said", which is the honest thing for the mind to remember.
+            said = "" if (failed or input_audio is not None
+                          or purpose == "observation") else reply
+            await self.memory.finish_turn(turn_id, said)
             if purpose != "observation":
                 await self.store.update("personas", pid, last_reply_at=now())
             if scratch.correction and not failed:

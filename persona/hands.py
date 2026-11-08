@@ -67,15 +67,28 @@ class Runner:
 
 
 class HandsHub:
-    """Connected runners, one per persona (a newer connection replaces an older one)."""
+    """Connected runners, keyed by (persona, place, lane).
+
+    One runner per (place, lane): a newer connection on the *same* lane replaces
+    the older one, while different lanes coexist. That is what lets several
+    R-lines drive several engine processes on one machine at the same time - each
+    ``sawii_hands.py --lane <lane>`` is its own hand, and every one of them is
+    still the same mind thinking through its own line. A runner with no lane keeps
+    the old single-hand-per-place behaviour.
+    """
 
     def __init__(self, timeout: float = 120.0):
-        self.runners: dict[tuple[int, str], Runner] = {}
+        self.runners: dict[tuple[int, str, str], Runner] = {}
         self.timeout = timeout
+
+    @staticmethod
+    def _key(pid: int, place: str, lane: str) -> tuple[int, str, str]:
+        return (pid, place, str(lane or "")[:32])
 
     def connect(self, pid: int, send, tools: list[dict], host: str = "", place: str = "computer",
                 lane: str = "") -> Runner:
         place = place if place in PLACES else "computer"
+        lane = str(lane or "")[:32]
         offered, names = [], {}
         for t in tools:
             fn = t.get("function") if isinstance(t, dict) else None
@@ -86,20 +99,22 @@ class HandsHub:
             offered.append({"type": "function", "function": {
                 **fn, "name": pname,
                 "description": f"[{PLACES[place]}] " + str(fn.get("description", ""))}})
-        old = self.runners.get((pid, place))
+        old = self.runners.get(self._key(pid, place, lane))
         if old is not None:
             self._fail_all(old, "replaced by a newer connection")
-        r = self.runners[(pid, place)] = Runner(pid=pid, send=send, tools=offered, host=host[:80],
-                                                place=place, lane=str(lane or "")[:32], names=names)
+        r = self.runners[self._key(pid, place, lane)] = Runner(
+            pid=pid, send=send, tools=offered, host=host[:80],
+            place=place, lane=lane, names=names)
         return r
 
     def disconnect(self, runner: Runner) -> None:
-        if self.runners.get((runner.pid, runner.place)) is runner:
-            self.runners.pop((runner.pid, runner.place), None)
+        if self.runners.get(self._key(runner.pid, runner.place, runner.lane)) is runner:
+            self.runners.pop(self._key(runner.pid, runner.place, runner.lane), None)
         self._fail_all(runner, f"the hands {PLACES[runner.place]} disconnected")
 
     def connected(self, pid: int) -> list[Runner]:
-        return [r for (p, _), r in self.runners.items() if p == pid]
+        """Every runner of this persona, across places and lanes."""
+        return [r for (p, _, _), r in self.runners.items() if p == pid]
 
     def schemas(self, pid: int) -> list[dict]:
         return [t for r in self.connected(pid) for t in r.tools]
@@ -107,8 +122,18 @@ class HandsHub:
     def names(self, pid: int) -> set[str]:
         return {t["function"]["name"] for t in self.schemas(pid)}
 
-    async def call(self, pid: int, name: str, arguments: dict) -> str:
-        r = next((x for x in self.connected(pid) if name in x.names), None)
+    async def call(self, pid: int, name: str, arguments: dict, lane: str = "") -> str:
+        """Send one tool call and await its result.
+
+        ``lane`` routes to the hand of one specific line of work (the value the
+        runner put in its ``hello`` frame). With no lane, the call goes to the
+        first hand that advertises the tool and is not already busy - so one
+        persona can drive several engine processes without their results mixing.
+        """
+        lane = str(lane or "")[:32]
+        candidates = [x for x in self.connected(pid) if name in x.names
+                      and (not lane or x.lane == lane)]
+        r = next((x for x in candidates if not x.pending), None) or (candidates[0] if candidates else None)
         if r is None:
             return json.dumps({"error": f"no hands connected for {name} (start sawii_hands)"})
         cid = uuid.uuid4().hex[:12]
@@ -133,8 +158,12 @@ class HandsHub:
             r.pending.pop(cid, None)
         return out
 
-    async def observe(self, pid: int, place: str) -> dict | None:
-        runner = self.runners.get((pid, place))
+    async def observe(self, pid: int, place: str, lane: str = "") -> dict | None:
+        runner = self.runners.get(self._key(pid, place, lane))
+        if runner is None:
+            # No lane given (or no lane-bound hand): the first hand on this place.
+            runner = next((r for (p, pl, _), r in self.runners.items()
+                           if p == pid and pl == place), None)
         if runner is None:
             return None
         tool = place + '_ocu_get_app_state'
@@ -251,9 +280,14 @@ def _waiting_on_person(mind, pid: int, place: str, frame: dict) -> None:
 
 def hands_status(mind, pid: int) -> dict:
     rs = mind.hands.connected(pid)
+    # Keyed by place, or "place:lane" when a second hand works that place for a
+    # specific R-line, so concurrent per-lane engines are all visible.
+    places = {(r.place if not r.lane else f"{r.place}:{r.lane}"): {
+        "host": r.host, "lane": r.lane, "place": r.place,
+        "tools": [t["function"]["name"] for t in r.tools]} for r in rs}
     return {"connected": bool(rs),
-            "places": {r.place: {"host": r.host, "lane": r.lane,
-                                 "tools": [t["function"]["name"] for t in r.tools]} for r in rs},
+            "places": places,
+            "lanes": sorted({r.lane for r in rs if r.lane}),
             "host": ", ".join(f"{r.place}: {r.host}" for r in rs),
             "tools": [t["function"]["name"] for r in rs for t in r.tools]}
 

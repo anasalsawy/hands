@@ -82,12 +82,15 @@ def cursor_alias_model_id(value, *, surface, cursor_worker):
     configured Cursor worker, returns "" - the request must never resolve
     through the alias table off the persona-cursor-deepinfra face, and the
     adapter keeps rejecting every model string other than "sawii-persona"
-    there. On the cursor face the only strings that resolve are exact keys of
-    config.CURSOR_MODEL_ALIASES; the empty "" answer means "not a valid alias"
+    there. On the cursor face the only strings that resolve are rows of the
+    ONE closed table that belongs to the provider the worker actually talks
+    to (config.cursor_table); the empty "" answer means "not a valid alias"
     and the caller must reject the request, so a host- or attacker-chosen
-    model id is never passed through to the provider.
+    model id is never passed through to the provider - not even a real id
+    served by the other provider.
     """
     if cursor_worker is None or surface != CURSOR_SURFACE:
         return ""
     from .config import cursor_alias_for
-    return cursor_alias_for(value)
+    worker_base = getattr(getattr(cursor_worker, "endpoint", None), "base_url", "")
+    return cursor_alias_for(value, worker_base)

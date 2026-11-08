@@ -433,7 +433,16 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
         # Cursor/Cline/Hermes own their agent loops and tool runners. Persona
         # supplies the R model with shared memory; Companion uses its separate
         # app/voice endpoints to obtain the L conversation experience.
-        mode["home"] = False
+        # Default: the host owns the conversation, Persona is only its model.
+        # A host that *wants* the persona (its own app, or a partner opting in)
+        # asks for it explicitly — the persona system prompt is then appended
+        # alongside the host's own system message, never overwriting it.
+        home_wanted = str(data.get("sawii_home") or "").strip().lower() in {
+            "1", "true", "yes", "on", "persona"
+        } or (request.headers.get("x-sawii-home") or "").strip().lower() in {
+            "1", "true", "yes", "on", "persona"
+        }
+        mode["home"] = bool(home_wanted)
         host_system, host_messages = _host_context(msgs)
         if lane == "R" and data.get("response_format"):
             host_system += "\nReturn only JSON matching this response format, without markdown:\n" + json.dumps(data["response_format"])
@@ -947,6 +956,28 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
             "Cache-Control": "private, no-store",
             "X-Content-Type-Options": "nosniff"})
 
+    async def voice_status_view(request: Request):
+        """Companion voice wiring (no secrets): asr/native/tts + Vocode pipeline."""
+        from ..voice.vocode import pipeline_status
+        pipeline = pipeline_status(mind, rt.speech)
+        return JSONResponse({
+            "ok": True,
+            "websocket": "/v1/voice",
+            "web_ui": "/app",
+            "persona_speech": {
+                "asr": pipeline.get("asr"),
+                "tts": bool(rt.speech.has_tts),
+                "native": pipeline.get("native"),
+                "tts_model": getattr(settings.tts, "model", None),
+                "hear": getattr(settings.voice_native, "model", None),
+                "speak": getattr(settings.tts, "model", None),
+                "dual_listen": True,
+                "shared_mind": "DualLoop",
+                "architecture": "vocode-faithful",
+            },
+            "pipeline": pipeline,
+        }, headers={"Cache-Control": "no-store"})
+
     async def voice_ws(ws: WebSocket):
         await ws.accept()
         key = _bearer(ws)
@@ -998,7 +1029,18 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
                             "sampling_mode": getattr(mind.a, "sampling_mode", "unknown"),
                             "memory_policy": "background" if session.realtime_voice else "initial-grounding",
                             "asr": "native" if session.force_native_audio or settings.tinker_native_audio else
-                                   "server" if rt.speech.has_asr else "client"})
+                                   "server" if rt.speech.has_asr else "client",
+                            "architecture": ("dual-lobe-a-fast+b-native"
+                                             if getattr(session, "dual_lobe_voice", False)
+                                             else "vocode-faithful"),
+                            "hear": getattr(settings.voice_native, "model", ""),
+                            "speak": getattr(settings.tts, "model", ""),
+                            "dual_listen": True,
+                            "dual_lobe_voice": bool(getattr(session, "dual_lobe_voice", False)),
+                            "lobe_a": (getattr(session._lobe_a, "host_label", "")
+                                       if getattr(session, "_lobe_a", None) is not None else ""),
+                            "lobe_b": getattr(settings.voice_native, "model", "") or "DualLoop",
+                            "shared_mind": "DualLoop"})
         # A connected voice call is engagement even between utterances. The
         # microphone never goes idle just because the last sentence finished.
         voice_goals = getattr(mind, "goal_agent", None)
@@ -1344,6 +1386,7 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
         Route("/v1/knowledge", knowledge_post, methods=["POST"]),
         Route("/v1/knowledge/{source_id:int}", knowledge_delete, methods=["DELETE"]),
         Route("/v1/voice/clone", voice_clone_view, methods=["GET", "POST", "DELETE"]),
+        Route("/v1/voice-status", voice_status_view, methods=["GET"]),
         Route("/v1/persona/anchor", anchor_view),
         Route("/v1/persona/sleep", sleep_now, methods=["POST"]),
         Route("/v1/persona/subconscious", subconscious_view),
@@ -1388,6 +1431,15 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
         _dry = _os.getenv("SAWII_BROWSER_DRY_RUN", "0") in ("1", "true", "yes")
         _cdp = _os.getenv("SAWII_BROWSER_CDP_URL") or None
         register_browser_routes(app, dry_run=_dry, cdp_url=_cdp)
+    # Live computer cards (Background stage). SAWII_COMPUTER_STREAM=0 disables.
+    if _os.getenv("SAWII_COMPUTER_STREAM", "1") in ("1", "true", "yes"):
+        from ..gateway.computer import register_computer_routes
+        register_computer_routes(app)
+    # The court deck: the headless layer of concurrent desktop cards
+    # (persona/court.py). SAWII_COURTS=0 turns the routes off.
+    if _os.getenv("SAWII_COURTS", "1") in ("1", "true", "yes"):
+        from ..court import register_court_routes
+        register_court_routes(app)
     # The phone button is on the companion, so the call routes are on.
     # Without Twilio credentials they are a dry-run: the screen places the
     # call and you type what the other person says. SAWII_CALLS_ENABLED=0

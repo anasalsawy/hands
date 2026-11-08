@@ -31,6 +31,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import time
 
@@ -40,6 +41,12 @@ except ImportError:  # pragma: no cover
     import httpx2 as httpx  # type: ignore
 
 from ..config import ModelEndpoint
+from .fast_L import HISTORY_TURNS, FastL, fast_l_enabled
+from .lobe_a_fast import FastLobeA, dual_lobe_voice_enabled
+from .local_tts import PiperTTS, piper_enabled
+from .stream_tts import (ELEVENLABS_BASE, AudioSlice, ElevenStreamTTS,
+                         GeminiStreamTTS, elevenlabs_stream_enabled,
+                         gemini_native_once, gemini_stream_enabled, wav_from_pcm)
 from .native_input import (AudioReviewer, MAX_AUDIO_BYTES, NATIVE_REQUEST,
                            NativeAudio, decode_native_audio)
 
@@ -64,7 +71,7 @@ def _clause_cut(buf: str, start: int) -> int | None:
 class SentenceChunker:
     """Split a token stream into speakable chunks; the first one is cut early."""
 
-    def __init__(self, first_min: int = 24, min_len: int = 12, max_len: int = 140):
+    def __init__(self, first_min: int = 12, min_len: int = 8, max_len: int = 110):
         self.buf = ""
         self.first = True
         self.first_min = first_min
@@ -115,7 +122,11 @@ def tts_body(model: str, text: str, *, voice: str = "", clone: dict | None = Non
 
 
 class SpeechIO:
-    """OpenAI-compatible ASR (/audio/transcriptions) and TTS (/audio/speech)."""
+    """OpenAI-compatible ASR (/audio/transcriptions) and TTS (/audio/speech).
+
+    MiMo-V2.5-tts on DeepInfra also tries the Xiaomi chat-completions audio
+    shape when ``/audio/speech`` is unavailable (Vocode synthesizer path).
+    """
 
     def __init__(self, asr: ModelEndpoint, tts: ModelEndpoint, voice: str = "",
                  http: "httpx.AsyncClient | None" = None):
@@ -123,10 +134,92 @@ class SpeechIO:
         self._http = http
         self._tts_retry_after = 0.0
         self._tts_failures = 0
+        self._mimo = None
+        # Measured here (2026-11-08): streaming TTS hands back the first playable
+        # audio in ~0.18 s (ElevenLabs flash) or ~0.56-1.0 s (Gemini SSE), versus
+        # ~2.2 s for the non-streaming Gemini call and ~3.8-13.5 s for local
+        # PocketTTS. Whichever endpoint is configured decides the winner.
+        self._stream_tts: GeminiStreamTTS | ElevenStreamTTS | None = None
+        if gemini_stream_enabled(tts.base_url):
+            self._stream_tts = GeminiStreamTTS(
+                tts.base_url, tts.api_key, model=tts.model or "gemini-3.8-flash-lite-tts",
+                voice=voice or "Puck", http=http)
+        elif elevenlabs_stream_enabled(tts.base_url):
+            self._stream_tts = ElevenStreamTTS(
+                ELEVENLABS_BASE, tts.api_key, model=tts.model or "eleven_flash_v2_5",
+                voice=voice, http=http)
+        if self._use_mimo_tts():
+            from .vocode.synthesizer import DeepInfraMiMoSynthesizer
+            self._mimo = DeepInfraMiMoSynthesizer(tts, voice=voice or "Mia", http=http)
+        # Local speech (measured p50 588 ms first byte, no key, no quota) beats a
+        # throttled remote provider and survives a 429. It is preferred over the
+        # network only when the network is configured but unavailable, unless
+        # SAWII_TTS_LOCAL=pREFER forces it.
+        self._piper: PiperTTS | None = PiperTTS() if piper_enabled() else None
+        self._piper_preferred = (os.environ.get("SAWII_TTS_LOCAL") or "").strip().lower() in (
+            "1", "true", "yes", "on", "prefer")
+
+    @property
+    def _gemini_stream(self):
+        """Back-compat alias: the active streaming TTS client, whatever provider."""
+        return self._stream_tts
+
+    @property
+    def streams_tts(self) -> bool:
+        return self._gemini_stream is not None
+
+    async def synthesize_head(self, text: str, *, min_ms: int = 420, stop=None,
+                              ) -> tuple[bytes, str, list[tuple[bytes, str]]]:
+        """First playable clip, then the rest. Returns (head, mime, remainder).
+
+        The head is dispatched as soon as ``min_ms`` of audio exists, which is
+        what pulls first-audio off the 2 s non-streaming floor. The remainder is
+        already decoded by the time the caller asks for it, so nothing after the
+        head costs an extra round trip.
+        """
+        # Local first when it is preferred, or when no remote streamer exists.
+        if self._piper is not None and (self._piper_preferred or self._stream_tts is None):
+            if await self._piper.warm():
+                try:
+                    return await self._piper.synthesize_head(text)
+                except Exception as exc:  # noqa: BLE001
+                    log.info("local piper tts failed (%s)", type(exc).__name__)
+                    if self._piper_preferred:
+                        raise
+        if self._stream_tts is None:
+            raise RuntimeError("streaming tts not configured")
+        rate = 24000
+        head_limit = int(rate * 2 * min_ms / 1000)
+        head = bytearray()
+        rest: list[bytes] = []
+        async for slice_ in self._stream_tts.stream(text, stop=stop):
+            rate = slice_.sample_rate or rate
+            if len(head) < head_limit:
+                head += slice_.data
+            elif slice_.data:
+                rest.append(slice_.data)
+        head_bytes = bytes(head)
+        if not head_bytes:
+            raise RuntimeError("streaming tts produced no audio")
+        # A WAV frame is what the client can decode; PCM alone cannot be played.
+        clips = [wav_from_pcm(b, rate) for b in ([head_bytes] + rest) if b]
+        return clips[0], "audio/wav", [(c, "audio/wav") for c in clips[1:]]
+
+    async def warm_local_tts(self) -> None:
+        """Load the local voice off the critical path (~8.7 s; never on a turn)."""
+        if self._piper is not None:
+            await self._piper.warm()
+
+    def _use_mimo_tts(self) -> bool:
+        model = (self.tts.model or "").lower()
+        base = (self.tts.base_url or "").lower()
+        return "mimo" in model and "tts" in model and "deepinfra" in base
 
     def http(self) -> "httpx.AsyncClient":
         if self._http is None:
             self._http = httpx.AsyncClient(timeout=60)
+            if self._mimo is not None:
+                self._mimo._http = self._http
         return self._http
 
     @property
@@ -137,7 +230,14 @@ class SpeechIO:
     def has_tts(self) -> bool:
         # The default points at Featherless, so a missing key must stay silent
         # rather than calling the provider and failing every sentence.
-        return bool(self.tts.base_url and self.tts.model and self.tts.api_key) and time.monotonic() >= self._tts_retry_after
+        if self._mimo is not None:
+            return self._mimo.available
+        remote = (bool(self.tts.base_url and self.tts.model and self.tts.api_key)
+                  and time.monotonic() >= self._tts_retry_after)
+        # Local speech needs no key and no quota, so it keeps the voice alive when
+        # the provider is throttled - provided the voice actually loaded at boot.
+        local = self._piper is not None and self._piper.loaded
+        return remote or local
 
     async def transcribe(self, audio: bytes, mime: str = "audio/webm") -> str:
         ext = {"audio/webm": "webm", "audio/wav": "wav", "audio/mpeg": "mp3", "audio/ogg": "ogg"}.get(mime, "webm")
@@ -148,6 +248,33 @@ class SpeechIO:
         return (r.json().get("text") or "").strip()
 
     async def synthesize(self, text: str, *, clone: dict | None = None) -> tuple[bytes, str]:
+        if "generativelanguage.googleapis.com" in (self.tts.base_url or "").lower() and not clone:
+            # The OpenAI-compat /audio/speech on a Google base is a hard 404, so
+            # the whole-clip path for Gemini must use the native endpoint.
+            return await gemini_native_once(self.http(), self.tts.base_url, self.tts.api_key,
+                                            self.tts.model, self.voice, text)
+        if "elevenlabs.io" in (self.tts.base_url or "").lower() and not clone:
+            # ElevenLabs has no OpenAI-compat /audio/speech either; the whole-clip
+            # path is its plain (non-streamed) TTS endpoint. Gated on the base URL
+            # and not on the streamer, so SAWII_TTS_STREAM=0 still speaks aloud.
+            r = await self.http().post(
+                f"{ELEVENLABS_BASE}/v1/text-to-speech/{self.voice}",
+                headers={"xi-api-key": self.tts.api_key},
+                params={"output_format": "pcm_22050"},
+                json={"text": text, "model_id": self.tts.model or "eleven_flash_v2_5"})
+            r.raise_for_status()
+            rate = getattr(self._stream_tts, "rate", 22050)
+            return (wav_from_pcm(r.content or b"", rate), "audio/wav")
+        if self._mimo is not None:
+            try:
+                result = await self._mimo.create_speech(text, clone=clone)
+            except Exception as exc:
+                self._tts_failures = getattr(self._mimo, "_failures", self._tts_failures + 1)
+                self._tts_retry_after = getattr(self._mimo, "_retry_after", time.monotonic() + 5.0)
+                raise exc
+            self._tts_failures = 0
+            self._tts_retry_after = 0.0
+            return result.data, result.content_type
         body = tts_body(self.tts.model, text, voice=self.voice, clone=clone)
         r = await self.http().post(f"{self.tts.base_url}/audio/speech",
                                    headers={"Authorization": f"Bearer {self.tts.api_key}"},
@@ -191,7 +318,8 @@ class VoiceSession:
     """One live voice connection. ``send_json``/``send_bytes`` are the socket's."""
 
     # A clause that stops arriving (a tool started) is spoken after this long.
-    idle_flush_s = 0.35
+    # Keep short: first audio should not wait out a long tool silence.
+    idle_flush_s = 0.18
 
     def __init__(self, mind, persona: dict, speech: SpeechIO, send_json, send_bytes,
                  *, dual: bool | None = None, steer: bool | None = None, tz: str = "",
@@ -199,9 +327,15 @@ class VoiceSession:
                  force_native_audio: bool = False, tasker_intent: bool = False):
         self.mind = mind
         self.lane = lane
-        self.force_native_audio = bool(force_native_audio or getattr(getattr(mind, "s", None), "native_audio_default", False))
         # Tasker uses original audio directly with Inkling; no input STT.
         self.tasker_intent = bool(tasker_intent)
+        # Dual-lobe experiment: tiny local A (Ollama Qwen2.5-1.5B) speaks a
+        # real-model bridge first; B stays the MiMo native-audio DualLoop mind.
+        self.dual_lobe_voice = dual_lobe_voice_enabled() and not self.tasker_intent
+        self.force_native_audio = bool(
+            force_native_audio
+            or self.dual_lobe_voice
+            or getattr(getattr(mind, "s", None), "native_audio_default", False))
         # Native voice must remain responsive while tools and memory run, not only in Tasker.
         self.realtime_voice = self.force_native_audio
         self._voice_memory_task: asyncio.Task | None = None
@@ -241,15 +375,186 @@ class VoiceSession:
         self._bc_t = 0.0
         self._reviews: set[asyncio.Task] = set()
         from .duplex import DuplexVoice
+        from .vocode import StreamingConversation, build_pipeline
         self.duplex = DuplexVoice(mind, persona['id'], self._emit)
+        # Vocode-faithful pipeline: dual-listen transcriber → DualLoop agent → MiMo TTS.
+        # Dual listen feeds THIS mind only (no second DualLoop / no split agents).
+        self.pipeline = build_pipeline(
+            mind=mind, persona=persona, speech=speech, duplex=self.duplex,
+            session_id=self.session_id, lane=self.lane, dual=self.dual,
+            steer=self.steer, tz=self.tz, realtime_voice=self.realtime_voice,
+            http=getattr(speech, "_http", None))
+        self.conversation = StreamingConversation(self.pipeline)
+        # Soft ACK for every ACK client: first audio never waits; later segments
+        # soft-continue quickly so a late/missing ACK cannot serialize TTFA.
+        self._soft_playback_ack = bool(playback_ack)
         self._voice_response_role = None
         self._preview_grounding: asyncio.Task | None = None
+        self._tts_first_ms: int | None = None
+        self._first_delta_ms: int | None = None
+        self._ack_soft_continues = 0
+        self._synth_prefetch = 1
+        self._speculative_opener = ""
+        self._speculative_task: asyncio.Task | None = None
+        self._lobe_a = FastLobeA(http=getattr(speech, "_http", None)) if self.dual_lobe_voice else None
+        # The fast reactive L: a tiny model that answers short spoken turns while
+        # the full DualLoop turn runs in parallel. Off with SAWII_FAST_L=0.
+        #
+        # L is ONE lane with TWO mouths on the SAME mind (same memory, same
+        # tools, same persona). L1 is the local fast model (llama.cpp :8080);
+        # L2 is the deep Featherless model. Both are L. The race decides who is
+        # heard first, never which mind is answering.
+        self.fast_l = FastL(http=getattr(speech, "_http", None)) if fast_l_enabled() else None
+        self._fast_lobe_tag = "L1"     # the fast mouth
+        self._deep_lobe_tag = "L2"     # the deep featherless mouth
+        self._fast_l_task: asyncio.Task | None = None
+        # This call's own exchanges, oldest first, for the fast responder only.
+        # Not memory: the last few things said out loud, so it stops being deaf
+        # between turns. The mind keeps the real record.
+        self._fast_l_hist: list[dict] = []
+        self._fast_l_spoke = ""
+        self._fast_l_ms: int | None = None
+        self._fast_l_host = ""
+        self._fast_l_note = ""
+        self._lobe_a_bridge = ""
+        self._ttfa_filler: int | None = None
+        self._ttfa_native_answer: int | None = None
+        self._lobe_a_model_ms: int | None = None
+        self._lobe_a_host = ""
+        # Warm the TTS HTTP path so the first real clause is not a cold RTT.
+        asyncio.create_task(self._warm_tts())
+        if self._lobe_a is not None:
+            asyncio.create_task(self._warm_lobe_a())
+        if self.fast_l is not None:
+            # A cold local model costs ~14 s to first token on this box; warm it
+            # here so no live turn ever pays for the load.
+            asyncio.create_task(self._warm_fast_l())
 
     async def _emit(self, obj: dict, blob: bytes | None = None) -> None:
         async with self._send_lock:
             await self.send_json(obj)
             if blob is not None:
                 await self.send_bytes(blob)
+
+    async def _warm_tts(self) -> None:
+        if self.speech._piper is not None:
+            # ~8.7 s offline; must never land on a live turn.
+            await self.speech.warm_local_tts()
+        if not self.speech.has_tts:
+            return
+        try:
+            if self.speech.streams_tts:
+                # Warm the SSE path and its connection, not the slow one.
+                await asyncio.wait_for(self.speech.synthesize_head("ok"), timeout=12)
+            else:
+                await asyncio.wait_for(self.speech.synthesize("ok"), timeout=12)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _warm_fast_l(self) -> None:
+        """Load the tiny responder off the critical path; never blocks a turn."""
+        if self.fast_l is None:
+            return
+        try:
+            await asyncio.wait_for(self.fast_l.warm(), timeout=90)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _warm_lobe_a(self) -> None:
+        """Touch Ollama so the first live bridge is not a cold load."""
+        if self._lobe_a is None:
+            return
+        try:
+            await asyncio.wait_for(self._lobe_a.generate_bridge("hey"), timeout=60)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _start_speculative(self, opener: str) -> None:
+        """Speak dual-listen draft's first clause while DualLoop still starts."""
+        opener = (opener or "").strip()
+        if not opener or self.text_only or self.interrupted:
+            return
+        self._speculative_opener = opener
+        self._turn_t0 = time.monotonic()
+        self._first_audio = None
+        await self._emit({"type": "delta", "text": opener})
+        await self._say(0, opener)
+
+    async def _resolve_lobe_a_text(self, audio: bytes, mime: str) -> str:
+        """Text for Lobe A: prefer live partials, else optional server ASR."""
+        heard = (self._heard or "").strip()
+        if len(heard) >= 8:
+            return heard[:500]
+        if self.speech.has_asr and audio:
+            try:
+                text = await asyncio.wait_for(self.speech.transcribe(audio, mime), timeout=10)
+                text = (text or "").strip()
+                if text:
+                    await self._emit({"type": "transcript", "text": text, "for": "lobe_a"})
+                    return text[:500]
+            except Exception:  # noqa: BLE001
+                pass
+        return heard[:500]
+
+    async def _speak_lobe_a_bridge(self, user_text: str) -> str:
+        """Real-model A bridge → first audio. Returns spoken bridge text."""
+        if self._lobe_a is None or self.interrupted:
+            return ""
+        self._lobe_a_bridge = ""
+        self._ttfa_filler = None
+        self._lobe_a_model_ms = None
+        result = await self._lobe_a.generate_bridge(user_text)
+        self._lobe_a_host = result.host
+        self._lobe_a_model_ms = result.ttft_ms
+        if not result.ok or not result.text or self.interrupted:
+            await self._emit({
+                "type": "kernel",
+                "event": {
+                    "type": "lobe_a",
+                    "ok": False,
+                    "host": result.host,
+                    "model": result.model,
+                    "error": result.error,
+                    "model_ms": result.ttft_ms,
+                },
+            })
+            return ""
+        bridge = result.text
+        self._lobe_a_bridge = bridge
+        self._speculative_opener = bridge
+        if self._turn_t0 is None:
+            self._turn_t0 = time.monotonic()
+        await self._emit({
+            "type": "kernel",
+            "event": {
+                "type": "lobe_a",
+                "ok": True,
+                "host": result.host,
+                "model": result.model,
+                "text": bridge,
+                "model_ms": result.ttft_ms,
+            },
+        })
+        await self._emit({"type": "delta", "text": bridge, "lobe": self._fast_lobe_tag})
+        before = self._first_audio
+        await self._say(0, bridge)
+        # First audible frame from A is the filler TTFA.
+        if self._first_audio is not None and (before is None or self._ttfa_filler is None):
+            self._ttfa_filler = self._first_audio
+        return bridge
+
+    def _lobe_a_host_prefix(self, bridge: str, prepared: str = "") -> str:
+        bridge = (bridge or "").strip()
+        parts = []
+        if prepared:
+            parts.append(prepared.rstrip())
+        if bridge:
+            parts.append(
+                "FAST LOBE A already spoke this generic bridge aloud "
+                "(continue the real answer without repeating it): "
+                + repr(bridge)
+            )
+        return "\n".join(parts)
 
     async def on_partial(self, text: str) -> None:
         """They are still talking. A long enough partial starts the reply now.
@@ -363,6 +668,12 @@ class VoiceSession:
         )
 
     async def on_audio(self, chunk: bytes) -> None:
+        if self.force_native_audio:
+            await self.pipeline.transcriber.send_audio(chunk)
+            if self.pipeline.transcriber._hear.overflowed:
+                self._audio_overflow = True
+                await self._emit({"type": "error", "detail": "Audio payload too large; recording discarded"})
+            return
         if self._audio_overflow:
             return
         if len(self.audio) + len(chunk) > MAX_AUDIO_BYTES:
@@ -373,8 +684,15 @@ class VoiceSession:
         self.audio.extend(chunk)
 
     async def on_audio_progress(self, mime: str) -> None:
-        # No future-speech queue: only the newest prefix is offered to the two voice roles.
+        # Dual listen starts on progressive prefixes — both ears share DualLoop.
         native = self.force_native_audio or getattr(getattr(self.mind, 's', None), 'tinker_native_audio', False)
+        if self.force_native_audio:
+            self.pipeline.transcriber.offer_progress(mime)
+            audio = self.pipeline.transcriber._hear.peek()
+            grounded = self._voice_memory_valid()
+            if audio and not grounded and self._preview_grounding is None and self._voice_memory_task is None:
+                self._preview_grounding = asyncio.create_task(self._first_audio_vector(audio, mime))
+            return
         if native and self.audio and not self._audio_overflow:
             self.duplex.offer(self.audio, mime)
             grounded = self._voice_memory_valid()
@@ -409,26 +727,42 @@ class VoiceSession:
             return None
 
     async def on_end_utterance(self, mime: str) -> None:
-        audio, self.audio = bytes(self.audio), bytearray()
-        if self._audio_overflow:
-            self._audio_overflow = False
-            return
-        if not audio:
-            return
-        voice_role, prepared = await self.duplex.finish_prefix()
-        if self.tasker_intent:
-            # In Tasker, Persona L is the only speaker/goal decision-maker.
-            # The edited R lane belongs to tool execution, not voice output.
-            # Do not promote the private R prefix draft into the public turn.
-            voice_role, prepared = "L", ""
-        pending, self._preview_grounding = self._preview_grounding, None
-        first = not self._voice_memory_valid()
+        pending = None
         settings = getattr(self.mind, "s", None)
         native = self.force_native_audio or getattr(settings, "tinker_native_audio", False)
         try:
-            recording = await decode_native_audio(audio, mime) if native else None
-            if self.force_native_audio and not getattr(self.mind.voice_native or self.mind.a, "supports_native_audio", False):
-                raise RuntimeError("phone native-audio model is not configured")
+            if self.force_native_audio:
+                if self._audio_overflow:
+                    self._audio_overflow = False
+                    self.pipeline.transcriber._hear.clear()
+                    return
+                if not getattr(self.mind.voice_native or self.mind.a, "supports_native_audio", False):
+                    raise RuntimeError("native-audio model is not configured")
+                # DualListenTranscriber finishes L+R prefix prep into ONE DualLoop turn.
+                heard = await self.pipeline.transcriber.end_utterance(mime)
+                recording = heard.audio
+                voice_role, prepared = heard.voice_role or "L", heard.prepared_context or ""
+                speculative = getattr(heard, "speculative_opener", "") or ""
+                audio = recording.wav if recording is not None else b""
+            else:
+                audio, self.audio = bytes(self.audio), bytearray()
+                if self._audio_overflow:
+                    self._audio_overflow = False
+                    return
+                if not audio:
+                    return
+                voice_role, prepared, speculative = await self.duplex.finish_prefix()
+                recording = await decode_native_audio(audio, mime) if native else None
+
+            if self.tasker_intent:
+                # In Tasker, Persona L is the only speaker/goal decision-maker.
+                # The edited R lane belongs to tool execution, not voice output.
+                # Do not promote the private R prefix draft into the public turn.
+                voice_role, prepared, speculative = "L", "", ""
+            pending, self._preview_grounding = self._preview_grounding, None
+            first = not self._voice_memory_valid()
+            if not audio and recording is None:
+                return
             if first and pending is None and (not self.realtime_voice or self._voice_memory_task is None):
                 pending = asyncio.create_task(self._first_audio_vector(
                     recording.wav if recording else audio, "audio/wav" if recording else mime))
@@ -459,15 +793,34 @@ class VoiceSession:
                 self._native_turn = True
                 self._voice_response_role = voice_role
                 await self._emit({"type": "audio_received", "source": recording.source})
-                if self.tasker_intent:
-                    self._tasker_audio_revision += 1
-                    revision = self._tasker_audio_revision
-                    if self._tasker_intention is not None:
-                        self._tasker_intention.cancel()
-                    self._tasker_intention = asyncio.create_task(
-                        self._emit_tasker_intent(recording, revision))
-                self.turn_task = asyncio.create_task(self._turn(
-                    NATIVE_REQUEST, initial_query_embedding=vector, input_audio=recording, host_system=prepared))
+                self._turn_t0 = time.monotonic()
+                self._first_audio = None
+                self._ttfa_filler = None
+                self._ttfa_native_answer = None
+                self._lobe_a_bridge = ""
+                if self.dual_lobe_voice and not self.tasker_intent:
+                    # A = Ollama Qwen2.5-1.5B real-model bridge first;
+                    # B = MiMo native-audio DualLoop deep answer (interrupt kills B).
+                    raw_for_a = recording.wav if recording is not None else audio
+                    a_mime = "audio/wav" if recording is not None else mime
+                    self.turn_task = asyncio.create_task(self._dual_lobe_native_turn(
+                        recording, vector=vector, prepared=prepared, voice_role=voice_role,
+                        a_audio=raw_for_a, a_mime=a_mime))
+                else:
+                    # Dual-listen acceleration: speak the provisional opener NOW while
+                    # DualLoop starts on the complete audio (shared mind, not a split).
+                    if speculative and self.realtime_voice and not self.tasker_intent:
+                        self._speculative_task = asyncio.create_task(self._start_speculative(speculative))
+                    if self.tasker_intent:
+                        self._tasker_audio_revision += 1
+                        revision = self._tasker_audio_revision
+                        if self._tasker_intention is not None:
+                            self._tasker_intention.cancel()
+                        self._tasker_intention = asyncio.create_task(
+                            self._emit_tasker_intent(recording, revision))
+                    self.turn_task = asyncio.create_task(self._turn(
+                        NATIVE_REQUEST, initial_query_embedding=vector, input_audio=recording,
+                        host_system=prepared))
             else:
                 if not self.speech.has_asr:
                     raise RuntimeError("server ASR not configured; send text frames")
@@ -489,6 +842,76 @@ class VoiceSession:
                         pending.add_done_callback(self._consume_task)
                     else:
                         await asyncio.gather(pending, return_exceptions=True)
+
+    async def _dual_lobe_native_turn(self, recording: NativeAudio, *, vector,
+                                     prepared: str, voice_role: str,
+                                     a_audio: bytes, a_mime: str) -> None:
+        """A (tiny real LLM) bridge audio first; B native DualLoop answer next.
+
+        Interrupt/KILL cancels this whole task (B included). A's spoken text is
+        passed into B as host_system prefix so tone/continuation match.
+        """
+        self._voice_response_role = voice_role or "L"
+        user_text = await self._resolve_lobe_a_text(a_audio, a_mime)
+        if self.interrupted:
+            return
+        # Model call first so B receives the actual generated bridge as prefix;
+        # TTS for A runs overlapped with B DualLoop start.
+        assert self._lobe_a is not None
+        result = await self._lobe_a.generate_bridge(user_text)
+        self._lobe_a_host = result.host
+        self._lobe_a_model_ms = result.ttft_ms
+        bridge = result.text if result.ok else ""
+        self._lobe_a_bridge = bridge
+        await self._emit({
+            "type": "kernel",
+            "event": {
+                "type": "lobe_a",
+                "ok": bool(bridge),
+                "host": result.host,
+                "model": result.model,
+                "text": bridge,
+                "model_ms": result.ttft_ms,
+                "error": result.error,
+            },
+        })
+        if self.interrupted:
+            return
+        host = self._lobe_a_host_prefix(bridge, prepared)
+        speak_a: asyncio.Task | None = None
+        if bridge and not self.text_only:
+            self._speculative_opener = bridge
+            speak_a = asyncio.create_task(self._emit_and_say_bridge(bridge))
+        try:
+            await self._turn(
+                NATIVE_REQUEST,
+                initial_query_embedding=vector,
+                input_audio=recording,
+                host_system=host,
+            )
+        finally:
+            if speak_a is not None and not speak_a.done():
+                await asyncio.gather(speak_a, return_exceptions=True)
+
+    async def _emit_and_say_bridge(self, bridge: str) -> None:
+        if self.interrupted or not bridge:
+            return
+        await self._emit({"type": "delta", "text": bridge, "lobe": self._fast_lobe_tag})
+        before = self._first_audio
+        # Tag frame so TTFA filler attribution stays on the fast mouth.
+        if self.interrupted or self.text_only:
+            return
+        mode, audio, mime, rtt, extra = await self._synthesize(bridge)
+        if self._tts_first_ms is None and mode in ("audio", "say"):
+            self._tts_first_ms = round(rtt)
+        if mode == "audio" and audio is not None and not self.interrupted:
+            await self._dispatch_clips(0, bridge, audio, mime or "audio/mpeg", extra,
+                                       lobe=self._fast_lobe_tag)
+        elif mode == "say" and not self.interrupted:
+            await self._dispatch_speech(
+                0, {"type": "say", "seq": 0, "text": bridge, "lobe": self._fast_lobe_tag})
+        if self._first_audio is not None and (before is None or self._ttfa_filler is None):
+            self._ttfa_filler = self._first_audio
 
     def _memory_finished(self, task):
         if self._voice_memory_task is task:
@@ -605,28 +1028,50 @@ class VoiceSession:
             self._playback_released.set()
 
     async def _dispatch_speech(self, seq: int, frame: dict,
-                               blob: bytes | None = None) -> None:
-        """Only one segment in flight. ACK is armed BEFORE network send.
+                               blob: bytes | None = None, *,
+                               wait_ack: bool | None = None) -> None:
+        """Send one live audio/say frame. First audio never waits on ACK.
 
-        The speaker and client must not buffer future audio. While awaiting
-        playback, the socket loop can still process interrupt and input frames.
+        Later segments soft-continue quickly so ACK latency cannot serialize
+        synthesis of the next clause. Interrupt/input frames still run on the
+        socket loop while a soft wait is outstanding.
         """
         if self.interrupted:
             return
-        if self._turn_t0 is not None and self._first_audio is None:
+        first_audio = self._turn_t0 is not None and self._first_audio is None
+        if first_audio:
             self._first_audio = round((time.monotonic() - self._turn_t0) * 1000)
-        if self.playback_ack:
+            if self.dual_lobe_voice and self._ttfa_filler is None and (
+                    frame.get("lobe") == self._fast_lobe_tag
+                    or (self._lobe_a_bridge and frame.get("text") == self._lobe_a_bridge)):
+                self._ttfa_filler = self._first_audio
+        elif (self.dual_lobe_voice and self._ttfa_filler is not None
+              and self._ttfa_native_answer is None and self._turn_t0 is not None):
+            # First audible B content after A's bridge.
+            if frame.get("text") and frame.get("text") != self._lobe_a_bridge:
+                self._ttfa_native_answer = round((time.monotonic() - self._turn_t0) * 1000)
+        if wait_ack is None:
+            # First audible frame: fire immediately. Remaining soft-ACK only.
+            wait_ack = bool(self.playback_ack) and not first_audio
+        if wait_ack:
             self._playback_waiting = seq
             self._playback_released.clear()
         try:
             await self._emit(frame, blob)
-            if self.playback_ack and not self.interrupted:
+            if wait_ack and not self.interrupted:
+                # Soft path is the default with ACK clients; hard 30s only when
+                # soft ACK was explicitly disabled.
+                timeout = 0.45 if self._soft_playback_ack else 30.0
                 try:
-                    await asyncio.wait_for(self._playback_released.wait(), timeout=30.0)
+                    await asyncio.wait_for(self._playback_released.wait(), timeout=timeout)
                 except asyncio.TimeoutError:
-                    log.warning("voice playback ACK missing for seq %s", seq)
-                    self.interrupted = True
-                    await self._emit({"type": "error", "detail": "Audio playback acknowledgement timed out"})
+                    if self._soft_playback_ack:
+                        self._ack_soft_continues += 1
+                        log.debug("voice playback ACK soft-continue for seq %s", seq)
+                    else:
+                        log.warning("voice playback ACK missing for seq %s", seq)
+                        self.interrupted = True
+                        await self._emit({"type": "error", "detail": "Audio playback acknowledgement timed out"})
         finally:
             if self._playback_waiting == seq:
                 self._playback_waiting = None
@@ -640,26 +1085,81 @@ class VoiceSession:
         for i, s in enumerate(chunker.feed(text + " ") + chunker.flush()):
             await self._say(i, s)
 
+    async def _synthesize(self, sentence: str) -> tuple[str, bytes | None, str | None, float, list]:
+        """Run TTS only. Returns (mode, audio, mime, rtt_ms, extra_clips).
+
+        ``extra_clips`` are further already-decoded pieces of the SAME sentence
+        which must be played right after ``audio``; they exist because the
+        streaming path hands the first playable slice long before the sentence
+        is finished synthesising. mode is audio|say|skip.
+        """
+        if self.interrupted or self.text_only or not sentence.strip():
+            return "skip", None, None, 0.0, []
+        if not self.speech.has_tts:
+            return "say", None, None, 0.0, []
+        t0 = time.monotonic()
+        if self.speech.streams_tts and time.monotonic() >= self.speech._tts_retry_after:
+            # No clone path here: the streaming provider is Gemini native, and a
+            # reference-audio clone would push us back onto the slow endpoint.
+            try:
+                # Barge-in tears the SSE response down mid-sentence: the stop
+                # predicate is polled between audio slices, so an interrupted
+                # clause costs at most one slice of wasted audio, not the clip.
+                head, mime, rest = await asyncio.wait_for(
+                    self.speech.synthesize_head(sentence, stop=lambda: self.interrupted),
+                    timeout=12)
+                if self.interrupted:
+                    return "skip", None, None, (time.monotonic() - t0) * 1000, []
+                return "audio", head, mime, (time.monotonic() - t0) * 1000, rest
+            except Exception as exc:  # noqa: BLE001
+                # Count it. A throttled or quota-exhausted provider must back off
+                # across the whole session; otherwise every clause burns a dead
+                # round trip here AND another on the whole-clip path below.
+                speech = self.speech
+                speech._tts_failures += 1
+                speech._tts_retry_after = time.monotonic() + min(
+                    300.0, 5.0 * 2 ** min(speech._tts_failures, 6))
+                log.info("streaming tts unavailable (%s); backing off %.0fs",
+                         type(exc).__name__, speech._tts_retry_after - time.monotonic())
+        try:
+            from .clone import load as load_clone
+            clone = load_clone(getattr(self.mind.s, "data_dir", ""), self.persona["id"])
+            audio, mime = await asyncio.wait_for(
+                self.speech.synthesize(sentence, clone=clone), timeout=12)
+            rtt = (time.monotonic() - t0) * 1000
+            return "audio", audio, mime, rtt, []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("tts failed: %s", type(exc).__name__)
+            return "say", None, None, (time.monotonic() - t0) * 1000, []
+
+    async def _dispatch_clips(self, seq: int, sentence: str, audio: bytes, mime: str,
+                              extra: list, *, lobe: str = "") -> None:
+        """Play the head slice now, the rest of that sentence as live follow-ons.
+
+        Continuation frames carry no text: the words were already sent as a
+        delta, and re-sending them would duplicate what the person is hearing.
+        """
+        tag = {"lobe": lobe} if lobe else {}
+        await self._dispatch_speech(
+            seq, {"type": "audio", "seq": seq, "mime": mime, "text": sentence, **tag}, audio)
+        for blob, tail_mime in extra:
+            if self.interrupted or not blob:
+                return
+            await self._dispatch_speech(
+                seq, {"type": "audio", "seq": seq, "mime": tail_mime, "text": "", **tag}, blob)
+
     async def _say(self, seq: int, sentence: str) -> None:
         if self.interrupted or self.text_only:
             return
-        if self.speech.has_tts:
-            try:
-                from .clone import load as load_clone
-                clone = load_clone(getattr(self.mind.s, "data_dir", ""), self.persona["id"])
-                audio, mime = await asyncio.wait_for(
-                    self.speech.synthesize(sentence, clone=clone), timeout=20)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("tts failed: %s", type(exc).__name__)
+        mode, audio, mime, rtt, extra = await self._synthesize(sentence)
+        if self._tts_first_ms is None and mode in ("audio", "say"):
+            self._tts_first_ms = round(rtt)
+        if mode == "audio" and audio is not None and not self.interrupted:
+            await self._dispatch_clips(seq, sentence, audio, mime or "audio/mpeg", extra)
+        elif mode == "say" and not self.interrupted:
+            if self.speech.has_tts:
                 await self._emit({"type": "error", "detail": "Server speech failed; trying device speech"})
-                if not self.interrupted:
-                    await self._dispatch_speech(seq, {"type": "say", "seq": seq, "text": sentence})
-                return
-            if not self.interrupted:
-                await self._dispatch_speech(seq, {"type": "audio", "seq": seq, "mime": mime, "text": sentence}, audio)
-        else:
-            if not self.interrupted:
-                await self._dispatch_speech(seq, {"type": "say", "seq": seq, "text": sentence})
+            await self._dispatch_speech(seq, {"type": "say", "seq": seq, "text": sentence})
 
     async def _review(self, request: str, candidate: str, evidence: list[str], *,
                       input_audio: NativeAudio | None = None) -> dict:
@@ -735,6 +1235,8 @@ class VoiceSession:
     async def _response_events(self, text: str, *, initial_query_embedding=None,
                                input_audio: NativeAudio | None = None, host_system: str = ""):
         # A spoken browser task runs as long as a typed one; she talks through it.
+        # Fast voice memory/policy applies to every companion voice turn (text or
+        # native) so DualLoop is not held behind a cold full recall.
         async with asyncio.timeout(300):
             async for event in self.mind.respond(
                     self.persona["id"], text, channel="voice", dual=self.dual, steer=self.steer,
@@ -742,7 +1244,7 @@ class VoiceSession:
                     host_system=host_system,
                     **({"lane": self.lane} if self.lane else {}),
                     initial_query_embedding=initial_query_embedding,
-                    **({"realtime_voice": True} if self.realtime_voice and input_audio is not None else {}),
+                    **({"realtime_voice": True} if self.realtime_voice else {}),
                     **({"input_audio": input_audio} if input_audio is not None else {}),
                     **({"voice_responder": self._voice_response_role} if input_audio is not None and self._voice_response_role else {})):
                 yield event
@@ -772,8 +1274,18 @@ class VoiceSession:
         if goals is not None:
             goals.engaged(self.persona["id"], True)
         t0 = time.monotonic()
-        self._turn_t0, self._first_audio = t0, None
-        state = {"rev": self._input_revision, "seq": 0, "said": []}
+        # Keep speculative dual-listen first_audio clock if it already fired.
+        if self._turn_t0 is None:
+            self._turn_t0 = t0
+        if not self._speculative_opener:
+            self._tts_first_ms = None
+            self._first_delta_ms = None
+            self._first_audio = None
+            self._turn_t0 = t0
+        self._ack_soft_continues = 0
+        start_seq = 1 if self._speculative_opener else 0
+        state = {"rev": self._input_revision, "seq": start_seq,
+                 "said": ([self._speculative_opener] if self._speculative_opener else [])}
         candidate = ""
         verification = None
         verdict = None
@@ -781,13 +1293,45 @@ class VoiceSession:
         cancelled = False
         evidence: list[str] = []
         self._played_segments = 0
+        self._fast_l_spoke = ""
+        self._fast_l_note = ""
         queue: asyncio.Queue = asyncio.Queue()
         chunker = SentenceChunker()
         speaker = asyncio.create_task(self._speaker(queue, state))
+        # The fast reactive L runs CONCURRENTLY with this turn, not before it:
+        # its line is pushed onto the same speech queue, so it takes seq 0 when
+        # it wins the race and is simply never spoken when the deep path gets
+        # there first. Nothing here waits on it.
+        if (self.fast_l is not None and not self._speculative_opener
+                and text and text != NATIVE_REQUEST and not host_system):
+            # Snapshot the window BEFORE this utterance goes in, then record it:
+            # the responder sees what was said earlier in the call, never the
+            # question twice.
+            hist = list(self._fast_l_hist)
+            self._remember_fast_l("user", text)
+            self._fast_l_task = asyncio.create_task(
+                self._fast_l_race(text, queue, hist))
         idle: asyncio.Task | None = None
+        opener = self._speculative_opener
 
         def stale() -> bool:
             return self.interrupted or state["rev"] != self._input_revision
+
+        def skip_restated(seg: str) -> bool:
+            # Drop deep-path segments that only restate what was already spoken
+            # (a speculative opener, or the fast L's line). Only those two: widening this
+            # to every segment already spoken would silently drop a word a
+            # person is entitled to hear twice in one turn.
+            for spoken in (opener, self._fast_l_spoke):
+                if not spoken:
+                    continue
+                a = "".join(ch.lower() for ch in spoken if ch.isalnum() or ch.isspace()).split()
+                b = "".join(ch.lower() for ch in seg if ch.isalnum() or ch.isspace()).split()
+                if not a or not b:
+                    continue
+                if b[: max(1, len(a))] == a[:len(b)] or " ".join(a) in " ".join(b):
+                    return True
+            return False
 
         async def idle_flush(seen: int) -> None:
             # A finished clause followed by a tool wait is spoken now, not
@@ -795,7 +1339,8 @@ class VoiceSession:
             await asyncio.sleep(self.idle_flush_s)
             if seen == len(candidate) and not stale() and len(chunker.buf.strip()) >= chunker.min_len:
                 for seg in chunker.flush():
-                    queue.put_nowait(seg)
+                    if not skip_restated(seg):
+                        queue.put_nowait(seg)
 
         try:
             async for ev in self._response_events(text, initial_query_embedding=initial_query_embedding,
@@ -814,6 +1359,7 @@ class VoiceSession:
                         state["rev"] = self._input_revision
                         self._resume_on_switch = False
                         self.interrupted = False
+                    # Verify is informational for stream gate — never hold speech.
                     await self._emit({"type": "kernel", "event": ev})
                     continue
                 if kind == "done":
@@ -828,12 +1374,16 @@ class VoiceSession:
                 if kind == "delta":
                     piece = str(ev.get("text") or "")
                     candidate += piece
+                    if self._first_delta_ms is None and piece.strip():
+                        self._first_delta_ms = round((time.monotonic() - (self._turn_t0 or t0)) * 1000)
                     if len(candidate) > 64000 or stale():
                         continue
                     for seg in chunker.feed(piece):
-                        queue.put_nowait(seg)
+                        if not skip_restated(seg):
+                            queue.put_nowait(seg)
                     if idle is not None:
                         idle.cancel()
+                    # First clause: flush sooner so TTS starts before a tool wait.
                     idle = asyncio.create_task(idle_flush(len(candidate)))
             if idle is not None:
                 idle.cancel()
@@ -842,6 +1392,7 @@ class VoiceSession:
                     queue.put_nowait(seg)
             queue.put_nowait(None)
             # C reads the whole reply while its last sentences are still playing.
+            # Stream gate never awaits this before first audio.
             review = asyncio.create_task(self._review(
                 text, candidate, evidence, **({"input_audio": input_audio} if input_audio else {})))
             self._reviews.add(review)
@@ -881,6 +1432,9 @@ class VoiceSession:
             log.warning("voice turn failed: %s", type(exc).__name__)
         finally:
             self._playback_released.set()
+            if self._fast_l_task is not None and not self._fast_l_task.done():
+                self._fast_l_task.cancel()
+            self._fast_l_task = None
             for task in (idle, speaker):
                 if task is not None and not task.done():
                     task.cancel()
@@ -893,12 +1447,34 @@ class VoiceSession:
                         pass
                 metrics = dict(self.last_metrics)
                 metrics["first_audio_ms"] = self._first_audio
+                metrics["first_delta_ms"] = self._first_delta_ms
+                metrics["tts_first_rtt_ms"] = self._tts_first_ms
+                metrics["ack_soft_continues"] = self._ack_soft_continues
                 metrics["playback_ack_segments"] = self._played_segments
                 metrics["voice_gate"] = "stream"
                 metrics["whole_reply_c_reviewed"] = bool(verification and
                                                           verification.get("whole_reply_reviewed"))
+                metrics["fast_l_spoke"] = bool(self._fast_l_spoke)
+                metrics["fast_l_host"] = self._fast_l_host
+                metrics["fast_l_ms"] = self._fast_l_ms
+                metrics["fast_l_note"] = self._fast_l_note
+                metrics["tts_streams"] = self.speech.streams_tts
+                if self.dual_lobe_voice:
+                    metrics["dual_lobe_voice"] = True
+                    metrics["ttfa_filler"] = self._ttfa_filler
+                    metrics["ttfa_native_answer"] = self._ttfa_native_answer
+                    metrics["lobe_a_host"] = self._lobe_a_host
+                    metrics["lobe_a_model_ms"] = self._lobe_a_model_ms
+                    metrics["lobe_a_bridge"] = self._lobe_a_bridge
+                    metrics["lobe_b"] = "native:XiaomiMiMo/MiMo-V2.6-Flash"
+                # What was actually spoken this turn becomes the fast responder's next
+                # window entry: it can then hear itself, which is what makes a
+                # follow-up like "say that again slower" resolvable without recall.
+                self._remember_fast_l("assistant", " ".join(state["said"]))
                 done = {"type": "done", "text": " ".join(state["said"]),
                         "first_audio_ms": self._first_audio,
+                        "ttfa_filler": self._ttfa_filler,
+                        "ttfa_native_answer": self._ttfa_native_answer,
                         "interrupted": self.interrupted, "metrics": metrics}
                 if verdict:
                     done["verdict"] = verdict
@@ -914,20 +1490,127 @@ class VoiceSession:
                 goals.engaged(self.persona["id"], False)
             self._native_turn = False
             self._turn_t0 = None
+            self._speculative_opener = ""
+            if self._speculative_task is not None and not self._speculative_task.done():
+                self._speculative_task.cancel()
+            self._speculative_task = None
+
+    def _remember_fast_l(self, role: str, text: str) -> None:
+        """Keep the last few exchanges of this call for the fast responder.
+
+        Deliberately tiny and in-memory: the fast path exists to answer without
+        a retrieval round trip, so it gets what was just said out loud, not the
+        mind's records. The window is dropped with the session.
+        """
+        if self.fast_l is None:
+            return
+        text = str(text or "").strip()
+        if not text:
+            return
+        self._fast_l_hist.append({"role": role, "content": text[:600]})
+        del self._fast_l_hist[:-HISTORY_TURNS]
+
+    async def _fast_l_race(self, text: str, queue: asyncio.Queue,
+                           history: "list[dict] | None" = None) -> None:
+        """Speak the tiny model's line only if it beats the deep path to speech.
+
+        The deep DualLoop turn keeps running either way; this task never blocks
+        it and never speaks over it. When the fast answer abstains (the turn
+        needs a fact, a memory or a tool) it says nothing at all.
+        """
+        try:
+            res = await self.fast_l.reply(text, history=history)
+            self._fast_l_host = res.host
+            self._fast_l_ms = res.total_ms
+            self._fast_l_note = ("abstained" if res.abstained
+                                 else "ok" if res.ok else res.error)
+            if not res.ok or res.abstained or not res.text:
+                return
+            # The deep path already got a clause out: stay quiet, it is speaking.
+            # _first_delta_ms is the honest signal - it is set for any visible
+            # text, and audio is never set at all when output is text-only.
+            if self.interrupted or self._first_audio is not None or (
+                    self._first_delta_ms is not None and not self._fast_l_spoke):
+                return
+            self._fast_l_spoke = res.text
+            queue.put_nowait(res.text)
+            await self._emit({"type": "kernel", "event": {
+                "type": "fast_l", "mouth": self._fast_lobe_tag, "text": res.text, "model": res.model,
+                "host": res.host, "first_token_ms": res.first_token_ms,
+                "total_ms": res.total_ms}})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._fast_l_note = type(exc).__name__
 
     async def _speaker(self, queue: asyncio.Queue, state: dict) -> None:
-        """One sentence at a time, in order; text appears as it is spoken.
-        Holds text only - audio is synthesised for the one live segment."""
-        while True:
-            seg = await queue.get()
-            if seg is None:
-                return
-            if self.interrupted or state["rev"] != self._input_revision:
-                continue
-            await self._emit({"type": "delta", "text": seg})
+        """Pipeline: synthesize clause N+1 while clause N plays/soft-ACKs.
+
+        First speakable clause starts TTS immediately (does not wait for DualLoop
+        to finish). While clause N is dispatched/soft-ACK'd, clause N+1 TTS runs.
+        """
+        ahead: tuple[int, str, asyncio.Task] | None = None
+
+        def stale() -> bool:
+            return self.interrupted or state["rev"] != self._input_revision
+
+        async def kick(seg: str) -> tuple[int, str, asyncio.Task]:
+            seq = state["seq"]
+            state["seq"] = seq + 1
+            lobe = (self._fast_lobe_tag if self._fast_l_spoke and seg == self._fast_l_spoke
+                    else self._deep_lobe_tag)
+            await self._emit({"type": "delta", "text": seg, "lobe": lobe})
             state["said"].append(seg)
-            await self._say(state["seq"], seg)
-            state["seq"] += 1
+            return seq, seg, asyncio.create_task(self._synthesize(seg))
+
+        async def deliver_result(seq: int, sentence: str,
+                                 mode: str, audio: bytes | None, mime: str | None,
+                                 rtt: float, extra: list | None = None) -> None:
+            if self._tts_first_ms is None and mode in ("audio", "say"):
+                self._tts_first_ms = round(rtt)
+            if stale():
+                return
+            if mode == "audio" and audio is not None:
+                await self._dispatch_clips(seq, sentence, audio, mime or "audio/mpeg",
+                                           extra or [],
+                                           lobe=(self._fast_lobe_tag if self._fast_l_spoke
+                                                 and sentence == self._fast_l_spoke
+                                                 else self._deep_lobe_tag))
+            elif mode == "say":
+                if self.speech.has_tts:
+                    await self._emit({"type": "error",
+                                      "detail": "Server speech failed; trying device speech"})
+                await self._dispatch_speech(seq, {"type": "say", "seq": seq, "text": sentence})
+
+        while True:
+            if ahead is not None:
+                seq, sentence, synth = ahead
+                ahead = None
+            else:
+                seg = await queue.get()
+                if seg is None:
+                    return
+                if stale():
+                    continue
+                seq, sentence, synth = await kick(seg)
+
+            getter = asyncio.create_task(queue.get())
+            mode, audio, mime, rtt, extra = await synth
+            if getter.done():
+                nxt = getter.result()
+                if nxt is None:
+                    await deliver_result(seq, sentence, mode, audio, mime, rtt, extra)
+                    return
+                if not stale():
+                    # Overlap: next TTS runs during current soft-ACK wait.
+                    ahead = await kick(nxt)
+            await deliver_result(seq, sentence, mode, audio, mime, rtt, extra)
+            if ahead is None:
+                nxt = await getter
+                if nxt is None:
+                    return
+                if not stale():
+                    ahead = await kick(nxt)
 
     async def _turn_whole(self, text: str, *, initial_query_embedding=None,
                           input_audio: NativeAudio | None = None, host_system: str = "") -> None:

@@ -1,0 +1,17 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Runtime data and databases
+data/
+*.sqlite
+adaptive_tasks.sqlite
+decisions.sqlite
+native-audio/
+
+# Secrets
+.env
+
+# OS junk
+.DS_Store
+Thumbs.db

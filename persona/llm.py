@@ -235,12 +235,13 @@ class OpenAICompatLLM(LLM):
             body["tools"] = tools
         if json_mode:
             body["response_format"] = {"type": "json_object"}
-        if getattr(self.endpoint, "no_think", False) and "api.deepinfra.com" not in self.endpoint.base_url.lower():
-            # Ask reasoning models (Qwen3, DeepSeek-R1, ...) to skip the hidden
-            # "thinking" stream (delta.reasoning). Measured: 26-74s per reply with
-            # thinking on vs ~3s with it off. Providers that do not understand the
-            # field ignore it; ones that reject it are handled by the 400-fallback
-            # in chat()/stream().
+        if getattr(self.endpoint, "no_think", False):
+            # Ask reasoning models (Qwen3, DeepSeek-R1, MiMo, ...) to skip the
+            # hidden "thinking" stream (delta.reasoning_content). Measured on
+            # DeepInfra MiMo-V2.6-Flash native audio: ~2.7s TTFT with thinking
+            # off vs multi-second reasoning before first audible content.
+            # Providers that do not understand the field ignore it; ones that
+            # reject it are handled by the 400-fallback in chat()/stream().
             body["chat_template_kwargs"] = {"enable_thinking": False}
         return body
 

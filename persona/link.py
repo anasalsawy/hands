@@ -130,10 +130,35 @@ class LinkedLane:
     process: Any = None
     _bridge_task: asyncio.Task | None = None
 
+    # Identity this motor runs as (set by Link.delegate kwargs). The spawned
+    # engine authenticates with ``persona_key`` so it registers on the hub as
+    # *this* persona's runner; ``persona_id`` is the hub addressing key.
+    persona_id: int = 0
+    persona_key: str = ""
+
+    # True once HandsHub has shown a runner for this lane. Set by
+    # ``Link.observe_hub`` (which reads the hub, the only real source of truth)
+    # and read by ``Link._await_connection``, so "spawned" can only mean connected.
+    connected: bool = False
+
+    # Optional callback ``fn(exit_code, error)`` fired when the motor dies. The
+    # court deck uses it so a card that loses its engine reports the truth
+    # instead of sitting at "running" forever.
+    on_exit: Any = None
+
     # Lifecycle
     status: str = "starting"               # starting | active | done | failed | stopped
     started_at: float = 0.0
     error: str = ""
+
+    @property
+    def alive(self) -> bool:
+        """Is there actually a motor behind this lane right now?"""
+        if self.status != "active":
+            return False
+        if self.agent.strategy == "spawn":
+            return self.process is not None and self.process.returncode is None
+        return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -878,6 +903,10 @@ class Link:
         self.agent = agent
         self.driver = driver
         self._lanes: dict[str, LinkedLane] = {}
+        # Strong references to process monitors. An unheld ``create_task`` is
+        # only weakly referenced by the loop and can be collected mid-await,
+        # which would silently drop the death notice for a spawned engine.
+        self._monitor_tasks: set[asyncio.Task] = set()
         self._hub = None         # set by LinkRegistry when hub is available
         self._persona_id = 0     # set by LinkRegistry
 
@@ -947,12 +976,22 @@ class Link:
     # ────────────────────────────────────────────────────── delegate
 
     async def delegate(self, lane_id: str, instruction: str, **kwargs) -> LinkedLane:
-        """Start work on an R-lane through this agent."""
+        """Start work on an R-lane through this agent.
+
+        ``kwargs`` carries the identity the motor must run as:
+            persona_id (int): the persona whose lane this is (hub addressing)
+            persona_key (str): that persona's own key, forwarded to the spawned
+                engine so it registers as ITS runner, not as some other persona.
+                A caller that does not pass one falls back to the key this Link
+                was registered with.
+        """
         if lane_id in self._lanes and self._lanes[lane_id].status == "active":
             raise RuntimeError(f"lane {lane_id} is already active on {self.agent.name}")
 
         linked = LinkedLane(lane_id=lane_id, agent=self.agent, instruction=instruction,
                             started_at=time.monotonic())
+        linked.persona_id = int(kwargs.get("persona_id") or self._persona_id or 0)
+        linked.persona_key = str(kwargs.get("persona_key") or "")
         self._lanes[lane_id] = linked
 
         if self.agent.strategy == "hijack":
@@ -1014,14 +1053,31 @@ class Link:
         return True
 
     async def status(self, lane_id: str) -> str:
-        """Check the status of a lane."""
+        """Check the status of a lane, honestly.
+
+        Reconciles with HandsHub first: the hub is what a tool call actually
+        reaches, so a lane the hub cannot see is not running, whatever the
+        process table says.
+        """
         linked = self._lanes.get(lane_id)
         if not linked:
             return "unknown"
 
+        await self.observe_hub()
+
         if self.agent.strategy == "spawn" and linked.process:
-            if linked.process.returncode is not None:
-                linked.status = "done" if linked.process.returncode == 0 else "failed"
+            rc = linked.process.returncode
+            if rc is not None:
+                # Cleanly exiting is only "done" if the engine ever got as far
+                # as connecting. A process that died at the handshake is a
+                # failure with the engine's own words attached, never a success.
+                connected = linked.connected is not None and linked.connected.done() \
+                    and not linked.connected.cancelled() and linked.connected.exception() is None
+                if rc == 0 and connected:
+                    linked.status = "done"
+                else:
+                    linked.status = "failed"
+                    linked.error = linked.error or f"engine exited with code {rc} without working"
 
         if self.agent.strategy == "api_bridge" and linked._bridge_task:
             if linked._bridge_task.done():
@@ -1033,8 +1089,12 @@ class Link:
         return linked.status
 
     def active_lanes(self) -> list[str]:
-        """Lane IDs currently active on this agent."""
-        return [lid for lid, ln in self._lanes.items() if ln.status == "active"]
+        """Lane IDs that have a live motor behind them right now.
+
+        A lane whose engine died is not active, so ``/v1/link`` can never list a
+        hand that ``/v1/hands`` cannot see.
+        """
+        return [lid for lid, ln in self._lanes.items() if ln.alive]
 
     def lane(self, lane_id: str) -> LinkedLane | None:
         """Get a linked lane by ID."""
@@ -1108,11 +1168,16 @@ class Link:
     # ────────────────────────────────────────────────────── spawn internals
 
     async def _spawn_delegate(self, linked: LinkedLane, instruction: str):
-        """Launch a new sawii_hands.py process for this lane.
+        """Launch a new sawii_hands.py process for this lane, and PROVE it connected.
 
         The spawned process connects back to Persona's /v1/hands WebSocket
         with the lane ID. HandsHub registers it and handles all subsequent
-        call/result traffic. The Link only manages the process lifecycle.
+        call/result traffic. The Link manages the process lifecycle *and*
+        resolves ``linked.connected`` the moment the hub sees this lane's
+        runner, so a caller can await real liveness instead of trusting that a
+        started process is a working motor. If the process dies or never
+        checks in, the lane ends ``failed`` carrying the engine's own stderr —
+        "running with no motor" is never an allowed state.
         """
         binary = self.agent.binary
         if not binary or not os.path.isfile(binary):
@@ -1121,10 +1186,25 @@ class Link:
             log.error("Link: spawn binary not found: %s", binary)
             return
 
+        # The engine authenticates as the persona that owns this lane. Falling
+        # back to the registration key keeps single-persona deployments working,
+        # but a lane created by persona B must never connect as persona A: its
+        # runner would register on the wrong hub slot and the card would show
+        # "running" with no motor under its own persona.
+        key = linked.persona_key or self.agent.key
+        url = self.agent.url
+        if not key or not url:
+            linked.status = "failed"
+            linked.error = ("engine has no persona url/key to connect with "
+                            f"(url={'set' if url else 'empty'}, key={'set' if key else 'empty'})")
+            log.error("Link: cannot spawn %s for lane %s: %s",
+                      self.agent.name, linked.lane_id, linked.error)
+            return
+
         cmd = [
             sys.executable, binary,
-            "--url", self.agent.url,
-            "--key", self.agent.key,
+            "--url", url,
+            "--key", key,
             "--approve", self.agent.approve,
             "--place", self.agent.place,
             "--lane", linked.lane_id,
@@ -1136,6 +1216,12 @@ class Link:
         env = {**os.environ}
         # Pass the lane instruction so the worker can read it on start.
         env["SAWII_LANE_INSTRUCTION"] = instruction[:4000]
+        # Belt and braces: the engine also reads its connection from the
+        # environment, so a quoting mistake in argv cannot produce a child
+        # that dies on "--url and --key are required".
+        env["SAWII_HANDS_URL"] = url
+        env["SAWII_HANDS_KEY"] = key
+        env["SAWII_HANDS_LANE"] = linked.lane_id
 
         try:
             linked.process = await asyncio.create_subprocess_exec(
@@ -1145,16 +1231,111 @@ class Link:
                 stderr=asyncio.subprocess.PIPE,
             )
             linked.status = "active"
-            log.info("Link: spawned %s (pid %d) for lane %s",
-                     binary, linked.process.pid, linked.lane_id)
+            log.info("Link: spawned %s (pid %d) for lane %s (persona %s, place %s, roots %s)",
+                     binary, linked.process.pid, linked.lane_id,
+                     linked.persona_id or self._persona_id, self.agent.place,
+                     ", ".join(self.agent.roots) or "(none)")
 
-            # Monitor the process in the background so we know when it exits
-            asyncio.create_task(self._monitor_process(linked))
+            # Keep a strong reference: an unheld create_task can be garbage
+            # collected mid-flight, which would silently drop the monitor and
+            # leave a dead process looking active forever.
+            task = asyncio.create_task(self._monitor_process(linked))
+            self._monitor_tasks.add(task)
+            task.add_done_callback(self._monitor_tasks.discard)
+
+            # Do not return "active" until the hub has actually registered this
+            # lane's runner (or the engine proves it is dead).
+            await self._await_connection(linked)
 
         except Exception as exc:
             linked.status = "failed"
             linked.error = str(exc)[:200]
             log.exception("Link: failed to spawn %s: %s", binary, exc)
+
+    def hub_lane_seen(self, linked: LinkedLane) -> bool:
+        """Has HandsHub registered this lane's runner under the right persona?
+
+        The hub is the only proof that a motor exists: it is the thing tool
+        calls are actually routed through. Reading it here (instead of trusting
+        that ``create_subprocess_exec`` returned) is what makes an honest
+        ``running`` possible. The persona must match too — a runner that checked
+        in as somebody else is not this lane's hand.
+        """
+        hub = self._hub
+        pid = linked.persona_id or self._persona_id
+        if hub is None or not pid:
+            return False
+        try:
+            runner = hub.runners.get(hub._key(pid, self.agent.place, linked.lane_id))
+        except Exception:  # noqa: BLE001 - a hub we cannot read proves nothing
+            return False
+        return runner is not None
+
+    async def observe_hub(self) -> None:
+        """Reconcile every spawn lane with what the hub can actually see.
+
+        Called on each status/diagnostics read. A lane whose engine vanished is
+        moved to ``failed`` with a reason, so ``/v1/link`` and the card agree
+        with ``/v1/hands`` rather than contradicting it.
+        """
+        for linked in list(self._lanes.values()):
+            if self.agent.strategy != "spawn" or linked.status not in ("active", "starting"):
+                continue
+            if linked.process is not None and linked.process.returncode is not None:
+                continue  # _monitor_process owns the verdict for a dead process
+            seen = self.hub_lane_seen(linked)
+            if seen and not linked.connected:
+                linked.connected = True
+                log.info("Link: lane %s engine is live on /v1/hands (%s)",
+                         linked.lane_id, self.agent.name)
+            elif linked.connected and not seen:
+                linked.status = "failed"
+                linked.error = "the engine disconnected from /v1/hands"
+                log.warning("Link: lane %s lost its engine: %s", linked.lane_id, linked.error)
+                self._fire_exit(linked, None, linked.error)
+
+    async def _await_connection(self, linked: LinkedLane) -> bool:
+        """Block until this lane's runner is on the hub, or it dies, or timeout.
+
+        Returns True only when HandsHub shows the runner. Anything else marks
+        the lane ``failed`` with the reason, so nothing upstream can report a
+        motor that does not exist.
+        """
+        deadline = time.monotonic() + SPAWN_CONNECT_TIMEOUT
+        while time.monotonic() < deadline:
+            if self.hub_lane_seen(linked):
+                linked.connected = True
+                log.info("Link: lane %s engine connected (%s pid %s)",
+                         linked.lane_id, self.agent.name,
+                         linked.process.pid if linked.process else "?")
+                return True
+            if linked.process is not None and linked.process.returncode is not None:
+                break  # died before connecting; the monitor fills in the reason
+            await asyncio.sleep(0.1)
+        if self.hub_lane_seen(linked):
+            linked.connected = True
+            return True
+        if linked.status not in ("active", "starting"):
+            return False  # the monitor already recorded why it died
+        linked.status = "failed"
+        if linked.process is not None and linked.process.returncode is None:
+            linked.error = (f"engine started but never connected to /v1/hands within "
+                            f"{int(SPAWN_CONNECT_TIMEOUT)} s (check the persona key and url)")
+        else:
+            rc = linked.process.returncode if linked.process is not None else None
+            linked.error = f"engine exited before connecting (exit code {rc})"
+        log.error("Link: lane %s: %s", linked.lane_id, linked.error)
+        self._fire_exit(linked, None, linked.error)
+        return False
+
+    def _fire_exit(self, linked: LinkedLane, rc: int | None, error: str) -> None:
+        """Tell whoever opened this lane that its motor is gone."""
+        if linked.on_exit is None:
+            return
+        try:
+            linked.on_exit(rc, error)
+        except Exception:  # noqa: BLE001 - a hook must not break the Link
+            log.exception("Link: engine exit hook failed for lane %s", linked.lane_id)
 
     async def _monitor_process(self, linked: LinkedLane):
         """Wait for a spawned process to finish and update status."""
@@ -1163,15 +1344,31 @@ class Link:
         try:
             stdout, stderr = await linked.process.communicate()
             rc = linked.process.returncode
-            if rc == 0:
-                if linked.status == "active":
+            detail = (stderr or stdout or b"").decode("utf-8", errors="replace").strip()
+            # The engine talks to its own stdout/stderr; capture the tail of it
+            # in the error so an operator sees WHY (bad key, refused, no roots).
+            if rc != 0:
+                linked.status = "failed"
+                linked.error = (detail[-400:] or f"engine exited with code {rc}")
+                log.warning("Link: spawned process for lane %s exited with %d: %s",
+                            linked.lane_id, rc, linked.error)
+            elif linked.status in ("active", "starting"):
+                # A process that exits without ever being seen on /v1/hands did
+                # no work, however clean its exit code looks.
+                if linked.connected:
                     linked.status = "done"
-            else:
-                if linked.status == "active":
+                    if detail:
+                        log.info("Link: engine for lane %s finished cleanly: %s",
+                                 linked.lane_id, detail[-200:])
+                else:
                     linked.status = "failed"
-                    linked.error = (stderr or stdout or b"").decode("utf-8", errors="replace")[:200]
+                    linked.error = (detail[-400:]
+                                    or f"engine exited (code {rc}) without ever connecting")
                     log.warning("Link: spawned process for lane %s exited with %d: %s",
                                 linked.lane_id, rc, linked.error)
+            # Tell whoever opened the lane. A silent death mid-goal is worse
+            # than an honest failure.
+            self._fire_exit(linked, rc, linked.error)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -1214,6 +1411,23 @@ class LinkRegistry:
         self._links: dict[str, Link] = {}
         self._hub = None
         self._persona_id = 0
+        # persona id -> the persona key that persona authenticated with, seen on
+        # the request that opened its work (never persisted). A spawned engine
+        # must connect as the persona whose lane it drives: the hub keys runners
+        # by (persona, place, lane), so a hand registered under another persona
+        # is invisible to the very lane that spawned it.
+        self._persona_keys: dict[int, str] = {}
+
+    def remember_persona_key(self, persona_id: int, key: str) -> None:
+        """Note the key a persona is using, so its motors can authenticate as it."""
+        pid = int(persona_id or 0)
+        key = str(key or "")
+        if pid and key and len(key) < 200:
+            self._persona_keys[pid] = key
+
+    def persona_key(self, persona_id: int) -> str:
+        """The key to spawn this persona's engines with ('' when unknown)."""
+        return self._persona_keys.get(int(persona_id or 0), "")
 
     def set_hub(self, hub, persona_id: int = 0):
         """Provide the HandsHub reference so API bridges can use it.
@@ -1281,6 +1495,11 @@ class LinkRegistry:
                     link.receive_result(call_id, result)
                     return True
         return False
+
+    async def observe_hub(self) -> None:
+        """Reconcile every Link's lanes with what HandsHub can actually see."""
+        for link in self._links.values():
+            await link.observe_hub()
 
     def info(self) -> dict:
         """Diagnostics summary for all registered agents."""

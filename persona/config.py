@@ -72,8 +72,47 @@ def _float(name: str, default: float) -> float:
 
 
 FEATHERLESS = "https://api.featherless.ai/v1"
+DEEPINFRA = "https://api.deepinfra.com"
+DEEPINFRA_OPENAI = "https://api.deepinfra.com/v1/openai"
 TINKER_OAI = "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1"
 INKLING_SMALL = "thinkingmachines/Inkling-Small"
+MIMO_HEAR = "XiaomiMiMo/MiMo-V2.6-Flash"
+MIMO_TTS = "XiaomiMiMo/MiMo-V2.5-tts"
+QWEN3_TTS = "Qwen/Qwen3-TTS"
+# Lowest practical DeepInfra TTS RTT in bake-off (warm p50 ~0.8s).
+# Override with SAWII_TTS_MODEL=... to force MiMo/Qwen/etc.
+INWORLD_TTS = "inworld-ai/realtime-tts-1.5-mini"
+
+# ------------------------------------------------------------------ provider choice
+# Featherless is the authoritative default provider for every Persona lobe.
+# DeepInfra is now an EXPLICIT opt-in, never a side effect of a credential being
+# present in the environment: the mere existence of DEEPINFRA_API_KEY used to
+# repoint TTS, native audio and the Cursor worker at api.deepinfra.com, which
+# silently moved lobes onto a provider nobody chose (and onto a suspended
+# account). Set SAWII_PROVIDER=deepinfra to route the defaults back there - no
+# code change needed - or point one lobe at it with its own SAWII_<PREFIX>_BASE_URL.
+PROVIDER_FEATHERLESS = "featherless"
+PROVIDER_DEEPINFRA = "deepinfra"
+
+
+def provider() -> str:
+    """The explicitly chosen default provider: featherless unless SAWII_PROVIDER says otherwise."""
+    wanted = _env("PROVIDER", "").strip().lower()
+    return PROVIDER_DEEPINFRA if wanted == PROVIDER_DEEPINFRA else PROVIDER_FEATHERLESS
+
+
+def deepinfra_preferred() -> bool:
+    """True only when DeepInfra was chosen on purpose (SAWII_PROVIDER=deepinfra).
+
+    A present-but-unused DEEPINFRA_API_KEY means nothing here. An endpoint whose
+    own SAWII_<PREFIX>_BASE_URL names api.deepinfra.com still uses DeepInfra for
+    that one lobe regardless of this flag - per-lobe override always wins.
+    """
+    return provider() == PROVIDER_DEEPINFRA
+
+
+def is_deepinfra_base(base_url) -> bool:
+    return "api.deepinfra.com" in (base_url or "").lower()
 
 # ------------------------------------------------------------------ Cursor aliases
 # Hard-coded alias table for the Cursor adapter - the CURSOR-DEEPINFRA host
@@ -112,7 +151,7 @@ INKLING_SMALL = "thinkingmachines/Inkling-Small"
 #                                  id (what "sawii-persona" on this surface
 #                                  gets); an alias in the request still resolves
 #                                  strictly through the table, never through it.
-CURSOR_DEEPINFRA_BASE = "https://api.deepinfra.com/v1/openai"
+CURSOR_DEEPINFRA_BASE = DEEPINFRA_OPENAI
 # Price comments per 1M tokens, verified on deepinfra.com 2026-11-06.
 CURSOR_MODEL_IDS = (
     "deepseek-ai/DeepSeek-V4.1-Flash",          # $0.098 in / $0.294 out (51% off) - the baseline
@@ -137,32 +176,77 @@ CURSOR_DEFAULT_ALIAS = "sawii-fast"
 CURSOR_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 CURSOR_PUBLIC_MODEL = "sawii-persona"
 
+# The same closed deal sheet, priced for Featherless, which is now the default
+# provider. Every id below was read out of GET https://api.featherless.ai/v1/models
+# (10,245 served models, 2026-11-08) - none are invented. XiaomiMiMo/MiMo-V2.6-Flash
+# is NOT served by Featherless, so "mimo-fast" keeps its alias key and re-points to
+# the cheapest fast reasoner Featherless does have; a host naming "mimo-fast" still
+# gets a table row, never a passthrough.
+CURSOR_FEATHERLESS_MODEL_IDS = (
+    "deepseek-ai/DeepSeek-V3.2",               # $0.264 in / $0.41 out - the baseline
+    "deepseek-ai/DeepSeek-V3.1-Terminus",      # $0.285 in / $1.00 out
+    "deepseek-ai/DeepSeek-V3-0324",            # $0.385 in / $1.625 out
+    "Qwen/Qwen3-Coder-Next",                   # $0.16 in / $1.15 out - coding-tuned
+    "openai/gpt-oss-120b",                     # $0.15 in / $0.60 out
+    "zai-org/GLM-4.6",                         # $0.55 in / $2.20 out
+)
+CURSOR_FEATHERLESS_ALIASES = {
+    # alias              -> Featherless model id
+    "sawii-fast":      "deepseek-ai/DeepSeek-V3.2",
+    "sawii-fast-v4":   "deepseek-ai/DeepSeek-V3.1-Terminus",
+    "sawii-fast-0731": "deepseek-ai/DeepSeek-V3-0324",
+    "sawii-fast-1017": "Qwen/Qwen3-Coder-Next",
+    "mimo-fast":       "openai/gpt-oss-120b",          # MiMo is not on Featherless
+    "glm-flash":       "zai-org/GLM-4.6",
+}
+CURSOR_FEATHERLESS_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V3.2"
 
-def resolve_cursor_alias(name) -> str:
-    """Alias key or table model id -> DeepInfra model id. "" = not in the table.
 
-    Strictly a lookup: a friendly alias resolves to its row, a model id that is
-    one of the rows resolves to itself, and every other string - any live model
-    id this deal sheet does not name - resolves to "". Nothing is passed through.
+def cursor_table(which: str = "") -> tuple[tuple[str, ...], dict[str, str]]:
+    """(model ids, alias map) for a provider - featherless unless told otherwise.
+
+    Two closed tables, one per provider, sharing one alias-key space so a host
+    never has to know which provider is live. Selection follows SAWII_PROVIDER;
+    it is NOT chosen by whichever credential happens to be in the environment.
+    """
+    which = (which or provider()).strip().lower()
+    if which == PROVIDER_DEEPINFRA:
+        return CURSOR_MODEL_IDS, CURSOR_MODEL_ALIASES
+    return CURSOR_FEATHERLESS_MODEL_IDS, CURSOR_FEATHERLESS_ALIASES
+
+
+def resolve_cursor_alias(name, which: str = "") -> str:
+    """Alias key or table model id -> a model id on the ACTIVE provider. "" = not in the table.
+
+    Strictly a lookup against one closed table (see cursor_table): a friendly alias
+    resolves to its row, a model id that is one of the active rows resolves to
+    itself, and every other string - any live model id this deal sheet does not
+    name, including a row belonging to the OTHER provider - resolves to "".
+    Nothing is ever passed through, and switching the default provider does not
+    widen what a host can name.
     """
     if not isinstance(name, str):
         return ""
+    ids, aliases = cursor_table(which)
     key = name.strip()
-    hit = CURSOR_MODEL_ALIASES.get(key, "")
+    hit = aliases.get(key, "")
     if hit:
         return hit
-    return key if key in CURSOR_MODEL_IDS else ""
+    return key if key in ids else ""
 
 
-def cursor_default_alias() -> str:
-    """SAWII_CURSOR_ALIAS when it names a real row, else the V4.1-Flash baseline."""
+def cursor_default_alias(which: str = "") -> str:
+    """SAWII_CURSOR_ALIAS when it names a real row of the active table, else the baseline."""
     wanted = _env("CURSOR_ALIAS", "").strip()
-    return wanted if resolve_cursor_alias(wanted) else CURSOR_DEFAULT_ALIAS
+    return wanted if resolve_cursor_alias(wanted, which) else CURSOR_DEFAULT_ALIAS
 
 
-def cursor_default_model() -> str:
-    """The model id behind the default alias - the cheap coding baseline."""
-    return resolve_cursor_alias(cursor_default_alias()) or CURSOR_DEFAULT_MODEL
+def cursor_default_model(which: str = "") -> str:
+    """The model id behind the default alias - the cheap coding baseline of the active table."""
+    which = (which or provider()).strip().lower()
+    fallback = (CURSOR_DEFAULT_MODEL if which == PROVIDER_DEEPINFRA
+                else CURSOR_FEATHERLESS_DEFAULT_MODEL)
+    return resolve_cursor_alias(cursor_default_alias(which), which) or fallback
 
 
 def cursor_alias_for(value) -> str:
@@ -178,21 +262,40 @@ def cursor_alias_for(value) -> str:
     return resolve_cursor_alias(value)
 
 
-def cursor_worker_endpoint(inherit: ModelEndpoint) -> ModelEndpoint:
-    """The endpoint the CURSOR-DEEPINFRA adapter is built from (INFER_A prefix).
+def cursor_alias_for(value, base_url: str = "") -> str:
+    """A cursor request's model string -> a table model id, "" for anything else.
 
-    Pointing SAWII_INFER_A_BASE_URL at DeepInfra is the opt-in switch: the
-    adapter had no model of its own (SAWII_INFER_A_MODEL defaults empty, which
-    used to mean "inherit the speaker's model, or nothing"), so the default
-    comes from the alias table - deepseek-ai/DeepSeek-V4.1-Flash unless
-    SAWII_CURSOR_ALIAS names another entry. Any other base keeps the old
-    behaviour exactly: blank model, inherit the provider, no alias defaults.
+    "sawii-persona" (or no model at all) is NOT run through here: the gate in
+    api/app.py accepts the public pin outright and the worker keeps its own
+    configured model, which config already defaults to the baseline alias of the
+    active table - the "default alias when unset" leg.
+    What reaches here is an explicit model string: only a row of the table
+    resolves, an arbitrary provider id returns "" and the caller 400s it.
+    Pass the worker's base_url to resolve against that provider's table.
+    """
+    which = PROVIDER_DEEPINFRA if is_deepinfra_base(base_url) else ""
+    return resolve_cursor_alias(value, which)
+
+
+def cursor_worker_endpoint(inherit: ModelEndpoint) -> ModelEndpoint:
+    """The endpoint the Cursor host worker is built from (INFER_A prefix).
+
+    The R-side execution lane now runs on Featherless by default, exactly like
+    every other lobe. Activation no longer depends on naming an
+    api.deepinfra.com base: the worker is configured whenever a base resolves
+    (SAWII_INFER_A_BASE_URL, else A's own provider), and its model comes from
+    the ACTIVE alias table - deepseek-ai/DeepSeek-V3.2 on Featherless,
+    deepseek-ai/DeepSeek-V4.1-Flash under SAWII_PROVIDER=deepinfra - unless
+    SAWII_CURSOR_ALIAS names another row or SAWII_INFER_A_MODEL overrides it.
+    The whitelist property is unchanged: only table rows can ever be selected.
+    SAWII_INFER_A_BASE_URL=https://api.deepinfra.com/v1/openai still pins this
+    one lobe to DeepInfra on its own, with no other lobe following.
     """
     base_url = _env("INFER_A_BASE_URL", "") or (inherit.base_url if inherit else "")
-    if "api.deepinfra.com" not in (base_url or "").lower():
-        return _endpoint("INFER_A", model="", timeout=90, inherit=inherit)
-    return _endpoint("INFER_A", model=cursor_default_model(),
-                     base=CURSOR_DEEPINFRA_BASE, timeout=90)
+    which = PROVIDER_DEEPINFRA if is_deepinfra_base(base_url) else provider()
+    return _endpoint("INFER_A", model=cursor_default_model(which),
+                     base=(CURSOR_DEEPINFRA_BASE if which == PROVIDER_DEEPINFRA else FEATHERLESS),
+                     timeout=90)
 
 
 @dataclass
@@ -219,13 +322,20 @@ def _endpoint(prefix: str, *, model: str, base: str = FEATHERLESS, timeout: floa
               inherit: "ModelEndpoint | None" = None) -> ModelEndpoint:
     base_url = _env(f"{prefix}_BASE_URL", "") or (inherit.base_url if inherit else base)
     supplied_key = _env(f"{prefix}_API_KEY", "")
-    # DeepInfra uses one service-wide credential. Prefer the dedicated secret
-    # over stale provider-specific keys or unresolved Railway reference strings.
-    # This also allows operators to set only DEEPINFRA_API_KEY in Railway.
-    if "api.deepinfra.com" in base_url.lower() and os.environ.get("DEEPINFRA_API_KEY", ""):
-        api_key = os.environ["DEEPINFRA_API_KEY"]
+    # Keys never cross providers. A base naming api.deepinfra.com takes the
+    # dedicated DeepInfra credential (it outranks a stale provider-specific key
+    # or an unresolved Railway reference string); any other base is treated as
+    # Featherless and takes FEATHERLESS_API_KEY. The old rule fired on the mere
+    # presence of DEEPINFRA_API_KEY and could hand that secret to a Featherless
+    # base, so the URL - not the environment - now decides, and a Featherless
+    # call can never carry the DeepInfra key nor a DeepInfra call the Featherless one.
+    if is_deepinfra_base(base_url):
+        api_key = os.environ.get("DEEPINFRA_API_KEY", "") or supplied_key
     else:
-        api_key = supplied_key or (inherit.api_key if inherit else _env("FEATHERLESS_API_KEY", ""))
+        # Only borrow an inherited credential when the inherited endpoint is on
+        # this same (non-DeepInfra) provider.
+        inherit_key = "" if inherit is None or is_deepinfra_base(inherit.base_url) else inherit.api_key
+        api_key = supplied_key or inherit_key or _env("FEATHERLESS_API_KEY", "")
     return ModelEndpoint(
         base_url=base_url.rstrip("/"),
         api_key=api_key,
@@ -233,6 +343,93 @@ def _endpoint(prefix: str, *, model: str, base: str = FEATHERLESS, timeout: floa
         timeout=(float(_env(f"{prefix}_TIMEOUT")) if _env(f"{prefix}_TIMEOUT").strip() else timeout),
         no_think=_bool("DISABLE_THINKING", True),
     )
+
+
+def _tts_endpoint() -> ModelEndpoint:
+    """Companion speak path. Featherless Chatterbox unless DeepInfra is chosen.
+
+    Featherless serves ResembleAI/chatterbox and chatterbox-turbo (both probed
+    live 2026-11-08), so the default needs no DeepInfra at all. Chatterbox takes
+    a named voice and has no "alloy": SAWII_TTS_VOICE selects one (Aaron, Anaya,
+    ...). The DeepInfra bake-off still stands for that provider -
+      inworld-ai/realtime-tts-1.5-mini ~0.83s p50 (DeepInfra only)
+      ResembleAI/chatterbox-turbo      ~0.84s
+      Qwen/Qwen3-TTS                   ~1.5s
+      XiaomiMiMo/MiMo-V2.5-tts         ~3.7s
+    DeepInfra is reached with SAWII_PROVIDER=deepinfra or SAWII_TTS_BASE_URL
+    naming api.deepinfra.com. Override the id with SAWII_TTS_MODEL.
+    """
+    on_deepinfra = deepinfra_preferred()
+    default_base = DEEPINFRA_OPENAI if on_deepinfra else FEATHERLESS
+    default_model = INWORLD_TTS if on_deepinfra else "ResembleAI/chatterbox"
+    base_url = (_env("TTS_BASE_URL", "") or default_base).rstrip("/")
+    if is_deepinfra_base(base_url):
+        # DeepInfra's own credential only, never the Featherless one.
+        api_key = os.environ.get("DEEPINFRA_API_KEY", "") or _env("TTS_API_KEY", "")
+    else:
+        api_key = _env("TTS_API_KEY", "") or _env("FEATHERLESS_API_KEY", "")
+    return ModelEndpoint(base_url, api_key, _env("TTS_MODEL", default_model))
+
+
+def _native_audio_host() -> str:
+    """Which provider hosts the audio-input ("hearing") model: deepinfra | featherless | off.
+
+    Capability, not credential, decides this one. Featherless serves no
+    audio-input chat model as of 2026-11-08 (checked all 10,245 served ids: no
+    XiaomiMiMo, no Qwen2-Audio, no MiniCPM-o, no whisper/asr), so native audio
+    cannot follow the Featherless default without being switched to a text-only
+    model that would silently stop hearing her. SAWII_NATIVE_AUDIO_HOST overrides:
+    "off" disables the DualLoop lobe outright, "featherless" forces the default
+    provider (use once Featherless serves an audio model, e.g. with
+    SAWII_VOICE_NATIVE_MODEL naming it).
+    """
+    wanted = _env("NATIVE_AUDIO_HOST", "").strip().lower()
+    if wanted in ("off", "none", "no", "false", "disabled"):
+        return "off"
+    if wanted in (PROVIDER_DEEPINFRA, PROVIDER_FEATHERLESS):
+        return wanted
+    if deepinfra_preferred():
+        return PROVIDER_DEEPINFRA
+    # CAPABILITY EXCEPTION, and the only place a bare credential still decides
+    # anything. Featherless has no audio-input model, so the ears have nowhere to
+    # go on the default provider; if a DeepInfra credential exists we keep them
+    # where they work rather than silently deafening her. This host is pinned to
+    # this one lobe - it cannot move the voice, the verifier, the observer or the
+    # R worker, and its key can never ride along on a Featherless request.
+    # Turn it off with SAWII_NATIVE_AUDIO_HOST=off.
+    return PROVIDER_DEEPINFRA if os.environ.get("DEEPINFRA_API_KEY", "") else "off"
+
+
+def _native_audio_available() -> bool:
+    """True when a hosted audio-input model exists, so /app may default to DualLoop."""
+    host = _native_audio_host()
+    if host == "off":
+        return False
+    return bool(_env("VOICE_NATIVE_MODEL", "") or host == PROVIDER_DEEPINFRA)
+
+
+def _voice_native_endpoint() -> ModelEndpoint:
+    """The audio-input lobe - the one endpoint deliberately allowed off Featherless."""
+    host = _native_audio_host()
+    if host == "off":
+        return _endpoint("VOICE_NATIVE", model="")
+    base = DEEPINFRA_OPENAI if host == PROVIDER_DEEPINFRA else FEATHERLESS
+    model = MIMO_HEAR if host == PROVIDER_DEEPINFRA else ""
+    return _endpoint("VOICE_NATIVE", model=model, base=base, timeout=90)
+
+
+def _asr_endpoint() -> ModelEndpoint:
+    """Speech-to-text. Unconfigured unless an operator names a base: Featherless has no ASR model.
+
+    The credential follows the base that was named, so pointing this at
+    api.deepinfra.com takes DEEPINFRA_API_KEY and nothing else can leak in.
+    """
+    base_url = _env("ASR_BASE_URL", "").rstrip("/")
+    if not base_url:
+        return ModelEndpoint("", "", _env("ASR_MODEL", "whisper-1"))
+    api_key = (os.environ.get("DEEPINFRA_API_KEY", "") if is_deepinfra_base(base_url)
+               else _env("ASR_API_KEY", "") or _env("FEATHERLESS_API_KEY", ""))
+    return ModelEndpoint(base_url, api_key, _env("ASR_MODEL", "whisper-1"))
 
 
 def _a_endpoint() -> ModelEndpoint:
@@ -297,9 +494,12 @@ class Settings:
     # C: the psych observer.
     c: ModelEndpoint = field(default_factory=lambda: _endpoint("C", model="Compumacy/Psych_Qwen_32B", timeout=120))
     # Semantic grounding: explicit provider selection; all secrets stay in the environment.
-    # Gemini Embedding 2 is the default for native text+audio. Explicit override only:
-    # native Gemini Embedding 2. An Actions secret is NOT a Render environment key.
-    embedding_provider: str = field(default_factory=lambda: _env("EMBEDDING_PROVIDER", "gemini").lower())
+    # Featherless Qwen/Qwen3-Embedding-8B is the default now that Featherless is the
+    # provider (probed live: 200, 4096-dim, ~3.0s cold). "gemini" (Gemini Embedding 2,
+    # 768-dim, needs GOOGLE_API_KEY/GEMINI_API_KEY) and "deepinfra" (768-dim) remain
+    # one env var away; note the vector dimension differs per provider, so switching
+    # re-embeds rather than reuses. An Actions secret is NOT a Render environment key.
+    embedding_provider: str = field(default_factory=lambda: _env("EMBEDDING_PROVIDER", "featherless").lower())
     google_api_key: str = field(default_factory=lambda: _env("GOOGLE_API_KEY", "") or os.environ.get("GEMINI_API_KEY", ""))
     require_initial_semantic: bool = field(default_factory=lambda: _bool("REQUIRE_INITIAL_SEMANTIC", True))
     session_grounded_memory: bool = field(default_factory=lambda: _bool("SESSION_GROUNDED_MEMORY", True))
@@ -327,12 +527,13 @@ class Settings:
     steer: ModelEndpoint = field(default_factory=lambda: _endpoint("STEER", model="", timeout=60,
                                                                    inherit=_endpoint("A", model="")))
     steer_max_tokens: int = field(default_factory=lambda: _int("STEER_MAX_TOKENS", 90))
-    # Inference (visits) may use a different worker than the companion's A -
-    # e.g. a cheap DeepSeek under an expensive director. Off unless
-    # SAWII_INFER_A_BASE_URL points at DeepInfra (then DEEPINFRA_API_KEY and
-    # the alias table apply - see cursor_worker_endpoint above). A plain
-    # SAWII_INFER_A_MODEL without a DeepInfra base still works as before,
-    # inheriting A's provider.
+    # Inference (visits only) may use a different worker than the companion's A -
+    # e.g. a cheap DeepSeek under an expensive director. This is the R-side
+    # execution lane (the CURSOR host worker). It runs on Featherless by default
+    # now (deepseek-ai/DeepSeek-V3.2 via the alias table, FEATHERLESS_API_KEY);
+    # SAWII_INFER_A_BASE_URL naming DeepInfra, or SAWII_PROVIDER=deepinfra, moves
+    # just this lane back with DEEPINFRA_API_KEY. SAWII_INFER_A_MODEL still
+    # overrides the worker's own id. The alias table stays closed either way.
     infer_a: ModelEndpoint = field(default_factory=lambda: cursor_worker_endpoint(
         _endpoint("A", model="")))
 
@@ -431,19 +632,30 @@ class Settings:
     # has passed the whole reply GREEN. README.md
     voice_gate: str = field(default_factory=lambda: _env("VOICE_GATE", "stream"))
     # --- voice -------------------------------------------------------------
-    native_audio_default: bool = field(default_factory=lambda: _bool("VOICE_NATIVE_AUDIO", False))
-    voice_native: ModelEndpoint = field(default_factory=lambda: _endpoint(
-        "VOICE_NATIVE", model="XiaomiMiMo/MiMo-V2.6-Flash", timeout=90))
-    asr: ModelEndpoint = field(default_factory=lambda: ModelEndpoint(
-        _env("ASR_BASE_URL", ""), _env("ASR_API_KEY", ""), _env("ASR_MODEL", "whisper-1")))
-    # Chatterbox on Featherless. It has no preset voice; SAWII_TTS_VOICE stays
-    # empty unless the provider is one that accepts a name (Qwen-TTS does).
-    tts: ModelEndpoint = field(default_factory=lambda: ModelEndpoint(
-        _env("TTS_BASE_URL", FEATHERLESS),
-        (_env("DEEPINFRA_API_KEY", "") if "api.deepinfra.com" in _env("TTS_BASE_URL", FEATHERLESS).lower()
-         else _env("TTS_API_KEY", "") or _env("FEATHERLESS_API_KEY", "")),
-        _env("TTS_MODEL", "ResembleAI/chatterbox")))
-    tts_voice: str = field(default_factory=lambda: _env("TTS_VOICE", ""))
+    # CAPABILITY EXCEPTION (verified 2026-11-08 against
+    # GET https://api.featherless.ai/v1/models, 10,245 ids): Featherless serves no
+    # audio-input chat model - no MiMo, no Qwen2-Audio, no MiniCPM-o, no
+    # whisper/asr id - so "hearing" cannot move to Featherless without losing the
+    # capability. Native audio therefore stays on the host that does serve it
+    # (DeepInfra MiMo-V2.6-Flash) and is deliberately the ONE lobe allowed to
+    # resolve to api.deepinfra.com. It is opt-in per lobe, never a side effect of
+    # a stray credential: SAWII_NATIVE_AUDIO_HOST=off (or a DeepInfra key that is
+    # absent) leaves it unconfigured and the companion falls back to ASR + text.
+    # Opt out of the DualLoop default with SAWII_VOICE_NATIVE_AUDIO=0.
+    native_audio_default: bool = field(default_factory=lambda: _bool(
+        "VOICE_NATIVE_AUDIO", _native_audio_available()))
+    voice_native: ModelEndpoint = field(default_factory=_voice_native_endpoint)
+    # ASR likewise: no speech-to-text model on Featherless. Unconfigured unless an
+    # operator names a base, and the key then follows that base's provider.
+    asr: ModelEndpoint = field(default_factory=_asr_endpoint)
+    # Featherless Chatterbox by default; DeepInfra MiMo/inworld under
+    # SAWII_PROVIDER=deepinfra. SAWII_TTS_* still overrides per lobe.
+    tts: ModelEndpoint = field(default_factory=_tts_endpoint)
+    # Named Mia is MiMo-specific; Chatterbox voices are named (Aaron, Anaya, ...)
+    # and the provider default applies when this is empty.
+    tts_voice: str = field(default_factory=lambda: _env(
+        "TTS_VOICE",
+        "Mia" if "mimo" in _env("TTS_MODEL", "").lower() else ""))
 
     # --- channels ----------------------------------------------------------
     twilio_sid: str = field(default_factory=lambda: _env("TWILIO_ACCOUNT_SID", ""))

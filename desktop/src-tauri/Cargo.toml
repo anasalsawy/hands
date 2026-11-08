@@ -1,0 +1,26 @@
+[package]
+name = "hands-desktop"
+version = "0.1.0"
+description = "Hands - the desktop app for concurrent computer-use"
+authors = ["Anas AlSawy"]
+edition = "2021"
+license = "Proprietary"
+
+[lib]
+name = "hands_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# Thin LTO and default codegen units: fat LTO with codegen-units=1 needs more
+# resident memory than this machine has while other work is running.
+lto = "thin"
+opt-level = "s"
+strip = true

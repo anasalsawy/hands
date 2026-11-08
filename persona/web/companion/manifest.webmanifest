@@ -1,7 +1,7 @@
 {
-  "name": "Sawii - the companion",
-  "short_name": "Sawii",
-  "description": "A companion made of three minds, and one that ages.",
+  "name": "Companion by Sawii",
+  "short_name": "Companion",
+  "description": "Companion by Sawii — an AI partner powered by Sawii Persona.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

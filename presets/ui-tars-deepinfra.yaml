@@ -1,6 +1,20 @@
 # UI-TARS Desktop preset — DeepInfra OpenAI-compatible API
-# Import via Settings → Import Preset Config → choose this file.
-# Replace YOUR_DEEPINFRA_API_KEY before importing (or edit it after in Settings).
+#
+# WHO THIS FILE IS FOR: a STANDALONE UI-TARS Desktop operator
+# (github.com/bytedance/ui-tars, Settings → Import Preset Config). That program
+# embeds its own operator VLM, so it needs its own endpoint and key.
+#
+# THIS IS NOT CONFIGURATION FOR sawii_hands.py. The Hands engine in this repo is
+# model-less on purpose: it has no LLM, no httpx client and reads no API key. It
+# executes tools and gets all of its thinking from Persona's R-lanes over the
+# /v1/hands WebSocket, so the VLM is Persona (R), not the engine. Nothing in this
+# repo parses this file, and there is no --engine-preset flag. Importing it into
+# UI-TARS Desktop is the only thing it does.
+#
+# Replace YOUR_DEEPINFRA_API_KEY with your own key *after* copying this file out
+# of the repo. The placeholder must stay a placeholder — never commit a real key.
+# Persona's own key is a separate thing: `python stitch.py local --deepinfra-key`
+# (see stitch.py — that one seeds DEEPINFRA_API_KEY for the mind).
 #
 # Schema: docs/preset.md + apps/ui-tars PresetSchema
 # (vlmProvider / vlmBaseUrl / vlmApiKey / vlmModelName / useResponsesApi / operator / …)
@@ -11,6 +25,8 @@ name: DeepInfra OpenAI-compatible (GLM-5.3-Flash)
 language: en
 vlmProvider: Hugging Face for UI-TARS-1.5
 vlmBaseUrl: https://api.deepinfra.com/v1/openai
+# Placeholder for the standalone UI-TARS Desktop operator. Not read by
+# sawii_hands.py, stitch.py, or anything else in this repo.
 vlmApiKey: YOUR_DEEPINFRA_API_KEY
 vlmModelName: zai-org/GLM-5.3-Flash
 useResponsesApi: false
