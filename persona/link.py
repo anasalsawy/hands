@@ -963,6 +963,10 @@ class BrowserUseNativeDriver:
         Creates a browser-use Agent with PersonaChatModel as its LLM.
         The concurrency happens INSIDE PersonaChatModel.ainvoke() —
         from the LLM position, not from external orchestration.
+
+        Architecture: ONE BrowserSession shared by Agent and PersonaChatModel.
+        When PersonaChatModel.ainvoke() is called, it creates N tabs in the
+        SAME browser and drives them concurrently via TabLane + SharedMind.
         """
         try:
             from browser_use import Agent, BrowserProfile, BrowserSession
@@ -973,12 +977,6 @@ class BrowserUseNativeDriver:
             return
 
         profile = linked.agent
-        persona_llm = BrowserUseNativeDriver.create_persona_llm(profile)
-
-        # If there are concurrent sub-tasks set on the linked lane, configure them
-        if hasattr(linked, '_concurrent_tasks') and linked._concurrent_tasks:
-            persona_llm.set_concurrent_tasks(linked._concurrent_tasks)
-
         session = None
         try:
             opts = profile.extra_headers or {}
@@ -986,16 +984,25 @@ class BrowserUseNativeDriver:
             bp = BrowserProfile(headless=headless)
             session = BrowserSession(browser_profile=bp)
 
+            # Create PersonaChatModel with SAME session
+            persona_llm = BrowserUseNativeDriver.create_persona_llm(profile)
+            persona_llm.browser_session = session  # ← share the session
+
+            # If there are concurrent sub-tasks set on the linked lane, configure them
+            if hasattr(linked, '_concurrent_tasks') and linked._concurrent_tasks:
+                persona_llm.set_concurrent_tasks(linked._concurrent_tasks)
+
+            # Agent and PersonaChatModel share ONE session
             agent = Agent(
                 task=linked.instruction,
                 llm=persona_llm,  # Persona IS the LLM
-                browser_session=session,
+                browser_session=session,  # ← SAME session
                 enable_signal_handler=False,
             )
 
             linked.status = "active"
             log.info("Link: browser-use agent with PersonaChatModel for lane %s "
-                     "(backing=%s, headless=%s)",
+                     "(backing=%s, headless=%s, shared_session=True)",
                      linked.lane_id, profile.model, headless)
 
             history = await agent.run(max_steps=15)
@@ -1024,21 +1031,628 @@ class BrowserUseNativeDriver:
                     pass
 
 
+class SharedMind:
+    """Blackboard pattern — cross-tab awareness for concurrent browser lanes.
+
+    Every TabLane reads from and writes to this shared state. Before each
+    action, a lane sees what ALL other lanes are doing. This is what makes
+    Persona's concurrency intelligent rather than blind.
+
+    The SharedMind is the answer to Google's question: "Should sub-agents
+    pause for master mind authorization or freely pivot asynchronously?"
+    Answer: neither. They share awareness and coordinate implicitly.
+
+    Thread-safe via asyncio (single event loop, no threading needed).
+    """
+
+    def __init__(self):
+        self.tabs: dict[str, dict[str, Any]] = {}
+        # tab_id -> {url, title, status, last_result, error, started_at, ...}
+        self.events: list[dict[str, Any]] = []
+        # Ordered log: [{tab, event, data, ts}, ...]
+        self._lock = asyncio.Lock()
+
+    async def register_tab(self, tab_id: str, url: str, task: str) -> None:
+        async with self._lock:
+            self.tabs[tab_id] = {
+                "url": url,
+                "task": task,
+                "status": "created",
+                "title": "",
+                "last_result": None,
+                "error": None,
+                "started_at": time.monotonic(),
+            }
+            self.events.append({
+                "tab": tab_id, "event": "created",
+                "data": {"url": url, "task": task},
+                "ts": time.monotonic(),
+            })
+
+    async def update_tab(self, tab_id: str, **updates) -> None:
+        async with self._lock:
+            if tab_id in self.tabs:
+                self.tabs[tab_id].update(updates)
+                self.events.append({
+                    "tab": tab_id, "event": "update",
+                    "data": updates,
+                    "ts": time.monotonic(),
+                })
+
+    async def get_cross_tab_context(self, exclude_tab: str | None = None) -> str:
+        """What every lane reads before acting — awareness of ALL tabs."""
+        async with self._lock:
+            lines = []
+            for tid, info in self.tabs.items():
+                if tid == exclude_tab:
+                    continue
+                status = info.get("status", "unknown")
+                url = info.get("url", "?")
+                title = info.get("title", "")
+                last = info.get("last_result")
+                err = info.get("error")
+                line = f"  [{tid}] {status}: {url}"
+                if title:
+                    line += f" — '{title}'"
+                if last:
+                    line += f" → {str(last)[:100]}"
+                if err:
+                    line += f" ⚠ {str(err)[:80]}"
+                lines.append(line)
+            if not lines:
+                return "No other tabs active."
+            return "CROSS-TAB STATE:\n" + "\n".join(lines)
+
+    async def get_summary(self) -> str:
+        """Full summary for aggregated reporting."""
+        async with self._lock:
+            parts = []
+            for tid, info in self.tabs.items():
+                status = info.get("status", "?")
+                elapsed = time.monotonic() - info.get("started_at", time.monotonic())
+                parts.append(
+                    f"[{tid}] {status} ({elapsed:.1f}s): "
+                    f"{info.get('title') or info.get('url', '?')} "
+                    f"→ {str(info.get('last_result', ''))[:200]}"
+                )
+            return "\n".join(parts)
+
+
+class TabLane:
+    """Thin wrapper: own focus pointer + Page handle, shared CDP connection.
+
+    Each TabLane owns:
+    - A target_id (which tab it controls)
+    - A Page object (browser-use's own, with its own CDP session)
+    - A reference to the SharedMind
+
+    It shares:
+    - The underlying BrowserSession (and its CDP connection)
+    - The SharedMind with all other lanes
+
+    This is the proven approach from Test 4: no cross-contamination,
+    no focus conflict, full use of browser-use's Page infrastructure
+    (DOM parsing, JS evaluation, navigation, screenshots).
+    """
+
+    def __init__(self, tab_id: str, session: Any, target_id: str,
+                 mind: SharedMind):
+        self.tab_id = tab_id
+        self.session = session  # shared BrowserSession
+        self.target_id = target_id  # own focus pointer
+        self.mind = mind
+        self._page = None  # lazily created Page
+
+    async def _get_page(self):
+        if self._page is None:
+            from browser_use.actor.page import Page
+            self._page = Page(self.session, self.target_id)
+        return self._page
+
+    async def navigate(self, url: str) -> None:
+        page = await self._get_page()
+        await page.goto(url)
+        await self.mind.update_tab(self.tab_id, url=url, status="navigated")
+
+    async def evaluate(self, js: str) -> Any:
+        page = await self._get_page()
+        return await page.evaluate(js)
+
+    async def screenshot(self) -> Any:
+        page = await self._get_page()
+        return await page.screenshot()
+
+    async def get_title(self) -> str:
+        title = await self.evaluate("() => document.title")
+        await self.mind.update_tab(self.tab_id, title=title)
+        return title
+
+    async def get_text(self, selector: str = "body") -> str:
+        return await self.evaluate(
+            f"() => document.querySelector('{selector}')?.textContent || ''"
+        )
+
+    async def get_html(self, selector: str = "body") -> str:
+        return await self.evaluate(
+            f"() => document.querySelector('{selector}')?.innerHTML || ''"
+        )
+
+    async def click(self, selector: str) -> None:
+        await self.evaluate(f"() => document.querySelector('{selector}')?.click()")
+
+    async def type_text(self, selector: str, text: str) -> None:
+        escaped = text.replace("'", "\\'").replace("\n", "\\n")
+        await self.evaluate(
+            f"() => {{ const el = document.querySelector('{selector}'); "
+            f"if (el) {{ el.value = '{escaped}'; "
+            f"el.dispatchEvent(new Event('input', {{bubbles: true}})); }} }}"
+        )
+
+    async def wait_for(self, selector: str, timeout_ms: int = 5000) -> bool:
+        return await self.evaluate(
+            f"() => new Promise((resolve) => {{ "
+            f"const el = document.querySelector('{selector}'); "
+            f"if (el) return resolve(true); "
+            f"const obs = new MutationObserver(() => {{ "
+            f"  if (document.querySelector('{selector}')) {{ obs.disconnect(); resolve(true); }} "
+            f"}}); "
+            f"obs.observe(document.body, {{childList: true, subtree: true}}); "
+            f"setTimeout(() => {{ obs.disconnect(); resolve(false); }}, {timeout_ms}); "
+            f"}})"
+        )
+
+    async def cross_tab_context(self) -> str:
+        """What this lane knows about all other lanes."""
+        return await self.mind.get_cross_tab_context(exclude_tab=self.tab_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Same-Page Swarm — multiple hands on ONE DOM, shared mind coordination
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class SwarmMind:
+    """Real-time coordinator for multiple hands on ONE page.
+
+    Unlike SharedMind (cross-tab awareness), SwarmMind coordinates actions
+    on the SAME DOM. It handles:
+
+    1. Action Registry — what's in-flight, who's doing what
+    2. Conflict Detection — prevents two hands from touching the same element
+    3. Halt Signal — when page reload/navigation detected, all hands stop
+    4. DOM Mutation Awareness — one hand's changes are known to all others
+    5. Dynamic Task Rebalancing — hands pick up unfinished work from others
+    6. Micro-Delay Orchestration — uses execution gaps to interleave actions
+
+    This is the "unified swarm intelligence" — one mind, multiple bodies,
+    all operating on a single page simultaneously.
+    """
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        # ── Action registry ─────────────────────────────────────────
+        self._inflight: dict[str, dict[str, Any]] = {}
+        # hand_id -> {action, selector, status, started_at}
+        self._completed: list[dict[str, Any]] = []
+        # [{hand, action, selector, result, elapsed}, ...]
+        self._claimed_selectors: set[str] = set()
+        # Selectors currently being acted on (prevent collision)
+
+        # ── Task queue ──────────────────────────────────────────────
+        self._task_queue: list[dict[str, Any]] = []
+        # [{action, selector, data, priority}, ...] ordered by priority
+        self._task_idx: int = 0
+        # Next task to claim
+
+        # ── Halt signal ─────────────────────────────────────────────
+        self._halted = False
+        self._halt_reason: str = ""
+
+        # ── DOM state ───────────────────────────────────────────────
+        self._dom_version: int = 0
+        self._dom_mutations: list[dict[str, Any]] = []
+        # [{hand, type, selector, ts}, ...] — mutations caused by hands
+
+        # ── Coordination events ─────────────────────────────────────
+        self._events: list[dict[str, Any]] = []
+
+    # ── Task management ────────────────────────────────────────────
+
+    def load_tasks(self, tasks: list[dict[str, Any]]) -> None:
+        """Load a batch of tasks for the swarm to execute.
+
+        Each task: {action: "click"|"type"|"extract"|"wait"|"scroll",
+                    selector: "CSS selector",
+                    data: optional data (text to type, etc),
+                    priority: int (lower = higher priority)}
+        """
+        self._task_queue = sorted(tasks, key=lambda t: t.get("priority", 99))
+        self._task_idx = 0
+
+    async def claim_next_task(self, hand_id: str) -> dict[str, Any] | None:
+        """A hand claims the next available non-conflicting task.
+
+        Returns None if all tasks are done or all remaining tasks conflict
+        with in-flight actions. This is the dynamic pivoting — if task A
+        is being handled by hand-0, hand-1 automatically skips to task B.
+        """
+        async with self._lock:
+            if self._halted:
+                return None
+
+            for i in range(self._task_idx, len(self._task_queue)):
+                task = self._task_queue[i]
+                selector = task.get("selector", "")
+
+                # Skip if another hand is already acting on this selector
+                if selector and selector in self._claimed_selectors:
+                    continue
+
+                # Claim it
+                self._task_queue.pop(i)
+                if selector:
+                    self._claimed_selectors.add(selector)
+                self._inflight[hand_id] = {
+                    "action": task.get("action"),
+                    "selector": selector,
+                    "status": "executing",
+                    "started_at": time.monotonic(),
+                    "task": task,
+                }
+                self._events.append({
+                    "hand": hand_id, "event": "claimed",
+                    "task": task, "ts": time.monotonic(),
+                })
+                return task
+
+            return None  # All done or all conflicting
+
+    async def complete_task(self, hand_id: str, result: Any = None,
+                            error: str | None = None) -> None:
+        """Hand reports task completion. Releases the selector claim."""
+        async with self._lock:
+            info = self._inflight.pop(hand_id, None)
+            if info:
+                selector = info.get("selector", "")
+                if selector:
+                    self._claimed_selectors.discard(selector)
+                elapsed = time.monotonic() - info.get("started_at", time.monotonic())
+                self._completed.append({
+                    "hand": hand_id,
+                    "action": info.get("action"),
+                    "selector": selector,
+                    "result": result,
+                    "error": error,
+                    "elapsed": elapsed,
+                })
+                self._events.append({
+                    "hand": hand_id, "event": "completed",
+                    "result": str(result)[:100] if result else None,
+                    "error": error,
+                    "elapsed": elapsed,
+                    "ts": time.monotonic(),
+                })
+
+    # ── Halt signal (reload/navigation detected) ───────────────────
+
+    async def halt_all(self, reason: str) -> None:
+        """Signal all hands to stop immediately.
+
+        Called when a page reload, navigation, or destructive mutation
+        is detected. All hands check is_halted() before each action.
+        """
+        async with self._lock:
+            self._halted = True
+            self._halt_reason = reason
+            self._events.append({
+                "hand": "mind", "event": "HALT",
+                "reason": reason, "ts": time.monotonic(),
+            })
+            log.warning("SwarmMind: HALT — %s", reason)
+
+    async def resume(self) -> None:
+        """Resume after halt (e.g., page reload completed)."""
+        async with self._lock:
+            self._halted = False
+            self._halt_reason = ""
+            self._claimed_selectors.clear()  # selectors may have changed
+            self._events.append({
+                "hand": "mind", "event": "RESUME",
+                "ts": time.monotonic(),
+            })
+
+    def is_halted(self) -> bool:
+        return self._halted
+
+    # ── DOM mutation tracking ──────────────────────────────────────
+
+    async def record_mutation(self, hand_id: str, mutation_type: str,
+                               selector: str) -> None:
+        """Record a DOM mutation caused by a hand's action.
+
+        Other hands read this to understand index shifts and layout
+        changes they didn't cause.
+        """
+        async with self._lock:
+            self._dom_version += 1
+            self._dom_mutations.append({
+                "hand": hand_id,
+                "type": mutation_type,  # "click", "type", "remove", "add"
+                "selector": selector,
+                "dom_version": self._dom_version,
+                "ts": time.monotonic(),
+            })
+
+    async def get_mutations_since(self, since_version: int) -> list[dict[str, Any]]:
+        """Get DOM mutations since a given version.
+
+        A hand calls this before acting to see what changed since its
+        last action. This is how hand-1 knows hand-0 clicked a button
+        that shifted the DOM layout.
+        """
+        async with self._lock:
+            return [m for m in self._dom_mutations
+                    if m["dom_version"] > since_version]
+
+    # ── Situational awareness ──────────────────────────────────────
+
+    async def get_hand_context(self, exclude_hand: str | None = None) -> str:
+        """What a hand sees about all other hands before acting."""
+        async with self._lock:
+            lines = []
+            if self._halted:
+                lines.append(f"⚠ HALTED: {self._halt_reason}")
+
+            for hid, info in self._inflight.items():
+                if hid == exclude_hand:
+                    continue
+                action = info.get("action", "?")
+                selector = info.get("selector", "?")
+                elapsed = time.monotonic() - info.get("started_at", time.monotonic())
+                lines.append(f"  [{hid}] {action} on '{selector}' ({elapsed:.2f}s)")
+
+            done_count = len(self._completed)
+            remaining = len(self._task_queue) - self._task_idx
+            lines.append(f"  Progress: {done_count} done, {remaining} remaining")
+
+            if self._dom_mutations:
+                recent = self._dom_mutations[-3:]  # last 3 mutations
+                for m in recent:
+                    lines.append(
+                        f"  DOM[v{m['dom_version']}]: {m['hand']} {m['type']} "
+                        f"'{m['selector']}'"
+                    )
+
+            return "\n".join(lines) if lines else "Swarm idle."
+
+    async def get_results(self) -> list[dict[str, Any]]:
+        """Get all completed task results."""
+        async with self._lock:
+            return list(self._completed)
+
+
+class SwarmHand:
+    """One hand of the swarm — operates on a SHARED page via CDP.
+
+    All hands share:
+    - The same Page object (same tab, same DOM)
+    - The SwarmMind for coordination
+
+    Each hand:
+    - Claims tasks from the SwarmMind's queue
+    - Checks for halt signals before each action
+    - Records DOM mutations it causes
+    - Tracks the DOM version it last saw
+    - Interleaves with other hands automatically
+
+    The CDP evaluate() calls are atomic at the JS level — two concurrent
+    evaluates on the same page both run, they just serialize in V8.
+    The SwarmMind prevents logical conflicts (two hands clicking the same
+    button) while allowing physical concurrency (two hands acting on
+    different parts of the DOM simultaneously).
+    """
+
+    def __init__(self, hand_id: str, page: Any, mind: SwarmMind):
+        self.hand_id = hand_id
+        self.page = page  # shared Page object — same tab
+        self.mind = mind
+        self._dom_version = 0  # last DOM version this hand saw
+        self._action_count = 0
+
+    async def _check_halt(self) -> bool:
+        """Check if swarm is halted. Returns True if halted."""
+        if self.mind.is_halted():
+            log.info("  %s: halted — %s", self.hand_id, self.mind._halt_reason)
+            return True
+        return False
+
+    async def _pre_action(self) -> bool:
+        """Pre-action check: halt signal + DOM mutations from other hands.
+
+        Returns False if halted (hand should stop).
+        """
+        if await self._check_halt():
+            return False
+
+        # Check what other hands changed since our last action
+        mutations = await self.mind.get_mutations_since(self._dom_version)
+        if mutations:
+            self._dom_version = mutations[-1]["dom_version"]
+            for m in mutations:
+                if m["hand"] != self.hand_id:
+                    log.debug("  %s: saw mutation from %s: %s on '%s'",
+                              self.hand_id, m["hand"], m["type"], m["selector"])
+        return True
+
+    async def execute_action(self, task: dict[str, Any]) -> Any:
+        """Execute one task action on the shared page.
+
+        Handles: click, type, extract, wait, scroll, evaluate.
+        Records DOM mutations caused by the action.
+        """
+        if not await self._pre_action():
+            return None
+
+        action = task.get("action", "extract")
+        selector = task.get("selector", "body")
+        data = task.get("data", "")
+        self._action_count += 1
+
+        try:
+            if action == "click":
+                # Check element exists before clicking
+                exists = await self.page.evaluate(
+                    f"() => !!document.querySelector('{selector}')"
+                )
+                if not exists:
+                    return f"Element '{selector}' not found"
+
+                await self.page.evaluate(
+                    f"() => document.querySelector('{selector}')?.click()"
+                )
+                await self.mind.record_mutation(self.hand_id, "click", selector)
+                return f"Clicked '{selector}'"
+
+            elif action == "type":
+                escaped = data.replace("'", "\\'").replace("\n", "\\n")
+                await self.page.evaluate(
+                    f"() => {{ const el = document.querySelector('{selector}'); "
+                    f"if (el) {{ el.value = '{escaped}'; "
+                    f"el.dispatchEvent(new Event('input', {{bubbles: true}})); "
+                    f"el.dispatchEvent(new Event('change', {{bubbles: true}})); }} }}"
+                )
+                await self.mind.record_mutation(self.hand_id, "type", selector)
+                return f"Typed into '{selector}'"
+
+            elif action == "extract":
+                js = data if data else f"() => document.querySelector('{selector}')?.textContent || ''"
+                result = await self.page.evaluate(js)
+                return result
+
+            elif action == "wait":
+                timeout = int(data) if data else 5000
+                result = await self.page.evaluate(
+                    f"() => new Promise((resolve) => {{ "
+                    f"const el = document.querySelector('{selector}'); "
+                    f"if (el) return resolve(true); "
+                    f"const obs = new MutationObserver(() => {{ "
+                    f"  if (document.querySelector('{selector}')) {{ obs.disconnect(); resolve(true); }} "
+                    f"}}); "
+                    f"obs.observe(document.body, {{childList: true, subtree: true}}); "
+                    f"setTimeout(() => {{ obs.disconnect(); resolve(false); }}, {timeout}); "
+                    f"}})"
+                )
+                return f"Wait for '{selector}': {'found' if result else 'timeout'}"
+
+            elif action == "scroll":
+                await self.page.evaluate(
+                    f"() => document.querySelector('{selector}')?.scrollIntoView({{behavior: 'smooth'}})"
+                )
+                return f"Scrolled to '{selector}'"
+
+            elif action == "evaluate":
+                result = await self.page.evaluate(data)
+                return result
+
+            elif action == "check_navigation":
+                # Detect if page is navigating/reloading
+                state = await self.page.evaluate(
+                    "() => document.readyState"
+                )
+                if state != "complete":
+                    await self.mind.halt_all(
+                        f"Page navigating (readyState={state}), "
+                        f"triggered by {self.hand_id}"
+                    )
+                    return f"Navigation detected: {state}"
+                return f"Page stable: {state}"
+
+            else:
+                return f"Unknown action: {action}"
+
+        except Exception as e:
+            err_str = str(e)
+            # Detect navigation/reload errors
+            if any(kw in err_str.lower() for kw in
+                   ["navigation", "detached", "context was destroyed",
+                    "execution context", "target closed"]):
+                await self.mind.halt_all(f"Page destroyed: {err_str[:100]}")
+            return f"ERROR: {err_str[:200]}"
+
+    async def run_loop(self) -> list[dict[str, Any]]:
+        """Main loop: claim tasks, execute, repeat until queue empty or halted.
+
+        This is one hand's autonomous loop. It runs concurrently with
+        other hands, all sharing the same page and SwarmMind.
+        """
+        results = []
+        while True:
+            if await self._check_halt():
+                break
+
+            task = await self.mind.claim_next_task(self.hand_id)
+            if task is None:
+                break  # No more tasks (or all remaining conflict)
+
+            log.info("  %s: claimed %s on '%s'",
+                     self.hand_id, task.get("action"), task.get("selector", "?"))
+
+            # Execute
+            result = await self.execute_action(task)
+            results.append({"task": task, "result": result})
+
+            # Report completion
+            error = str(result) if result and str(result).startswith("ERROR") else None
+            await self.mind.complete_task(self.hand_id, result=result, error=error)
+
+            # Tiny yield to let other hands interleave
+            await asyncio.sleep(0)
+
+        log.info("  %s: done — %d actions executed", self.hand_id, self._action_count)
+        return results
+
+
 class PersonaChatModel:
     """Persona as a browser-use LLM — implements BaseChatModel protocol.
 
     This is the product. When browser-use calls ainvoke(), Persona
-    intercepts and creates concurrency FROM INSIDE the LLM call using
-    browser-use's own Agent class.
+    intercepts and creates concurrency FROM INSIDE the LLM call.
+
+    Architecture (thin wrapper + shared mind):
+        ONE BrowserSession, ONE browser process, N tabs.
+        Each tab gets a TabLane: own Page object with its own CDP session,
+        own focus pointer (target_id), shared awareness via SharedMind.
+
+        The concurrency uses browser-use's own Page class — CDP commands
+        are coupled to target_id, not visual focus. Each Page.goto(),
+        Page.evaluate(), Page.screenshot() operates independently.
+
+        SharedMind (blackboard pattern) gives every tab awareness of what
+        ALL other tabs are doing. This is coordinated concurrency, not
+        blind tab driving.
+
+    What this preserves from browser-use:
+        - Page class: DOM parsing, JS evaluation, navigation, screenshots
+        - CDP session management: each tab has its own session_id
+        - Error recovery: Page handles CDP errors per-tab
+        - The single BrowserSession's lifecycle management
+
+    What Persona adds:
+        - Concurrent tab creation from the LLM position
+        - SharedMind for cross-tab coordination
+        - Aggregated results returned as one AgentOutput
+        - The host Agent never knows concurrency happened
 
     Usage:
-        from browser_use import Agent
-        persona = PersonaChatModel(api_key="...", backing_model="gpt-4o-mini")
-        persona.set_concurrent_tasks(["task1", "task2", "task3"])
-        agent = Agent(task="...", llm=persona)
-        history = await agent.run()
-        # During agent.run(), when ainvoke is called, Persona spawns
-        # 3 concurrent browser-use Agents internally and aggregates results.
+        from browser_use import Agent, BrowserSession
+        session = BrowserSession(browser_profile=profile)
+        persona = PersonaChatModel(api_key="...", browser_session=session)
+        persona.set_concurrent_tasks([
+            {"url": "https://...", "extract": "() => document.title"},
+            {"url": "https://...", "extract": "() => ..."},
+        ])
+        agent = Agent(task="...", llm=persona, browser_session=session)
+        # SAME session. Persona creates tabs inside it.
     """
 
     def __init__(
@@ -1048,6 +1662,7 @@ class PersonaChatModel:
         base_url: str | None = None,
         headless: bool = True,
         max_concurrent: int = 3,
+        browser_session: Any = None,
     ):
         self.api_key = api_key
         self.backing_model = backing_model
@@ -1056,8 +1671,12 @@ class PersonaChatModel:
         self.max_concurrent = max_concurrent
         self.model = "persona-concurrent"
         self._verified_api_keys = False
-        self._sub_tasks: list[str] = []
+        self._sub_tasks: list[str | dict[str, str]] = []
         self._results: dict[str, str] = {}
+        # Shared session — set externally or created on first use
+        self.browser_session = browser_session
+        # Shared mind — created per concurrent batch
+        self._shared_mind: SharedMind | None = None
 
     @property
     def provider(self) -> str:
@@ -1071,8 +1690,12 @@ class PersonaChatModel:
     def model_name(self) -> str:
         return self.model
 
-    def set_concurrent_tasks(self, tasks: list[str]) -> None:
+    def set_concurrent_tasks(self, tasks: list[str | dict[str, str]]) -> None:
         """Set the sub-tasks Persona will run concurrently.
+
+        Each task can be:
+        - A string (URL to navigate and extract title from)
+        - A dict: {"url": "...", "extract": "() => JS expression"}
 
         In production, Persona's Mind analyzes the conversation and
         decides how to split. For the proof, we pre-set them.
@@ -1080,7 +1703,7 @@ class PersonaChatModel:
         self._sub_tasks = list(tasks)
 
     def _get_backing_llm(self) -> Any:
-        """Create the real LLM for sub-agents."""
+        """Create the real LLM for passthrough mode."""
         try:
             from browser_use.llm.openai.chat import ChatOpenAI as BUChatOpenAI
             params: dict[str, Any] = {"model": self.backing_model}
@@ -1108,27 +1731,33 @@ class PersonaChatModel:
     async def ainvoke(self, messages, output_format=None, **kwargs):
         """The interception point — browser-use calls this as its LLM.
 
-        If concurrent tasks are set, Persona spawns N browser-use Agents
-        INSIDE this call and returns aggregated results.
+        If concurrent tasks are set, Persona creates N tabs in the SAME
+        browser and drives them concurrently via Page objects.
         Otherwise, forwards to the backing LLM.
         """
         from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
         if self._sub_tasks:
             # ── CONCURRENT MODE ──────────────────────────────────────
-            log.info("PersonaChatModel.ainvoke: splitting into %d concurrent R-lanes",
+            log.info("PersonaChatModel.ainvoke: splitting into %d concurrent R-lanes "
+                     "(ONE browser, ONE session, shared mind)",
                      len(self._sub_tasks))
             aggregated = await self._run_concurrent(self._sub_tasks)
             self._sub_tasks = []  # consume
 
             if output_format is not None:
-                result_text = "CONCURRENT RESULTS:\n"
+                result_text = "CONCURRENT RESULTS (one browser, shared mind):\n"
                 for tid, res in aggregated.items():
                     result_text += f"\n[{tid}]: {res}\n"
 
+                # Include shared mind summary
+                if self._shared_mind:
+                    mind_summary = await self._shared_mind.get_summary()
+                    result_text += f"\nSHARED MIND STATE:\n{mind_summary}\n"
+
                 output_data = {
-                    "evaluation_previous_goal": "Success — concurrent execution completed",
-                    "memory": f"Ran {len(aggregated)} concurrent sub-tasks via Persona",
+                    "evaluation_previous_goal": "Success — concurrent multi-tab execution",
+                    "memory": f"Drove {len(aggregated)} tabs concurrently in ONE browser with shared mind",
                     "next_goal": "Report aggregated results",
                     "action": [{"done": {"text": result_text, "success": True}}],
                 }
@@ -1138,65 +1767,226 @@ class PersonaChatModel:
 
             return ChatInvokeCompletion(
                 completion=completion,
-                usage=ChatInvokeUsage(input_tokens=0, output_tokens=0),
+                usage=ChatInvokeUsage(
+                    prompt_tokens=0, prompt_cached_tokens=0,
+                    prompt_cache_creation_tokens=0, prompt_image_tokens=0,
+                    completion_tokens=0, total_tokens=0,
+                ),
             )
         else:
             # ── PASSTHROUGH ──────────────────────────────────────────
             backing = self._get_backing_llm()
             return await backing.ainvoke(messages, output_format=output_format, **kwargs)
 
-    async def _run_concurrent(self, tasks: list[str]) -> dict[str, str]:
-        """Spawn N browser-use Agents concurrently from INSIDE ainvoke."""
-        from browser_use import Agent, BrowserProfile, BrowserSession
+    async def _run_concurrent(self, tasks: list[str | dict[str, str]]) -> dict[str, str]:
+        """Drive N tabs concurrently in ONE browser via thin wrappers + shared mind.
 
-        backing_llm = self._get_backing_llm()
+        Architecture:
+            ONE BrowserSession (self.browser_session or created here)
+            ├── Tab 0: TabLane(target_id_0, Page_0) ──┐
+            ├── Tab 1: TabLane(target_id_1, Page_1) ──┤── SharedMind
+            └── Tab N: TabLane(target_id_N, Page_N) ──┘   (blackboard)
+
+        Each TabLane has its own Page object with its own CDP session.
+        CDP commands are coupled to target_id — no visual focus needed.
+        SharedMind gives cross-tab awareness before every action.
+
+        This is what browser-use cloud does when working on unfocused tabs.
+        Persona just does it concurrently, with shared awareness.
+        """
+        from browser_use import BrowserProfile, BrowserSession
+
+        # ── Shared mind for this batch ─────────────────────────────
+        self._shared_mind = SharedMind()
         results: dict[str, str] = {}
+        created_target_ids: list[str] = []
 
-        async def run_one(task_id: str, task: str) -> tuple[str, str]:
-            log.info("  R-lane %s: starting — %s", task_id, task[:60])
-            t0 = time.monotonic()
+        # ── Get or create shared session ───────────────────────────
+        own_session = False
+        session = self.browser_session
+        if session is None:
             session = BrowserSession(
                 browser_profile=BrowserProfile(headless=self.headless)
             )
-            try:
-                agent = Agent(
-                    task=task,
-                    llm=backing_llm,
-                    browser_session=session,
-                    max_actions_per_step=5,
-                    enable_signal_handler=False,
+            own_session = True
+
+        try:
+            # Start session if not already started
+            if not getattr(session, '_browser', None):
+                await session.start()
+
+            # ── Normalize tasks ────────────────────────────────────
+            normalized: list[dict[str, str]] = []
+            for t in tasks:
+                if isinstance(t, str):
+                    normalized.append({"url": t, "extract": "() => document.title"})
+                else:
+                    normalized.append(t)
+
+            # ── Create tabs + TabLanes ─────────────────────────────
+            lanes: list[TabLane] = []
+            for i, task in enumerate(normalized):
+                tab_id = f"tab-{i}"
+                target_id = await session._cdp_create_new_page('about:blank')
+                created_target_ids.append(target_id)
+                lane = TabLane(tab_id, session, target_id, self._shared_mind)
+                lanes.append(lane)
+                await self._shared_mind.register_tab(
+                    tab_id, task["url"], task.get("extract", "")
                 )
-                history = await agent.run(max_steps=10)
-                result = history.final_result() or "No result"
-                log.info("  R-lane %s: done in %.1fs", task_id,
-                         time.monotonic() - t0)
-                return task_id, result
-            except Exception as e:
-                log.error("  R-lane %s: failed in %.1fs — %s", task_id,
-                          time.monotonic() - t0, e)
-                return task_id, f"ERROR: {e}"
-            finally:
+                log.info("  Created %s (target=%s) for %s",
+                         tab_id, target_id[-6:], task["url"][:50])
+
+            # ── Drive all lanes concurrently ───────────────────────
+            async def drive_lane(lane: TabLane, task: dict[str, str]) -> tuple[str, str]:
+                t0 = time.monotonic()
+                url = task["url"]
+                extract_js = task.get("extract", "() => document.title")
+
+                try:
+                    # Read cross-tab context BEFORE acting (shared mind)
+                    ctx = await lane.cross_tab_context()
+                    log.info("  %s: cross-tab context: %s", lane.tab_id,
+                             ctx[:80] if ctx else "none")
+
+                    # Navigate
+                    await lane.navigate(url)
+                    await asyncio.sleep(0.5)  # let content render
+
+                    # Extract title for shared mind
+                    title = await lane.get_title()
+
+                    # Extract result
+                    result = await lane.evaluate(extract_js)
+                    result_str = str(result) if result else "empty"
+
+                    # Update shared mind with result
+                    await self._shared_mind.update_tab(
+                        lane.tab_id,
+                        status="done",
+                        last_result=result_str[:500],
+                    )
+
+                    elapsed = time.monotonic() - t0
+                    log.info("  %s: done in %.1fs — %s",
+                             lane.tab_id, elapsed, result_str[:80])
+                    return lane.tab_id, result_str
+
+                except Exception as e:
+                    elapsed = time.monotonic() - t0
+                    await self._shared_mind.update_tab(
+                        lane.tab_id, status="error", error=str(e)[:200]
+                    )
+                    log.error("  %s: failed in %.1fs — %s",
+                              lane.tab_id, elapsed, e)
+                    return lane.tab_id, f"ERROR: {e}"
+
+            log.info("═══ Driving %d tabs concurrently (ONE browser, shared mind) ═══",
+                     len(lanes))
+            t_start = time.monotonic()
+
+            raw = await asyncio.gather(*[
+                drive_lane(lane, task)
+                for lane, task in zip(lanes, normalized)
+            ], return_exceptions=True)
+
+            for item in raw:
+                if isinstance(item, Exception):
+                    log.error("  Lane failed: %s", item)
+                else:
+                    tid, res = item
+                    results[tid] = res
+
+            elapsed_total = time.monotonic() - t_start
+            log.info("═══ All %d tabs completed in %.1fs (ONE browser, shared mind) ═══",
+                     len(lanes), elapsed_total)
+
+        finally:
+            # Clean up tabs we created (keep the browser session clean)
+            for target_id in created_target_ids:
+                try:
+                    await session._cdp_close_page(target_id)
+                except Exception:
+                    pass
+            # Only close session if we created it
+            if own_session:
                 try:
                     await session.close()
                 except Exception:
                     pass
 
-        log.info("PersonaChatModel: launching %d R-lanes concurrently", len(tasks))
+        return results
+
+    async def _run_same_page_swarm(
+        self, page: Any, tasks: list[dict[str, Any]],
+        num_hands: int = 2,
+    ) -> dict[str, Any]:
+        """Run multiple hands on ONE page concurrently via SwarmMind.
+
+        This is the "unified swarm intelligence" — one mind, N bodies,
+        all operating on a single DOM simultaneously.
+
+        Architecture:
+            ONE Page (ONE tab, ONE DOM)
+            ├── SwarmHand 0 ──┐
+            ├── SwarmHand 1 ──┤── SwarmMind (coordinator)
+            └── SwarmHand N ──┘
+
+        The SwarmMind prevents logical conflicts (two hands clicking the
+        same button) while allowing physical concurrency (two hands acting
+        on different parts of the DOM simultaneously).
+
+        Args:
+            page: browser-use Page object (the shared tab)
+            tasks: list of task dicts with {action, selector, data, priority}
+            num_hands: how many concurrent hands (default 2)
+
+        Returns:
+            {results: [...], summary: str, mutations: int, halted: bool}
+        """
+        mind = SwarmMind()
+        mind.load_tasks(tasks)
+
+        # Create hands — all share the SAME page
+        hands = [
+            SwarmHand(f"hand-{i}", page, mind)
+            for i in range(num_hands)
+        ]
+
+        log.info("═══ Same-page swarm: %d hands on ONE DOM, %d tasks ═══",
+                 num_hands, len(tasks))
         t_start = time.monotonic()
 
-        coros = [run_one(f"lane-{i}", t) for i, t in enumerate(tasks)]
-        raw = await asyncio.gather(*coros, return_exceptions=True)
+        # Run all hands concurrently
+        raw = await asyncio.gather(*[
+            hand.run_loop() for hand in hands
+        ], return_exceptions=True)
 
+        elapsed = time.monotonic() - t_start
+
+        # Aggregate results
+        all_results = []
         for item in raw:
             if isinstance(item, Exception):
-                log.error("  R-lane failed: %s", item)
+                log.error("  Hand failed: %s", item)
             else:
-                tid, res = item
-                results[tid] = res
+                all_results.extend(item)
 
-        log.info("PersonaChatModel: all %d R-lanes done in %.1fs",
-                 len(tasks), time.monotonic() - t_start)
-        return results
+        completed = await mind.get_results()
+        context = await mind.get_hand_context()
+
+        log.info("═══ Swarm done: %d tasks in %.2fs, %d mutations, halted=%s ═══",
+                 len(completed), elapsed, mind._dom_version, mind._halted)
+
+        return {
+            "results": all_results,
+            "completed": completed,
+            "summary": context,
+            "mutations": mind._dom_version,
+            "halted": mind._halted,
+            "halt_reason": mind._halt_reason,
+            "elapsed": elapsed,
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
