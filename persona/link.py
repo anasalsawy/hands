@@ -2030,6 +2030,255 @@ class PossibilitySpeculator:
         return "\n".join(lines)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SpeculativeEngine — unified probability batching + possibility pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SpeculativeEngine:
+    """Combines SpeculativeRouter's probability batching with
+    PossibilitySpeculator's pre-compute-and-hold pipeline.
+
+    Decision logic per step:
+        1. Estimate confidence in the next action (0.0–1.0)
+        2. If confidence >= confidence_threshold:
+              → HIGH PATH: batch-fire via SpeculativeRouter (we KNOW what's next)
+              → Example: minimized window → click Start menu (95% certain)
+        3. If confidence < confidence_threshold:
+              → LOW PATH: pre-compute possibilities via PossibilitySpeculator
+              → Hold all N outcomes ready, instant-dispatch on result match
+              → Example: clicked Submit → could get success/error/modal/redirect
+
+    This gives the best of both worlds:
+        - High-confidence steps fire immediately (zero think, zero wait)
+        - Uncertain steps still get zero-gap dispatch via pre-computed possibilities
+        - Neither strategy alone covers both cases
+
+    The confidence_threshold is driven by the dial:
+        Dial 1:  threshold=0.9 (almost never batches, mostly possibilities)
+        Dial 5:  threshold=0.7 (batches when fairly confident)
+        Dial 10: threshold=0.5 (batches aggressively, possibilities for the rest)
+    """
+
+    DIAL_PROFILES: ClassVar[dict[int, dict[str, Any]]] = {
+        1:  {"confidence_threshold": 0.90, "max_batch": 1,  "max_possibilities": 2},
+        2:  {"confidence_threshold": 0.85, "max_batch": 2,  "max_possibilities": 3},
+        3:  {"confidence_threshold": 0.80, "max_batch": 2,  "max_possibilities": 3},
+        4:  {"confidence_threshold": 0.75, "max_batch": 3,  "max_possibilities": 4},
+        5:  {"confidence_threshold": 0.70, "max_batch": 3,  "max_possibilities": 4},
+        6:  {"confidence_threshold": 0.65, "max_batch": 4,  "max_possibilities": 5},
+        7:  {"confidence_threshold": 0.60, "max_batch": 5,  "max_possibilities": 6},
+        8:  {"confidence_threshold": 0.55, "max_batch": 6,  "max_possibilities": 8},
+        9:  {"confidence_threshold": 0.52, "max_batch": 8,  "max_possibilities": 10},
+        10: {"confidence_threshold": 0.50, "max_batch": 10, "max_possibilities": 12},
+    }
+
+    def __init__(self, thought_stream: ThoughtStream | None = None,
+                 dial: int = 5,
+                 confidence_threshold: float | None = None):
+        self.thought_stream = thought_stream or ThoughtStream()
+        self.dial = max(1, min(10, dial))
+        profile = self.DIAL_PROFILES[self.dial]
+
+        self.confidence_threshold = (confidence_threshold
+                                     if confidence_threshold is not None
+                                     else profile["confidence_threshold"])
+        self.max_batch = profile["max_batch"]
+        self.max_possibilities = profile["max_possibilities"]
+
+        # Sub-engines
+        self.router = SpeculativeRouter(
+            thought_stream=self.thought_stream,
+            speed=self.dial,
+        )
+        self.speculator = PossibilitySpeculator(
+            thought_stream=self.thought_stream,
+            dial=self.dial,
+        )
+
+        # Stats
+        self._lock = asyncio.Lock()
+        self._step_count = 0
+        self._high_path_count = 0    # batched (confident)
+        self._low_path_count = 0     # pre-computed (uncertain)
+        self._events: list[dict[str, Any]] = []
+        self._started_at = time.monotonic()
+
+        log.info("SpecEngine: dial=%d (threshold=%.0f%%, max_batch=%d, max_poss=%d)",
+                 self.dial, self.confidence_threshold * 100,
+                 self.max_batch, self.max_possibilities)
+
+    @classmethod
+    def from_dial(cls, dial: int,
+                  thought_stream: ThoughtStream | None = None) -> "SpeculativeEngine":
+        """Create from dial value alone."""
+        return cls(thought_stream=thought_stream, dial=dial)
+
+    async def step(
+        self,
+        confidence: float,
+        action_fn,
+        precompute_fn=None,
+        batch_actions: list[dict[str, Any]] | None = None,
+        step_context: dict[str, Any] | None = None,
+        is_last_step: bool = False,
+    ) -> dict[str, Any]:
+        """Execute one step, choosing the optimal strategy by confidence.
+
+        Args:
+            confidence: 0.0–1.0, how sure we are about the next action.
+            action_fn: async callable that executes the current action.
+            precompute_fn: async callable(ctx) → {outcome_key: action_dict}
+                           for the LOW path (possibilities).
+            batch_actions: list of actions to fire immediately for the
+                          HIGH path (probability batching). If None and
+                          confidence is high, only the current action fires.
+            step_context: context dict passed to precompute_fn.
+            is_last_step: if True, skip pre-computation.
+
+        Returns:
+            {
+                "result": action result,
+                "path": "high" | "low",
+                "next_action": dict | None,  # ready-to-fire next action
+                "possibilities": dict | None,  # pre-computed set (low path)
+                "confidence": float,
+            }
+        """
+        async with self._lock:
+            self._step_count += 1
+            step_num = self._step_count
+
+        t0 = time.monotonic()
+
+        if confidence >= self.confidence_threshold:
+            # ── HIGH PATH: batch and fire ──────────────────────────
+            self._high_path_count += 1
+
+            if batch_actions and not is_last_step:
+                # Fire current action + batch the next N high-confidence actions
+                batch_size = min(len(batch_actions), self.max_batch)
+                batch_to_fire = batch_actions[:batch_size]
+
+                result = await action_fn()
+
+                self._events.append({
+                    "event": "high_path",
+                    "step": step_num,
+                    "confidence": confidence,
+                    "batch_size": batch_size,
+                    "ts": time.monotonic(),
+                })
+                log.debug("SpecEngine: HIGH path step %d (conf=%.0f%%, batch=%d)",
+                          step_num, confidence * 100, batch_size)
+
+                return {
+                    "result": result,
+                    "path": "high",
+                    "next_action": batch_to_fire[0] if batch_to_fire else None,
+                    "batch_remaining": batch_to_fire[1:] if len(batch_to_fire) > 1 else [],
+                    "possibilities": None,
+                    "confidence": confidence,
+                }
+            else:
+                # High confidence but no batch — just fire
+                result = await action_fn()
+                self._events.append({
+                    "event": "high_path_single",
+                    "step": step_num,
+                    "confidence": confidence,
+                    "ts": time.monotonic(),
+                })
+                return {
+                    "result": result,
+                    "path": "high",
+                    "next_action": None,
+                    "possibilities": None,
+                    "confidence": confidence,
+                }
+
+        else:
+            # ── LOW PATH: pre-compute possibilities ────────────────
+            self._low_path_count += 1
+
+            result, possibilities = await self.speculator.execute_with_precompute(
+                action_fn,
+                precompute_fn or (lambda ctx: {}),
+                step_context=step_context,
+                is_last_step=is_last_step,
+            )
+
+            # Try instant dispatch
+            next_action = None
+            if possibilities and not is_last_step:
+                next_action = self.speculator.dispatch(result, possibilities)
+
+            self._events.append({
+                "event": "low_path",
+                "step": step_num,
+                "confidence": confidence,
+                "dispatched": next_action is not None,
+                "num_possibilities": len(possibilities) if possibilities else 0,
+                "ts": time.monotonic(),
+            })
+            log.debug("SpecEngine: LOW path step %d (conf=%.0f%%, dispatched=%s)",
+                      step_num, confidence * 100, next_action is not None)
+
+            return {
+                "result": result,
+                "path": "low",
+                "next_action": next_action,
+                "possibilities": possibilities,
+                "confidence": confidence,
+            }
+
+    # ── Queries ────────────────────────────────────────────────────
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        spec_stats = self.speculator.stats
+        elapsed = time.monotonic() - self._started_at
+        return {
+            "dial": self.dial,
+            "confidence_threshold": self.confidence_threshold,
+            "steps": self._step_count,
+            "high_path": self._high_path_count,
+            "low_path": self._low_path_count,
+            "instant_dispatches": spec_stats["instant_dispatches"],
+            "fallback_thinks": spec_stats["fallback_thinks"],
+            "hit_rate": spec_stats["hit_rate"],
+            "elapsed": elapsed,
+        }
+
+    def get_summary(self) -> str:
+        s = self.stats
+        return (f"SpecEngine dial={s['dial']}: {s['steps']} steps, "
+                f"{s['high_path']} high-conf / {s['low_path']} low-conf, "
+                f"{s['instant_dispatches']} instant dispatches "
+                f"({s['hit_rate']:.0%} hit), "
+                f"elapsed={s['elapsed']:.1f}s")
+
+    def get_timeline(self) -> str:
+        """ASCII timeline of engine decisions."""
+        lines = [f"SpecEngine Timeline (dial={self.dial}, "
+                 f"threshold={self.confidence_threshold:.0%}):"]
+        for e in self._events:
+            t = e["ts"] - self._started_at
+            conf = e["confidence"]
+            if e["event"] == "high_path":
+                lines.append(f"  {t:6.2f}s 🚀 HIGH step {e['step']} "
+                             f"(conf={conf:.0%}, batch={e['batch_size']})")
+            elif e["event"] == "high_path_single":
+                lines.append(f"  {t:6.2f}s 🚀 HIGH step {e['step']} "
+                             f"(conf={conf:.0%}, single)")
+            elif e["event"] == "low_path":
+                marker = "⚡" if e["dispatched"] else "🔮"
+                lines.append(f"  {t:6.2f}s {marker} LOW  step {e['step']} "
+                             f"(conf={conf:.0%}, "
+                             f"{e['num_possibilities']} poss, "
+                             f"{'instant' if e['dispatched'] else 'fallback'})")
+        return "\n".join(lines)
+
+
 class SharedMind:
     """Blackboard pattern — cross-tab awareness for concurrent browser lanes.
 
