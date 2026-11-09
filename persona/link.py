@@ -2038,25 +2038,35 @@ class SpeculativeEngine:
     """Combines SpeculativeRouter's probability batching with
     PossibilitySpeculator's pre-compute-and-hold pipeline.
 
-    Decision logic per step:
-        1. Estimate confidence in the next action (0.0–1.0)
-        2. If confidence >= confidence_threshold:
-              → HIGH PATH: batch-fire via SpeculativeRouter (we KNOW what's next)
-              → Example: minimized window → click Start menu (95% certain)
-        3. If confidence < confidence_threshold:
-              → LOW PATH: pre-compute possibilities via PossibilitySpeculator
-              → Hold all N outcomes ready, instant-dispatch on result match
-              → Example: clicked Submit → could get success/error/modal/redirect
+    Core principle: ALWAYS pre-compute possibilities from the previous
+    decision point. Pre-computation starts the moment you have something
+    solid — the result of the last step IS that solid ground.
 
-    This gives the best of both worlds:
-        - High-confidence steps fire immediately (zero think, zero wait)
-        - Uncertain steps still get zero-gap dispatch via pre-computed possibilities
-        - Neither strategy alone covers both cases
+    On TOP of that, high-confidence batching fires immediately:
+
+        Every step:
+            → Pre-compute possibilities (ALWAYS, from previous decision)
+            → These run in background during current action
+
+        If confidence >= threshold (we KNOW what's next):
+            → ALSO batch-fire the next action immediately
+            → If the batch was WRONG, possibilities are still ready
+            → Example: minimize → Start menu (95% sure, but pre-compute
+              covers the 5% where something else happened)
+
+        If confidence < threshold (uncertain):
+            → Only possibilities — wait for result, instant-dispatch match
+            → Example: clicked Submit → could be success/error/modal
+
+    This means high-confidence steps get BOTH speed AND safety:
+        - The batch fires with zero delay (speed)
+        - Pre-computed possibilities catch batch misses (safety)
+        - Low-confidence steps still get zero-gap dispatch
 
     The confidence_threshold is driven by the dial:
-        Dial 1:  threshold=0.9 (almost never batches, mostly possibilities)
+        Dial 1:  threshold=0.9 (rarely batches, mostly possibilities)
         Dial 5:  threshold=0.7 (batches when fairly confident)
-        Dial 10: threshold=0.5 (batches aggressively, possibilities for the rest)
+        Dial 10: threshold=0.5 (batches aggressively, possibilities backup)
     """
 
     DIAL_PROFILES: ClassVar[dict[int, dict[str, Any]]] = {
@@ -2122,25 +2132,29 @@ class SpeculativeEngine:
         step_context: dict[str, Any] | None = None,
         is_last_step: bool = False,
     ) -> dict[str, Any]:
-        """Execute one step, choosing the optimal strategy by confidence.
+        """Execute one step — ALWAYS pre-compute, batch on top if confident.
+
+        Pre-computation runs every step (from the previous decision).
+        High confidence adds batch-firing ON TOP, with possibilities as
+        a safety net if the batch was wrong.
 
         Args:
             confidence: 0.0–1.0, how sure we are about the next action.
             action_fn: async callable that executes the current action.
-            precompute_fn: async callable(ctx) → {outcome_key: action_dict}
-                           for the LOW path (possibilities).
-            batch_actions: list of actions to fire immediately for the
-                          HIGH path (probability batching). If None and
-                          confidence is high, only the current action fires.
+            precompute_fn: async callable(ctx) → {outcome_key: action_dict}.
+                           ALWAYS runs (unless is_last_step).
+            batch_actions: list of actions to batch-fire immediately when
+                          confidence is high. Layered on top of possibilities.
             step_context: context dict passed to precompute_fn.
             is_last_step: if True, skip pre-computation.
 
         Returns:
             {
                 "result": action result,
-                "path": "high" | "low",
-                "next_action": dict | None,  # ready-to-fire next action
-                "possibilities": dict | None,  # pre-computed set (low path)
+                "path": "high+precompute" | "precompute",
+                "next_action": dict | None,
+                "batch_fired": bool,
+                "possibilities": dict | None,
                 "confidence": float,
             }
         """
@@ -2148,85 +2162,97 @@ class SpeculativeEngine:
             self._step_count += 1
             step_num = self._step_count
 
-        t0 = time.monotonic()
-
-        if confidence >= self.confidence_threshold:
-            # ── HIGH PATH: batch and fire ──────────────────────────
+        is_high = confidence >= self.confidence_threshold
+        if is_high:
             self._high_path_count += 1
-
-            if batch_actions and not is_last_step:
-                # Fire current action + batch the next N high-confidence actions
-                batch_size = min(len(batch_actions), self.max_batch)
-                batch_to_fire = batch_actions[:batch_size]
-
-                result = await action_fn()
-
-                self._events.append({
-                    "event": "high_path",
-                    "step": step_num,
-                    "confidence": confidence,
-                    "batch_size": batch_size,
-                    "ts": time.monotonic(),
-                })
-                log.debug("SpecEngine: HIGH path step %d (conf=%.0f%%, batch=%d)",
-                          step_num, confidence * 100, batch_size)
-
-                return {
-                    "result": result,
-                    "path": "high",
-                    "next_action": batch_to_fire[0] if batch_to_fire else None,
-                    "batch_remaining": batch_to_fire[1:] if len(batch_to_fire) > 1 else [],
-                    "possibilities": None,
-                    "confidence": confidence,
-                }
-            else:
-                # High confidence but no batch — just fire
-                result = await action_fn()
-                self._events.append({
-                    "event": "high_path_single",
-                    "step": step_num,
-                    "confidence": confidence,
-                    "ts": time.monotonic(),
-                })
-                return {
-                    "result": result,
-                    "path": "high",
-                    "next_action": None,
-                    "possibilities": None,
-                    "confidence": confidence,
-                }
-
         else:
-            # ── LOW PATH: pre-compute possibilities ────────────────
             self._low_path_count += 1
 
-            result, possibilities = await self.speculator.execute_with_precompute(
-                action_fn,
-                precompute_fn or (lambda ctx: {}),
-                step_context=step_context,
-                is_last_step=is_last_step,
-            )
+        # ── ALWAYS pre-compute possibilities during action ─────────
+        # This is the foundation — every step gets possibilities ready
+        result, possibilities = await self.speculator.execute_with_precompute(
+            action_fn,
+            precompute_fn or (lambda ctx: {}),
+            step_context=step_context,
+            is_last_step=is_last_step,
+        )
 
-            # Try instant dispatch
-            next_action = None
+        next_action = None
+        batch_fired = False
+
+        if is_high and batch_actions and not is_last_step:
+            # ── HIGH CONFIDENCE: batch fires ON TOP ────────────────
+            # We already pre-computed possibilities (safety net).
+            # Now also use the batch action — it's what we're confident about.
+            batch_size = min(len(batch_actions), self.max_batch)
+            batch_to_fire = batch_actions[:batch_size]
+            next_action = batch_to_fire[0] if batch_to_fire else None
+            batch_fired = True
+
+            # Check: did the result match our confident prediction?
+            # If not, override the batch with the matching possibility
+            if possibilities and not is_last_step:
+                dispatched = self.speculator.dispatch(result, possibilities)
+                if dispatched is not None and next_action is not None:
+                    # Result matched a possibility — check if it agrees
+                    # with our batch. If the batch was wrong, use the
+                    # possibility instead (the safety net catches it).
+                    result_key = str(result)
+                    batch_key = next_action.get("_expected_outcome", "")
+                    if batch_key and result_key != batch_key:
+                        # Batch was WRONG — safety net kicks in
+                        next_action = dispatched
+                        batch_fired = False
+                        log.info("SpecEngine: batch miss step %d — "
+                                 "safety net caught it (conf=%.0f%%)",
+                                 step_num, confidence * 100)
+
+            self._events.append({
+                "event": "high_plus_precompute",
+                "step": step_num,
+                "confidence": confidence,
+                "batch_fired": batch_fired,
+                "batch_size": batch_size,
+                "num_possibilities": len(possibilities) if possibilities else 0,
+                "ts": time.monotonic(),
+            })
+            log.debug("SpecEngine: HIGH+PRECOMPUTE step %d (conf=%.0f%%, "
+                      "batch=%s, %d poss ready)",
+                      step_num, confidence * 100, batch_fired,
+                      len(possibilities) if possibilities else 0)
+
+            return {
+                "result": result,
+                "path": "high+precompute",
+                "next_action": next_action,
+                "batch_remaining": batch_to_fire[1:] if batch_fired and len(batch_to_fire) > 1 else [],
+                "batch_fired": batch_fired,
+                "possibilities": possibilities,
+                "confidence": confidence,
+            }
+
+        else:
+            # ── PRECOMPUTE ONLY (low confidence or no batch) ───────
+            # Possibilities are our only play — instant-dispatch on match
             if possibilities and not is_last_step:
                 next_action = self.speculator.dispatch(result, possibilities)
 
             self._events.append({
-                "event": "low_path",
+                "event": "precompute_only",
                 "step": step_num,
                 "confidence": confidence,
                 "dispatched": next_action is not None,
                 "num_possibilities": len(possibilities) if possibilities else 0,
                 "ts": time.monotonic(),
             })
-            log.debug("SpecEngine: LOW path step %d (conf=%.0f%%, dispatched=%s)",
+            log.debug("SpecEngine: PRECOMPUTE step %d (conf=%.0f%%, dispatched=%s)",
                       step_num, confidence * 100, next_action is not None)
 
             return {
                 "result": result,
-                "path": "low",
+                "path": "precompute",
                 "next_action": next_action,
+                "batch_fired": False,
                 "possibilities": possibilities,
                 "confidence": confidence,
             }
@@ -2264,15 +2290,14 @@ class SpeculativeEngine:
         for e in self._events:
             t = e["ts"] - self._started_at
             conf = e["confidence"]
-            if e["event"] == "high_path":
-                lines.append(f"  {t:6.2f}s 🚀 HIGH step {e['step']} "
-                             f"(conf={conf:.0%}, batch={e['batch_size']})")
-            elif e["event"] == "high_path_single":
-                lines.append(f"  {t:6.2f}s 🚀 HIGH step {e['step']} "
-                             f"(conf={conf:.0%}, single)")
-            elif e["event"] == "low_path":
+            if e["event"] == "high_plus_precompute":
+                safety = "" if e["batch_fired"] else " → SAFETY NET"
+                lines.append(f"  {t:6.2f}s 🚀 HIGH+PRE step {e['step']} "
+                             f"(conf={conf:.0%}, batch={e['batch_size']}, "
+                             f"{e['num_possibilities']} poss{safety})")
+            elif e["event"] == "precompute_only":
                 marker = "⚡" if e["dispatched"] else "🔮"
-                lines.append(f"  {t:6.2f}s {marker} LOW  step {e['step']} "
+                lines.append(f"  {t:6.2f}s {marker} PRE  step {e['step']} "
                              f"(conf={conf:.0%}, "
                              f"{e['num_possibilities']} poss, "
                              f"{'instant' if e['dispatched'] else 'fallback'})")
