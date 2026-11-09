@@ -1243,6 +1243,355 @@ class ThoughtStream:
             return "\n".join(lines)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SpeculativeRouter — probability-based speculative batching
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class SpeculativeBranch:
+    """One probability branch — an agent pursuing one hypothesis.
+
+    Each branch has:
+    - A probability score (0.0–1.0) that updates as evidence arrives
+    - A ThoughtStream feed (live reasoning visible to all branches)
+    - A halt signal (killed early when probability drops below threshold)
+    - Results accumulated so far
+    """
+
+    def __init__(self, branch_id: str, hypothesis: str,
+                 initial_probability: float,
+                 tasks: list[dict[str, Any]] | None = None):
+        self.branch_id = branch_id
+        self.hypothesis = hypothesis       # What this branch is betting on
+        self.probability = initial_probability
+        self.tasks = tasks or []
+        self.results: list[dict[str, Any]] = []
+        self.halted = False
+        self.halt_reason: str = ""
+        self.started_at = time.monotonic()
+        self.finished_at: float | None = None
+        self.tokens_generated: int = 0
+        self._evidence: list[dict[str, Any]] = []
+        # [{type, data, delta, ts}] — evidence that shifted the probability
+
+    def record_evidence(self, evidence_type: str, data: str,
+                        probability_delta: float) -> None:
+        """Record evidence that shifts this branch's probability.
+
+        Positive delta = evidence supports this hypothesis.
+        Negative delta = evidence contradicts it.
+        """
+        self.probability = max(0.0, min(1.0,
+                                         self.probability + probability_delta))
+        self._evidence.append({
+            "type": evidence_type,
+            "data": data[:200],
+            "delta": probability_delta,
+            "new_prob": self.probability,
+            "ts": time.monotonic(),
+        })
+
+    def halt(self, reason: str) -> None:
+        self.halted = True
+        self.halt_reason = reason
+        self.finished_at = time.monotonic()
+
+    @property
+    def elapsed(self) -> float:
+        end = self.finished_at or time.monotonic()
+        return end - self.started_at
+
+    @property
+    def is_alive(self) -> bool:
+        return not self.halted
+
+    def summary(self) -> str:
+        status = "ALIVE" if self.is_alive else f"HALTED({self.halt_reason})"
+        return (f"[{self.branch_id}] p={self.probability:.2f} {status} "
+                f"— \"{self.hypothesis}\" "
+                f"({len(self.results)} results, {self.elapsed:.2f}s)")
+
+
+class SpeculativeRouter:
+    """Probability-based speculative batching — the Persona way.
+
+    Instead of blind speculative execution (fire N branches, discard losers),
+    this router spawns N concurrent agents weighted by probability, each
+    streaming its reasoning via ThoughtStream. The router watches the
+    probability landscape shift in real time:
+
+    - High-probability branches get priority task claims
+    - Low-probability branches are halted early (saving compute)
+    - Evidence from ANY branch updates ALL branches' probabilities
+    - The winning branch's partial work is KEPT, not recomputed
+
+    This is NOT speculative decoding (token-level prediction).
+    This is speculative REASONING — multiple hypothesis-driven agents
+    pursuing different strategies simultaneously, with a shared mind
+    that prunes losers and amplifies winners mid-execution.
+
+    Example: filling a complex form where the right approach is unclear.
+        Branch A (p=0.4): "This is a multi-step wizard — click Next first"
+        Branch B (p=0.35): "All fields visible — fill top to bottom"
+        Branch C (p=0.25): "Need to expand collapsed sections first"
+
+    As Branch B's hand starts finding visible fields and filling them,
+    its probability rises. Branch A clicks Next and gets an error —
+    its probability drops below threshold and is halted. Branch C
+    expands a section and finds more fields — its results feed into
+    Branch B's task queue. Final output: Branch B's filled form,
+    enriched by Branch C's discovery, with Branch A's wasted work
+    cut short after 1 action instead of running to completion.
+
+    Integration with ThoughtStream:
+        Every branch's reasoning is visible to all other branches.
+        Before Branch B fills a field, it sees:
+            [branch-A] INTENT: click '#next-btn' — assuming wizard flow
+            [branch-C] THINKING: "Found hidden section, expanding..."
+        This lets branches adjust their own probability estimates
+        reactively, not just from their own evidence.
+    """
+
+    def __init__(self, thought_stream: ThoughtStream | None = None,
+                 halt_threshold: float = 0.05,
+                 promotion_threshold: float = 0.7,
+                 max_branches: int = 8):
+        self._lock = asyncio.Lock()
+        self.thought_stream = thought_stream or ThoughtStream()
+        self.halt_threshold = halt_threshold
+        # Below this probability, a branch is killed
+        self.promotion_threshold = promotion_threshold
+        # Above this, a branch is declared winner (others halted)
+        self.max_branches = max_branches
+
+        self._branches: dict[str, SpeculativeBranch] = {}
+        self._events: list[dict[str, Any]] = []
+        self._winner: str | None = None
+        self._started_at = time.monotonic()
+
+    # ── Branch management ──────────────────────────────────────────
+
+    def add_branch(self, branch_id: str, hypothesis: str,
+                   probability: float,
+                   tasks: list[dict[str, Any]] | None = None) -> SpeculativeBranch:
+        """Register a new probability branch.
+
+        Probabilities across all branches don't need to sum to 1.0 —
+        they're independent confidence scores, not a distribution.
+        (Though normalizing them is valid for the pitch.)
+        """
+        if len(self._branches) >= self.max_branches:
+            raise ValueError(f"Max {self.max_branches} branches")
+        branch = SpeculativeBranch(branch_id, hypothesis, probability, tasks)
+        self._branches[branch_id] = branch
+        self._events.append({
+            "event": "branch_added", "branch": branch_id,
+            "hypothesis": hypothesis, "probability": probability,
+            "ts": time.monotonic(),
+        })
+        log.info("SpecRouter: +%s (p=%.2f) \"%s\"",
+                 branch_id, probability, hypothesis)
+        return branch
+
+    async def update_probability(self, branch_id: str,
+                                  evidence_type: str, data: str,
+                                  delta: float) -> dict[str, Any]:
+        """Update a branch's probability based on new evidence.
+
+        Returns the action taken: {"action": "continue"|"halt"|"promote",
+                                    "branch": ..., "new_prob": ...}
+
+        Called by:
+        - The branch's own hand (self-assessment from execution results)
+        - Other branches (cross-evidence from ThoughtStream)
+        - An external scorer (if wired up)
+        """
+        async with self._lock:
+            branch = self._branches.get(branch_id)
+            if not branch or branch.halted:
+                return {"action": "skip", "branch": branch_id,
+                        "reason": "not found or halted"}
+
+            old_prob = branch.probability
+            branch.record_evidence(evidence_type, data, delta)
+            new_prob = branch.probability
+
+            self._events.append({
+                "event": "probability_update", "branch": branch_id,
+                "old": old_prob, "new": new_prob, "delta": delta,
+                "evidence": evidence_type, "data": data[:100],
+                "ts": time.monotonic(),
+            })
+
+            # Broadcast probability shift via ThoughtStream
+            await self.thought_stream.push_tokens(
+                branch_id,
+                f"[p={old_prob:.2f}→{new_prob:.2f}] {evidence_type}: {data[:80]}"
+            )
+
+            # ── Decision: halt, promote, or continue ───────────────
+            if new_prob <= self.halt_threshold:
+                branch.halt(f"probability {new_prob:.3f} ≤ {self.halt_threshold}")
+                log.info("SpecRouter: HALT %s (p=%.3f ≤ %.2f)",
+                         branch_id, new_prob, self.halt_threshold)
+                return {"action": "halt", "branch": branch_id,
+                        "new_prob": new_prob,
+                        "reason": f"below threshold {self.halt_threshold}"}
+
+            if new_prob >= self.promotion_threshold and not self._winner:
+                self._winner = branch_id
+                # Halt all other branches
+                halted_others = []
+                for bid, b in self._branches.items():
+                    if bid != branch_id and b.is_alive:
+                        b.halt(f"outcompeted by {branch_id} (p={new_prob:.2f})")
+                        halted_others.append(bid)
+                log.info("SpecRouter: PROMOTE %s (p=%.2f) — halted %s",
+                         branch_id, new_prob, halted_others)
+                return {"action": "promote", "branch": branch_id,
+                        "new_prob": new_prob,
+                        "halted_others": halted_others}
+
+            return {"action": "continue", "branch": branch_id,
+                    "new_prob": new_prob}
+
+    async def cross_pollinate(self, source_branch: str,
+                               discovery: str,
+                               target_branches: list[str] | None = None
+                               ) -> None:
+        """Feed one branch's discovery into other branches.
+
+        When Branch C finds hidden fields, that evidence helps Branch B
+        (which is filling visible fields) but hurts Branch A (which
+        assumed a wizard flow). The router adjusts both.
+
+        If target_branches is None, broadcasts to all alive branches.
+        """
+        targets = target_branches or [
+            bid for bid, b in self._branches.items()
+            if bid != source_branch and b.is_alive
+        ]
+        for bid in targets:
+            await self.thought_stream.push_tokens(
+                bid,
+                f"[cross-evidence from {source_branch}] {discovery[:200]}"
+            )
+        self._events.append({
+            "event": "cross_pollinate", "source": source_branch,
+            "targets": targets, "discovery": discovery[:200],
+            "ts": time.monotonic(),
+        })
+
+    # ── Execution ──────────────────────────────────────────────────
+
+    async def run_branches(self, executor_fn,
+                            timeout: float = 30.0) -> dict[str, Any]:
+        """Run all branches concurrently, with probability-based routing.
+
+        executor_fn(branch: SpeculativeBranch, router: SpeculativeRouter)
+            -> list[dict] (results)
+
+        The executor is called for each branch. Inside it, the executor
+        should periodically call router.update_probability() and check
+        branch.halted before each action.
+
+        Returns:
+            {
+                "winner": branch_id or None,
+                "branches": {id: branch.summary(), ...},
+                "results": {id: [...results...], ...},
+                "elapsed": float,
+                "events": [...],
+            }
+        """
+        alive = [b for b in self._branches.values() if b.is_alive]
+        if not alive:
+            return {"winner": None, "branches": {}, "results": {},
+                    "elapsed": 0, "events": self._events}
+
+        log.info("SpecRouter: running %d branches concurrently", len(alive))
+
+        async def run_one(branch: SpeculativeBranch):
+            try:
+                results = await asyncio.wait_for(
+                    executor_fn(branch, self),
+                    timeout=timeout,
+                )
+                branch.results = results or []
+                if not branch.halted:
+                    branch.finished_at = time.monotonic()
+            except asyncio.TimeoutError:
+                branch.halt("timeout")
+            except Exception as e:
+                branch.halt(f"error: {str(e)[:100]}")
+                log.error("SpecRouter: %s failed: %s", branch.branch_id, e)
+
+        t0 = time.monotonic()
+        await asyncio.gather(*[run_one(b) for b in alive],
+                              return_exceptions=True)
+        elapsed = time.monotonic() - t0
+
+        # If no winner was promoted during execution, pick highest prob
+        if not self._winner:
+            alive_after = [b for b in self._branches.values()
+                           if b.results]
+            if alive_after:
+                self._winner = max(alive_after,
+                                    key=lambda b: b.probability).branch_id
+
+        return {
+            "winner": self._winner,
+            "branches": {bid: b.summary()
+                         for bid, b in self._branches.items()},
+            "results": {bid: b.results
+                        for bid, b in self._branches.items()},
+            "elapsed": elapsed,
+            "events": self._events,
+            "probability_history": {
+                bid: [(e["delta"], e["new_prob"])
+                      for e in b._evidence]
+                for bid, b in self._branches.items()
+            },
+        }
+
+    # ── Queries ────────────────────────────────────────────────────
+
+    def get_branch(self, branch_id: str) -> SpeculativeBranch | None:
+        return self._branches.get(branch_id)
+
+    def alive_branches(self) -> list[SpeculativeBranch]:
+        return [b for b in self._branches.values() if b.is_alive]
+
+    def get_winner(self) -> SpeculativeBranch | None:
+        if self._winner:
+            return self._branches.get(self._winner)
+        return None
+
+    async def get_landscape(self) -> str:
+        """Probability landscape — snapshot of all branches for logging."""
+        async with self._lock:
+            lines = [f"SpecRouter: {len(self._branches)} branches, "
+                     f"winner={self._winner or 'none'}"]
+            for bid, b in sorted(self._branches.items(),
+                                  key=lambda x: -x[1].probability):
+                bar = "█" * int(b.probability * 20)
+                lines.append(f"  {b.summary()}")
+                lines.append(f"    [{bar:<20}] {b.probability:.0%}")
+            return "\n".join(lines)
+
+    async def get_summary(self) -> str:
+        """Compact summary for reporting."""
+        async with self._lock:
+            elapsed = time.monotonic() - self._started_at
+            total_results = sum(len(b.results) for b in self._branches.values())
+            alive = sum(1 for b in self._branches.values() if b.is_alive)
+            halted = sum(1 for b in self._branches.values() if b.halted)
+            return (f"SpecRouter: {len(self._branches)} branches "
+                    f"({alive} alive, {halted} halted), "
+                    f"winner={self._winner or 'pending'}, "
+                    f"{total_results} total results, {elapsed:.1f}s")
+
+
 class SharedMind:
     """Blackboard pattern — cross-tab awareness for concurrent browser lanes.
 
