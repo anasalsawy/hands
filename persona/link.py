@@ -1031,6 +1031,218 @@ class BrowserUseNativeDriver:
                     pass
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ThoughtStream — live inference mirror for simultaneous shared consciousness
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class ThoughtStream:
+    """Live inference mirror — streams one agent's reasoning to all others.
+
+    Standard multi-agent frameworks are sequential talkers: Agent A runs,
+    finishes, sends a message, then Agent B runs. ThoughtStream creates
+    simultaneous shared consciousness: Agent 1 knows what Agent 0 is
+    *intending* to do while Agent 0 is still thinking it.
+
+    Mechanics:
+        Because Persona IS the LLM (sits in the ainvoke() slot), we control
+        the token stream server-side. As Agent 0 generates <thought> tokens
+        token-by-token, ThoughtStream captures and broadcasts them to all
+        other agents' context windows in real time.
+
+    Two consumption modes:
+        1. Streaming Mirror — tokens arrive as they're generated, other
+           agents see partial thoughts mid-inference
+        2. Snapshot — agent reads the latest complete thought block before
+           starting its own inference step
+
+    This is the "Inter-Agent Attention Layer": before Agent 1 begins its
+    own inference, its input is dynamically appended with:
+        [Agent_0_Current_Thought: "Typing login credentials..."]
+
+    Thread-safe via asyncio. No locking needed for reads — worst case
+    a reader sees a slightly stale snapshot, which is fine because the
+    stream is append-only.
+    """
+
+    def __init__(self, max_tokens_per_agent: int = 2048):
+        self._streams: dict[str, list[str]] = {}
+        # agent_id -> list of token chunks (append-only)
+        self._thought_blocks: dict[str, list[str]] = {}
+        # agent_id -> list of complete thought blocks
+        self._active_thought: dict[str, str] = {}
+        # agent_id -> current partial thought being generated
+        self._listeners: dict[str, list[asyncio.Event]] = {}
+        # agent_id -> list of events to notify on new tokens
+        self._max_tokens = max_tokens_per_agent
+        self._lock = asyncio.Lock()
+        self._t0 = time.monotonic()
+
+    # ── Writing: agent pushes its reasoning tokens ─────────────────
+
+    async def push_tokens(self, agent_id: str, tokens: str) -> None:
+        """Agent pushes token chunk as it's generated.
+
+        Called from inside ainvoke() as the model streams tokens.
+        Other agents' listeners are notified immediately.
+        """
+        async with self._lock:
+            if agent_id not in self._streams:
+                self._streams[agent_id] = []
+                self._active_thought[agent_id] = ""
+            self._streams[agent_id].append(tokens)
+            self._active_thought[agent_id] += tokens
+
+            # Trim if too long (keep tail)
+            if len(self._active_thought[agent_id]) > self._max_tokens:
+                self._active_thought[agent_id] = \
+                    self._active_thought[agent_id][-self._max_tokens:]
+
+        # Notify all listeners for this agent (outside lock)
+        for evt in self._listeners.get(agent_id, []):
+            evt.set()
+
+    async def complete_thought(self, agent_id: str,
+                                thought_type: str = "reasoning") -> None:
+        """Mark current thought block as complete.
+
+        Called when the agent finishes a reasoning step (before action).
+        The complete block is archived and the active buffer is cleared.
+        """
+        async with self._lock:
+            active = self._active_thought.get(agent_id, "")
+            if active.strip():
+                if agent_id not in self._thought_blocks:
+                    self._thought_blocks[agent_id] = []
+                self._thought_blocks[agent_id].append(active.strip())
+                # Keep last 5 blocks
+                if len(self._thought_blocks[agent_id]) > 5:
+                    self._thought_blocks[agent_id] = \
+                        self._thought_blocks[agent_id][-5:]
+            self._active_thought[agent_id] = ""
+            self._streams[agent_id] = []
+
+    async def push_action_intent(self, agent_id: str,
+                                  action: str, target: str,
+                                  reasoning: str = "") -> None:
+        """Shortcut: agent declares what it's about to do and why.
+
+        More structured than raw token streaming — used when the agent
+        has already decided on an action but hasn't executed it yet.
+        Other agents see this as: "[agent_0 INTENDS: click '#submit'
+        because form is filled]"
+        """
+        intent = f"{action} '{target}'"
+        if reasoning:
+            intent += f" — {reasoning}"
+        async with self._lock:
+            if agent_id not in self._streams:
+                self._streams[agent_id] = []
+            self._active_thought[agent_id] = f"INTENT: {intent}"
+            self._streams[agent_id].append(f"INTENT: {intent}")
+        # Notify listeners
+        for evt in self._listeners.get(agent_id, []):
+            evt.set()
+
+    # ── Reading: other agents consume the stream ───────────────────
+
+    async def get_live_thoughts(self, exclude_agent: str | None = None,
+                                 max_chars: int = 1000) -> str:
+        """Snapshot of all agents' current thoughts for injection into prompt.
+
+        This is the Inter-Agent Attention Layer. Returns a formatted block
+        ready to inject into another agent's system prompt or context:
+
+            LIVE AGENT THOUGHTS:
+            [agent-0] THINKING: "I see a login form, will type credentials..."
+            [agent-1] INTENT: click '#submit' — form is complete
+            [agent-2] IDLE (last: "Extracted price from #total")
+
+        Called by an agent before its own inference step.
+        """
+        async with self._lock:
+            lines = []
+            for aid, active in self._active_thought.items():
+                if aid == exclude_agent:
+                    continue
+                if active.strip():
+                    # Truncate to max_chars per agent
+                    thought = active.strip()[:max_chars]
+                    if thought.startswith("INTENT:"):
+                        lines.append(f"  [{aid}] {thought}")
+                    else:
+                        lines.append(f"  [{aid}] THINKING: \"{thought}\"")
+                else:
+                    # Show last completed thought
+                    blocks = self._thought_blocks.get(aid, [])
+                    if blocks:
+                        last = blocks[-1][:200]
+                        lines.append(f"  [{aid}] IDLE (last: \"{last}\")")
+                    else:
+                        lines.append(f"  [{aid}] IDLE")
+
+            if not lines:
+                return ""
+            return "LIVE AGENT THOUGHTS:\n" + "\n".join(lines)
+
+    async def get_agent_intent(self, agent_id: str) -> str | None:
+        """Get a specific agent's current intent/thought.
+
+        Used for targeted awareness — e.g., hand-1 checks what hand-0
+        is about to do before choosing its own action.
+        """
+        async with self._lock:
+            return self._active_thought.get(agent_id, "").strip() or None
+
+    async def wait_for_thought(self, agent_id: str,
+                                timeout: float = 5.0) -> str | None:
+        """Block until an agent pushes new tokens. Returns the new content.
+
+        Used for the Streaming Mirror mode — hand-1 literally waits for
+        hand-0 to start thinking, then reacts.
+        """
+        evt = asyncio.Event()
+        if agent_id not in self._listeners:
+            self._listeners[agent_id] = []
+        self._listeners[agent_id].append(evt)
+
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=timeout)
+            return self._active_thought.get(agent_id, "")
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self._listeners.get(agent_id, []).remove(evt) if evt in \
+                self._listeners.get(agent_id, []) else None
+
+    # ── Lifecycle ──────────────────────────────────────────────────
+
+    async def clear_agent(self, agent_id: str) -> None:
+        """Remove an agent's stream (agent done or crashed)."""
+        async with self._lock:
+            self._streams.pop(agent_id, None)
+            self._thought_blocks.pop(agent_id, None)
+            self._active_thought.pop(agent_id, None)
+            self._listeners.pop(agent_id, None)
+
+    async def get_summary(self) -> str:
+        """Full summary of all thought activity."""
+        async with self._lock:
+            lines = []
+            elapsed = time.monotonic() - self._t0
+            lines.append(f"ThoughtStream active {elapsed:.1f}s, "
+                         f"{len(self._streams)} agents")
+            for aid in self._streams:
+                active = self._active_thought.get(aid, "")
+                blocks = len(self._thought_blocks.get(aid, []))
+                total_tokens = sum(len(c) for c in self._streams.get(aid, []))
+                status = "THINKING" if active.strip() else "IDLE"
+                lines.append(f"  [{aid}] {status} — "
+                             f"{blocks} completed thoughts, "
+                             f"{total_tokens} chars streamed")
+            return "\n".join(lines)
+
+
 class SharedMind:
     """Blackboard pattern — cross-tab awareness for concurrent browser lanes.
 
@@ -1043,6 +1255,9 @@ class SharedMind:
     Answer: neither. They share awareness and coordinate implicitly.
 
     Thread-safe via asyncio (single event loop, no threading needed).
+
+    Now includes a ThoughtStream for live inference mirroring — each tab's
+    reasoning tokens are visible to all other tabs in real time.
     """
 
     def __init__(self):
@@ -1051,6 +1266,8 @@ class SharedMind:
         self.events: list[dict[str, Any]] = []
         # Ordered log: [{tab, event, data, ts}, ...]
         self._lock = asyncio.Lock()
+        self.thought_stream = ThoughtStream()
+        # Live inference mirror — shared across all tabs
 
     async def register_tab(self, tab_id: str, url: str, task: str) -> None:
         async with self._lock:
@@ -1080,7 +1297,11 @@ class SharedMind:
                 })
 
     async def get_cross_tab_context(self, exclude_tab: str | None = None) -> str:
-        """What every lane reads before acting — awareness of ALL tabs."""
+        """What every lane reads before acting — awareness of ALL tabs.
+
+        Now includes live thought stream — each tab sees what other tabs
+        are currently thinking/intending, not just their last action.
+        """
         async with self._lock:
             lines = []
             for tid, info in self.tabs.items():
@@ -1101,7 +1322,16 @@ class SharedMind:
                 lines.append(line)
             if not lines:
                 return "No other tabs active."
-            return "CROSS-TAB STATE:\n" + "\n".join(lines)
+
+        # Append live thought stream (outside lock — ThoughtStream has its own)
+        thoughts = await self.thought_stream.get_live_thoughts(
+            exclude_agent=exclude_tab, max_chars=500
+        )
+
+        result = "CROSS-TAB STATE:\n" + "\n".join(lines)
+        if thoughts:
+            result += "\n\n" + thoughts
+        return result
 
     async def get_summary(self) -> str:
         """Full summary for aggregated reporting."""
@@ -1223,6 +1453,8 @@ class SwarmMind:
     4. DOM Mutation Awareness — one hand's changes are known to all others
     5. Dynamic Task Rebalancing — hands pick up unfinished work from others
     6. Micro-Delay Orchestration — uses execution gaps to interleave actions
+    7. Live Thought Sharing — each hand's reasoning is visible to all others
+       in real time via ThoughtStream (simultaneous shared consciousness)
 
     This is the "unified swarm intelligence" — one mind, multiple bodies,
     all operating on a single page simultaneously.
@@ -1255,6 +1487,19 @@ class SwarmMind:
 
         # ── Coordination events ─────────────────────────────────────
         self._events: list[dict[str, Any]] = []
+
+        # ── Live thought sharing ───────────────────────────────────
+        self.thought_stream = ThoughtStream()
+        # Each hand's reasoning tokens are broadcast to all other hands
+        # in real time. Before hand-1 acts, it sees:
+        #   [hand-0] INTENT: click '#submit' — form is complete
+        # This is the "simultaneous shared consciousness" from the pitch.
+
+        # ── Reactive stagger ───────────────────────────────────────
+        self._dispatch_event = asyncio.Event()
+        # Fires when ANY hand dispatches a CDP command — other hands
+        # that are sleeping wake up and claim their next task.
+        self._dispatch_count: int = 0
 
     # ── Task management ────────────────────────────────────────────
 
@@ -1489,6 +1734,8 @@ class SwarmHand:
 
         Handles: click, type, extract, wait, scroll, evaluate.
         Records DOM mutations caused by the action.
+        Broadcasts intent via ThoughtStream before acting.
+        Signals dispatch_event so staggered hands wake up.
         """
         if not await self._pre_action():
             return None
@@ -1497,6 +1744,13 @@ class SwarmHand:
         selector = task.get("selector", "body")
         data = task.get("data", "")
         self._action_count += 1
+
+        # ── Broadcast intent BEFORE acting ─────────────────────────
+        # Other hands see this mid-inference: "[hand-0] INTENT: click '#submit'"
+        await self.mind.thought_stream.push_action_intent(
+            self.hand_id, action, selector,
+            reasoning=f"task priority {task.get('priority', '?')}"
+        )
 
         try:
             if action == "click":
@@ -1577,6 +1831,9 @@ class SwarmHand:
                    ["navigation", "detached", "context was destroyed",
                     "execution context", "target closed"]):
                 await self.mind.halt_all(f"Page destroyed: {err_str[:100]}")
+            await self.mind.thought_stream.push_tokens(
+                self.hand_id, f"ERROR: {err_str[:100]}"
+            )
             return f"ERROR: {err_str[:200]}"
 
     async def run_loop(self) -> list[dict[str, Any]]:
@@ -1584,11 +1841,21 @@ class SwarmHand:
 
         This is one hand's autonomous loop. It runs concurrently with
         other hands, all sharing the same page and SwarmMind.
+
+        Before each claim, the hand reads other hands' live thoughts
+        from the ThoughtStream (the Inter-Agent Attention Layer).
         """
         results = []
         while True:
             if await self._check_halt():
                 break
+
+            # ── Read other hands' live thoughts before deciding ────
+            live = await self.mind.thought_stream.get_live_thoughts(
+                exclude_agent=self.hand_id, max_chars=500
+            )
+            if live:
+                log.debug("  %s: sees live thoughts:\n%s", self.hand_id, live)
 
             task = await self.mind.claim_next_task(self.hand_id)
             if task is None:
@@ -1597,18 +1864,23 @@ class SwarmHand:
             log.info("  %s: claimed %s on '%s'",
                      self.hand_id, task.get("action"), task.get("selector", "?"))
 
-            # Execute
+            # Execute (broadcasts intent + signals dispatch_event internally)
             result = await self.execute_action(task)
             results.append({"task": task, "result": result})
 
-            # Report completion
+            # Report completion + complete thought block
             error = str(result) if result and str(result).startswith("ERROR") else None
             await self.mind.complete_task(self.hand_id, result=result, error=error)
+            await self.mind.thought_stream.complete_thought(self.hand_id)
 
-            # Tiny yield to let other hands interleave
+            # Signal other staggered hands to wake up
+            self.mind._dispatch_event.set()
+            self.mind._dispatch_count += 1
             await asyncio.sleep(0)
+            self.mind._dispatch_event.clear()
 
         log.info("  %s: done — %d actions executed", self.hand_id, self._action_count)
+        await self.mind.thought_stream.clear_agent(self.hand_id)
         return results
 
 
