@@ -64,7 +64,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from .host_delegation import is_host_background_tool
 
@@ -1352,22 +1352,58 @@ class SpeculativeRouter:
         reactively, not just from their own evidence.
     """
 
+    # ── Speed dial ──────────────────────────────────────────────
+    # One number, 1–10. Higher = faster execution, more token burn.
+    #
+    #   Speed 1:  1 branch, aggressive pruning  (sequential, cheap)
+    #   Speed 3:  3 branches, moderate pruning   (balanced)
+    #   Speed 5:  5 branches, light pruning      (fast)
+    #   Speed 7:  8 branches, minimal pruning    (aggressive)
+    #   Speed 10: 16 branches, NO pruning        (all possibilities, max burn)
+    #
+    # The user sees a slider. Internally it controls:
+    #   max_branches  — how many concurrent possibilities
+    #   halt_threshold — how quickly losers get killed
+    #   branch_depth  — how deep the branching tree goes
+    SPEED_PROFILES: ClassVar[dict[int, dict[str, Any]]] = {
+        1:  {"max_branches": 1,  "halt_threshold": 0.30, "promotion_threshold": 0.6,  "branch_depth": 1},
+        2:  {"max_branches": 2,  "halt_threshold": 0.20, "promotion_threshold": 0.65, "branch_depth": 2},
+        3:  {"max_branches": 3,  "halt_threshold": 0.15, "promotion_threshold": 0.7,  "branch_depth": 3},
+        4:  {"max_branches": 4,  "halt_threshold": 0.10, "promotion_threshold": 0.75, "branch_depth": 3},
+        5:  {"max_branches": 5,  "halt_threshold": 0.08, "promotion_threshold": 0.8,  "branch_depth": 4},
+        6:  {"max_branches": 6,  "halt_threshold": 0.05, "promotion_threshold": 0.85, "branch_depth": 5},
+        7:  {"max_branches": 8,  "halt_threshold": 0.03, "promotion_threshold": 0.9,  "branch_depth": 6},
+        8:  {"max_branches": 10, "halt_threshold": 0.02, "promotion_threshold": 0.95, "branch_depth": 7},
+        9:  {"max_branches": 12, "halt_threshold": 0.01, "promotion_threshold": 0.99, "branch_depth": 8},
+        10: {"max_branches": 16, "halt_threshold": 0.00, "promotion_threshold": 1.10, "branch_depth": 10},
+    }
+
     def __init__(self, thought_stream: ThoughtStream | None = None,
-                 halt_threshold: float = 0.05,
-                 promotion_threshold: float = 0.7,
-                 max_branches: int = 8):
+                 speed: int = 5,
+                 halt_threshold: float | None = None,
+                 promotion_threshold: float | None = None,
+                 max_branches: int | None = None):
         self._lock = asyncio.Lock()
         self.thought_stream = thought_stream or ThoughtStream()
-        self.halt_threshold = halt_threshold
-        # Below this probability, a branch is killed
-        self.promotion_threshold = promotion_threshold
-        # Above this, a branch is declared winner (others halted)
-        self.max_branches = max_branches
+
+        # Speed dial drives everything — explicit overrides still work
+        self.speed = max(1, min(10, speed))
+        profile = self.SPEED_PROFILES[self.speed]
+        self.halt_threshold = halt_threshold if halt_threshold is not None else profile["halt_threshold"]
+        self.promotion_threshold = promotion_threshold if promotion_threshold is not None else profile["promotion_threshold"]
+        self.max_branches = max_branches if max_branches is not None else profile["max_branches"]
+        self.branch_depth = profile["branch_depth"]
 
         self._branches: dict[str, SpeculativeBranch] = {}
+        self._branch_tree: dict[str, list[str]] = {}  # parent → [children]
+        self._branch_generation: dict[str, int] = {}   # branch_id → depth
         self._events: list[dict[str, Any]] = []
         self._winner: str | None = None
         self._started_at = time.monotonic()
+
+        log.info("SpecRouter: speed=%d (max=%d branches, halt=%.2f, promo=%.2f, depth=%d)",
+                 self.speed, self.max_branches, self.halt_threshold,
+                 self.promotion_threshold, self.branch_depth)
 
     # ── Branch management ──────────────────────────────────────────
 
@@ -1392,6 +1428,122 @@ class SpeculativeRouter:
         log.info("SpecRouter: +%s (p=%.2f) \"%s\"",
                  branch_id, probability, hypothesis)
         return branch
+
+    @classmethod
+    def from_speed(cls, speed: int,
+                   thought_stream: ThoughtStream | None = None) -> SpeculativeRouter:
+        """Create a router from just a speed dial value (1–10).
+
+        This is the user-facing API:
+            router = SpeculativeRouter.from_speed(7)  # aggressive
+            router = SpeculativeRouter.from_speed(3)  # balanced
+        """
+        return cls(thought_stream=thought_stream, speed=speed)
+
+    def branch_from(self, parent_id: str,
+                    child_hypotheses: list[dict[str, Any]]) -> list[SpeculativeBranch]:
+        """Spawn child branches from a parent — recursive branching tree.
+
+        After a branch completes an action and sees N possible next steps,
+        it branches into N children. Each child inherits the parent's
+        accumulated results and runs its own hypothesis.
+
+        This is the aggressive model: after every action, the possibility
+        space fans out. Speed dial controls how deep this goes.
+
+        Args:
+            parent_id: the branch that's splitting
+            child_hypotheses: list of {hypothesis: str, probability: float,
+                                        tasks: list[dict]}
+
+        Returns:
+            List of newly created child branches (empty if depth exceeded
+            or max branches hit).
+        """
+        parent = self._branches.get(parent_id)
+        if not parent:
+            return []
+
+        parent_gen = self._branch_generation.get(parent_id, 0)
+        if parent_gen >= self.branch_depth:
+            log.info("SpecRouter: %s at max depth %d, no branching",
+                     parent_id, self.branch_depth)
+            return []
+
+        children = []
+        for i, hyp in enumerate(child_hypotheses):
+            if len(self._branches) >= self.max_branches:
+                log.info("SpecRouter: max branches %d hit, stopping branching",
+                         self.max_branches)
+                break
+
+            child_id = f"{parent_id}.{i}"
+            child = SpeculativeBranch(
+                child_id,
+                hyp["hypothesis"],
+                hyp.get("probability", parent.probability * 0.8),
+                hyp.get("tasks", []),
+            )
+            # Inherit parent's results
+            child.results = list(parent.results)
+            self._branches[child_id] = child
+            self._branch_generation[child_id] = parent_gen + 1
+
+            # Track tree structure
+            if parent_id not in self._branch_tree:
+                self._branch_tree[parent_id] = []
+            self._branch_tree[parent_id].append(child_id)
+
+            self._events.append({
+                "event": "branch_spawned", "parent": parent_id,
+                "child": child_id, "generation": parent_gen + 1,
+                "hypothesis": hyp["hypothesis"],
+                "probability": child.probability,
+                "ts": time.monotonic(),
+            })
+            children.append(child)
+            log.info("SpecRouter: %s → %s (gen=%d, p=%.2f) \"%s\"",
+                     parent_id, child_id, parent_gen + 1,
+                     child.probability, hyp["hypothesis"])
+
+        # Halt parent — children take over
+        if children:
+            parent.halt(f"branched into {len(children)} children")
+
+        return children
+
+    def get_tree_depth(self) -> int:
+        """Current max depth of the branching tree."""
+        if not self._branch_generation:
+            return 0
+        return max(self._branch_generation.values())
+
+    def get_tree_visualization(self) -> str:
+        """ASCII tree of all branches for logging/display."""
+        lines = [f"SpecRouter Tree (speed={self.speed}, depth={self.get_tree_depth()}/{self.branch_depth}):"]
+
+        # Find root branches (no parent)
+        all_children = set()
+        for kids in self._branch_tree.values():
+            all_children.update(kids)
+        roots = [bid for bid in self._branches if bid not in all_children]
+
+        def render(bid: str, prefix: str = "  ", is_last: bool = True):
+            branch = self._branches.get(bid)
+            if not branch:
+                return
+            connector = "└── " if is_last else "├── "
+            status = "✓" if branch.is_alive else "✗"
+            lines.append(f"{prefix}{connector}[{bid}] p={branch.probability:.2f} {status} \"{branch.hypothesis}\"")
+            children = self._branch_tree.get(bid, [])
+            child_prefix = prefix + ("    " if is_last else "│   ")
+            for i, child_id in enumerate(children):
+                render(child_id, child_prefix, i == len(children) - 1)
+
+        for i, root in enumerate(sorted(roots)):
+            render(root, "  ", i == len(roots) - 1)
+
+        return "\n".join(lines)
 
     async def update_probability(self, branch_id: str,
                                   evidence_type: str, data: str,
