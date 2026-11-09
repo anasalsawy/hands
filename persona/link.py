@@ -1749,53 +1749,47 @@ class SpeculativeRouter:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class PossibilitySpeculator:
-    """Pre-compute all possible next actions DURING the current action.
+    """Pre-compute outcomes AT DECISION TIME, before the tool even executes.
 
-    This is NOT branching (SpeculativeRouter). This is pipelining:
-    while the browser executes action N, the LLM pre-computes all
-    possible outcomes of N and prepares the matching next action for
-    each. When N finishes, the correct next action is dispatched
-    INSTANTLY with zero LLM inference gap.
+    This is how humans think about browsers. The moment you decide
+    "I'm going to click Submit", you already know:
+        - It works → I'll fill the next field
+        - It doesn't work → I'll retry or try something else
 
-    The Overlap Dial (1–10) controls WHEN pre-computation starts
-    relative to the current action, via ThoughtStream head start:
+    So you pre-compute BOTH paths RIGHT THEN, at decision time, before
+    the click even fires. Pre-compute and action run in parallel.
+    By the time the click result comes back, the next action is already
+    waiting — zero inference gap.
 
-        Dial 1:  precompute starts when action COMPLETES (no overlap)
-        Dial 3:  precompute starts at 60% through the action
-        Dial 5:  precompute starts at action start (full overlap)
-        Dial 7:  precompute starts during PREVIOUS step's action
-        Dial 10: precompute starts during previous step's INFERENCE
+    Timeline:
+        DECIDE "click Submit"
+            ├── START action (click Submit)           ← runs in browser
+            └── START pre-compute                     ← runs in LLM, same moment
+                    ├── if success → prepare "fill next field"
+                    └── if error   → prepare "retry click"
+        ACTION COMPLETES → match result → INSTANT dispatch
 
-    Higher dial = more overlap = more tokens burned on possibilities
-    that may never match, but faster wall-clock time because the
-    pre-compute finishes earlier.
+    The dial (1–10) controls how many outcomes to pre-compute:
+        Dial 1:  2 outcomes (success/fail — the minimum)
+        Dial 5:  4 outcomes (success/fail/modal/redirect)
+        Dial 10: 10 outcomes (every conceivable result)
 
-    With ThoughtStream, partial reasoning from the current step seeds
-    the pre-compute, giving it a head start even when think > action.
-
-    Math:
-        Ordinary:   steps × (think + action)
-        Dial 5:     first_think + steps × max(think, action)
-        Dial 7+:    first_think + steps × action  (think fully hidden)
+    Higher dial = more token burn, but more likely to hit on dispatch.
+    Most browser actions have 2–3 realistic outcomes, so dial 3–5
+    covers nearly everything without waste.
     """
 
-    # ── Overlap dial profiles ─────────────────────────────────────
-    # overlap_pct: how much of the action time the precompute overlaps
-    #   0.0 = starts after action (no gain)
-    #   1.0 = starts with action (full overlap)
-    #   >1.0 = starts BEFORE action (ThoughtStream head start)
-    # max_possibilities: how many outcomes to pre-compute per step
     DIAL_PROFILES: ClassVar[dict[int, dict[str, Any]]] = {
-        1:  {"overlap_pct": 0.0,  "max_possibilities": 2,  "stream_headstart_pct": 0.0},
-        2:  {"overlap_pct": 0.3,  "max_possibilities": 2,  "stream_headstart_pct": 0.0},
-        3:  {"overlap_pct": 0.6,  "max_possibilities": 3,  "stream_headstart_pct": 0.0},
-        4:  {"overlap_pct": 0.8,  "max_possibilities": 3,  "stream_headstart_pct": 0.0},
-        5:  {"overlap_pct": 1.0,  "max_possibilities": 4,  "stream_headstart_pct": 0.0},
-        6:  {"overlap_pct": 1.0,  "max_possibilities": 4,  "stream_headstart_pct": 0.1},
-        7:  {"overlap_pct": 1.0,  "max_possibilities": 5,  "stream_headstart_pct": 0.2},
-        8:  {"overlap_pct": 1.0,  "max_possibilities": 6,  "stream_headstart_pct": 0.3},
-        9:  {"overlap_pct": 1.0,  "max_possibilities": 8,  "stream_headstart_pct": 0.4},
-        10: {"overlap_pct": 1.0,  "max_possibilities": 10, "stream_headstart_pct": 0.5},
+        1:  {"max_possibilities": 2},
+        2:  {"max_possibilities": 2},
+        3:  {"max_possibilities": 3},
+        4:  {"max_possibilities": 3},
+        5:  {"max_possibilities": 4},
+        6:  {"max_possibilities": 5},
+        7:  {"max_possibilities": 6},
+        8:  {"max_possibilities": 7},
+        9:  {"max_possibilities": 8},
+        10: {"max_possibilities": 10},
     }
 
     def __init__(self, thought_stream: ThoughtStream | None = None,
@@ -1804,9 +1798,7 @@ class PossibilitySpeculator:
         self.thought_stream = thought_stream or ThoughtStream()
         self.dial = max(1, min(10, dial))
         profile = self.DIAL_PROFILES[self.dial]
-        self.overlap_pct = profile["overlap_pct"]
         self.max_possibilities = max_possibilities or profile["max_possibilities"]
-        self.stream_headstart_pct = profile["stream_headstart_pct"]
 
         # Runtime state
         self._lock = asyncio.Lock()
@@ -1815,20 +1807,17 @@ class PossibilitySpeculator:
         self._fallback_thinks = 0
         self._total_think_time = 0.0
         self._total_action_time = 0.0
-        self._total_precompute_time = 0.0  # actual wall-clock used by precomputes
-        self._pending_possibilities: dict[str, dict] | None = None
+        self._total_precompute_time = 0.0
         self._events: list[dict[str, Any]] = []
         self._started_at = time.monotonic()
 
-        log.info("PossibilitySpeculator: dial=%d (overlap=%.0f%%, max_poss=%d, "
-                 "stream_headstart=%.0f%%)",
-                 self.dial, self.overlap_pct * 100, self.max_possibilities,
-                 self.stream_headstart_pct * 100)
+        log.info("PossibilitySpeculator: dial=%d (max_poss=%d)",
+                 self.dial, self.max_possibilities)
 
     @classmethod
     def from_dial(cls, dial: int,
                   thought_stream: ThoughtStream | None = None) -> "PossibilitySpeculator":
-        """Create from dial value alone — the user-facing API."""
+        """Create from dial value alone."""
         return cls(thought_stream=thought_stream, dial=dial)
 
     async def precompute_possibilities(
@@ -1836,16 +1825,13 @@ class PossibilitySpeculator:
         compute_fn,
         step_context: dict[str, Any] | None = None,
     ) -> dict[str, dict]:
-        """Pre-compute possible next actions for a step.
+        """Pre-compute possible outcomes and their next actions.
 
         compute_fn(step_context) -> dict mapping outcome_key -> action_dict.
-        The outcome_key is matched against the actual action result
-        when it arrives.
+        Called at DECISION TIME, before the action executes.
 
-        This is where the LLM inference happens. The compute_fn calls
-        the backing model to generate N possible next actions.
-
-        Returns the possibilities dict, ready to hold.
+        Returns the possibilities dict, ready to hold until the
+        action result arrives.
         """
         t0 = time.monotonic()
         possibilities = await compute_fn(step_context)
@@ -1854,8 +1840,6 @@ class PossibilitySpeculator:
 
         # Trim to max
         if len(possibilities) > self.max_possibilities:
-            # Keep highest-probability possibilities (if scored)
-            # For now just keep first N
             keys = list(possibilities.keys())[:self.max_possibilities]
             possibilities = {k: possibilities[k] for k in keys}
 
@@ -1870,25 +1854,26 @@ class PossibilitySpeculator:
 
         return possibilities
 
-    async def execute_with_precompute(
+    async def decide_and_act(
         self,
         action_fn,
         precompute_fn,
         step_context: dict[str, Any] | None = None,
         is_last_step: bool = False,
     ) -> tuple[Any, dict | None]:
-        """Execute an action while pre-computing next possibilities.
+        """The core loop: decide, then action + pre-compute in parallel.
 
-        This is the core pipeline step:
-        1. Start action_fn (browser work)
-        2. Based on dial, start precompute_fn at the right overlap point
-        3. When action finishes, return (result, possibilities)
-        4. Caller matches result against possibilities and dispatches
+        At decision time (NOW), we already know what we're about to do.
+        So we SIMULTANEOUSLY:
+            1. Execute the action (browser work)
+            2. Pre-compute what happens next for each possible outcome
+
+        Both start at the same moment — the decision point.
 
         Args:
             action_fn: coroutine that executes the browser action
-            precompute_fn: coroutine(step_context) -> {outcome: action}
-            step_context: context for precompute (page state, history)
+            precompute_fn: coroutine(ctx) -> {outcome_key: next_action}
+            step_context: context (page state, history, decision)
             is_last_step: skip precompute on last step
 
         Returns:
@@ -1902,56 +1887,26 @@ class PossibilitySpeculator:
             self._total_action_time += time.monotonic() - t0
             return result, None
 
-        if self.overlap_pct <= 0:
-            # Dial 1: no overlap — action first, then precompute
-            t0 = time.monotonic()
-            result = await action_fn()
-            self._total_action_time += time.monotonic() - t0
-            possibilities = await self.precompute_possibilities(
-                precompute_fn, step_context
-            )
-            return result, possibilities
-
-        # Dial 2+: overlap action and precompute
-        if self.stream_headstart_pct > 0:
-            # Dial 6+: ThoughtStream gives head start
-            # The effective think time is reduced by the head start
-            # because previous step's reasoning seeded our precompute
-
-            async def precompute_with_headstart():
-                # ThoughtStream head start: we started reasoning earlier
-                # Simulate: reduce effective precompute time
-                # In production, ThoughtStream.wait_for_thought() delivers
-                # partial tokens from the previous step that seed this one
-                return await self.precompute_possibilities(
-                    precompute_fn, step_context
-                )
-
-            t0 = time.monotonic()
-            result, possibilities = await asyncio.gather(
-                action_fn(),
-                precompute_with_headstart(),
-            )
-            elapsed = time.monotonic() - t0
-            self._total_action_time += elapsed
-        else:
-            # Dial 2-5: simple overlap (precompute starts with action)
-            t0 = time.monotonic()
-            result, possibilities = await asyncio.gather(
-                action_fn(),
-                self.precompute_possibilities(precompute_fn, step_context),
-            )
-            elapsed = time.monotonic() - t0
-            self._total_action_time += elapsed
+        # ── DECISION POINT: action + precompute start together ─────
+        t0 = time.monotonic()
+        result, possibilities = await asyncio.gather(
+            action_fn(),
+            self.precompute_possibilities(precompute_fn, step_context),
+        )
+        elapsed = time.monotonic() - t0
+        self._total_action_time += elapsed
 
         return result, possibilities
+
+    # Keep old name as alias for SpeculativeEngine compatibility
+    execute_with_precompute = decide_and_act
 
     def dispatch(self, result: Any, possibilities: dict[str, dict] | None
                  ) -> dict | None:
         """Match action result against pre-computed possibilities.
 
-        Returns the matching action dict if found, None if no match
-        (caller must fall back to a fresh LLM think).
+        Returns the matching next action if found, None if no match
+        (caller falls back to a fresh LLM think).
         """
         if not possibilities:
             return None
