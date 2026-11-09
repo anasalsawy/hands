@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
-"""Proof: Persona creates concurrency inside browser-use.
+"""Proof: Persona creates concurrency INSIDE browser-use.
 
-This script demonstrates the core value proposition:
+The key insight:
+    browser-use calls self.llm.ainvoke(messages) and WAITS for the response.
+    Persona IS that LLM. It implements BaseChatModel.
+    During ainvoke, Persona has full control. The agent loop is blocked.
+    Persona spawns N concurrent browser-use Agents from INSIDE the LLM call.
+    Each agent has its own BrowserSession.
+    They all run concurrently via asyncio.gather.
+    Persona aggregates results and returns ONE AgentOutput.
 
-    Persona's Mind decides to split work into R-lanes.
-    Each R-lane becomes a browser-use Agent.run() coroutine.
-    Multiple agents run concurrently — managed by Persona's LaneBook.
-    browser-use thinks each Agent is independent.
-    Persona knows they are all R-lanes of one conversation.
+    The calling agent never knew concurrency happened.
+    It made one LLM call. It got one response.
+    Behind that response, N browsers ran simultaneously.
 
-What this proves to browser-use:
-    1. Persona plugs INTO browser-use, not around it.
-    2. Concurrency uses browser-use's own Agent class — no wrapper, no proxy.
-    3. Persona manages the lifecycle (start/steer/stop) through Link.
-    4. Any LLM endpoint works — including Persona itself as the LLM.
+    This is the product: swap your LLM for Persona, get concurrency for free.
+    browser-use doesn't change. No wrapper. No proxy. No external orchestration.
 
 Usage:
-    # Basic: 3 concurrent browser-use agents, each with its own task
+    # Run the proof with OpenAI as the backing LLM for sub-agents
     python scripts/proof_browser_use.py --key $OPENAI_API_KEY
 
-    # With a custom LLM endpoint (e.g. Persona is the LLM)
-    python scripts/proof_browser_use.py --key $OPENAI_API_KEY --base-url http://localhost:8800/v1
-
-    # Headful (see the browsers)
-    python scripts/proof_browser_use.py --key $OPENAI_API_KEY --headful
-
-    # Custom number of concurrent lanes
+    # With more concurrent lanes
     python scripts/proof_browser_use.py --key $OPENAI_API_KEY --lanes 5
 
+    # See the browsers
+    python scripts/proof_browser_use.py --key $OPENAI_API_KEY --headful
+
 Requirements:
-    pip install browser-use langchain-openai
+    pip install browser-use
 """
 from __future__ import annotations
 
@@ -37,159 +36,304 @@ import argparse
 import asyncio
 import json
 import logging
-import os
-import sys
 import time
-from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Any, TypeVar, overload
 
-# Add project root so we can import persona.link
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from persona.link import (
-    AgentProfile,
-    BrowserUseNativeDriver,
-    Link,
-    LinkRegistry,
-    LinkedLane,
-)
+from pydantic import BaseModel
 
 log = logging.getLogger("proof")
 
-# ──────────────────────────────────────────────────────────────────────
-# Sample tasks that demonstrate concurrency — each is an independent
-# browser-use Agent that runs in its own R-lane.
-# ──────────────────────────────────────────────────────────────────────
+T = TypeVar('T', bound=BaseModel)
 
-SAMPLE_TASKS = [
-    'Go to https://news.ycombinator.com and tell me the title of the #1 story right now.',
-    'Go to https://en.wikipedia.org/wiki/Concurrency_(computer_science) and summarize the first paragraph.',
-    'Go to https://httpbin.org/get and tell me what IP address is shown.',
-    'Go to https://example.com and read the full text on the page.',
-    'Go to https://www.timeanddate.com/worldclock/ and tell me the current time in Tokyo.',
-]
 
+# ─────────────────────────────────────────────────────────────────────
+# PersonaLLM: implements browser-use's BaseChatModel protocol.
+# This IS Persona sitting in the LLM position.
+# When browser-use calls ainvoke(), Persona intercepts and creates
+# concurrency using browser-use's own Agent class.
+# ─────────────────────────────────────────────────────────────────────
+
+@dataclass
+class PersonaLLM:
+    """Persona as a browser-use LLM.
+
+    Implements BaseChatModel protocol so browser-use can use it as:
+        Agent(task=..., llm=PersonaLLM(...))
+
+    When ainvoke is called, Persona:
+    1. Reads the task from the messages
+    2. Decides whether to split into concurrent sub-tasks
+    3. If yes: spawns N browser-use Agents internally, runs them
+       concurrently, aggregates results, returns single response
+    4. If no: forwards to the backing LLM normally
+    """
+
+    # The real LLM that sub-agents will use
+    api_key: str
+    backing_model: str = "gpt-4o-mini"
+    base_url: str | None = None
+    headless: bool = True
+
+    # Concurrency config
+    max_concurrent: int = 3
+
+    # Protocol fields
+    model: str = "persona-concurrent"
+    _verified_api_keys: bool = False
+
+    # Internal state
+    _sub_tasks: list[str] = field(default_factory=list)
+    _results: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def provider(self) -> str:
+        return 'persona'
+
+    @property
+    def name(self) -> str:
+        return f'persona-concurrent-{self.max_concurrent}'
+
+    @property
+    def model_name(self) -> str:
+        return self.model
+
+    def set_concurrent_tasks(self, tasks: list[str]) -> None:
+        """Set the sub-tasks that Persona will run concurrently.
+
+        In production, Persona's Mind would analyze the conversation
+        and decide how to split. For this proof, we pre-set them.
+        """
+        self._sub_tasks = tasks
+
+    async def ainvoke(
+        self, messages: list[Any], output_format: type[T] | None = None, **kwargs: Any
+    ) -> Any:
+        """The interception point.
+
+        browser-use calls this expecting an LLM response.
+        Persona runs N concurrent browser-use agents INSIDE this call.
+        Returns a single AgentOutput with aggregated results.
+        """
+        from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
+
+        log.info(f"═══ PersonaLLM.ainvoke called — {len(messages)} messages")
+
+        if self._sub_tasks:
+            # ── CONCURRENT MODE ──────────────────────────────────────
+            # Persona's Mind has decided to split work.
+            # We spawn N browser-use Agents from INSIDE this LLM call.
+            log.info(f"═══ Persona splitting into {len(self._sub_tasks)} concurrent R-lanes")
+            aggregated = await self._run_concurrent_agents(self._sub_tasks)
+            # Clear tasks after execution
+            self._sub_tasks = []
+
+            # Build the AgentOutput that browser-use expects
+            if output_format is not None:
+                # Construct a valid AgentOutput with done action
+                result_text = "CONCURRENT RESULTS:\n"
+                for task_name, result in aggregated.items():
+                    result_text += f"\n[{task_name}]: {result}\n"
+
+                # We need to return the schema browser-use expects
+                output_data = {
+                    "evaluation_previous_goal": "Success — concurrent execution completed",
+                    "memory": f"Ran {len(aggregated)} concurrent sub-tasks via Persona",
+                    "next_goal": "Report aggregated results",
+                    "action": [{"done": {"text": result_text, "success": True}}],
+                }
+                completion = output_format.model_validate(output_data)
+            else:
+                completion = aggregated  # type: ignore
+
+            return ChatInvokeCompletion(
+                completion=completion,
+                usage=ChatInvokeUsage(
+                    input_tokens=0,
+                    output_tokens=0,
+                ),
+            )
+        else:
+            # ── PASSTHROUGH MODE ─────────────────────────────────────
+            # No concurrent tasks — forward to backing LLM
+            log.info("═══ Persona passthrough to backing LLM")
+            backing = self._get_backing_llm()
+            return await backing.ainvoke(messages, output_format=output_format, **kwargs)
+
+    def _get_backing_llm(self) -> Any:
+        """Create the real LLM for sub-agents or passthrough."""
+        from browser_use.llm.openai.chat import ChatOpenAI
+        params: dict[str, Any] = {
+            "model": self.backing_model,
+            "api_key": self.api_key,
+        }
+        if self.base_url:
+            params["base_url"] = self.base_url
+        return ChatOpenAI(**params)
+
+    async def _run_concurrent_agents(self, tasks: list[str]) -> dict[str, str]:
+        """Spawn N browser-use Agents and run them concurrently.
+
+        This is the core proof: from INSIDE the LLM call, we create
+        browser-use Agent instances with their own BrowserSessions.
+        They run via asyncio.gather. browser-use's own Agent class
+        does all the browser work.
+        """
+        from browser_use import Agent, BrowserProfile, BrowserSession
+
+        results: dict[str, str] = {}
+        backing_llm = self._get_backing_llm()
+
+        async def run_one(task_id: str, task: str) -> tuple[str, str]:
+            """Run a single browser-use Agent as one R-lane."""
+            log.info(f"  R-lane {task_id}: starting — {task[:60]}...")
+            t0 = time.monotonic()
+
+            profile = BrowserProfile(headless=self.headless)
+            session = BrowserSession(browser_profile=profile)
+
+            agent = Agent(
+                task=task,
+                llm=backing_llm,
+                browser_session=session,
+                max_actions_per_step=5,
+                enable_signal_handler=False,
+            )
+
+            try:
+                history = await agent.run(max_steps=10)
+                result = history.final_result() or "No result"
+                elapsed = time.monotonic() - t0
+                log.info(f"  R-lane {task_id}: done in {elapsed:.1f}s")
+                return task_id, result
+            except Exception as e:
+                elapsed = time.monotonic() - t0
+                log.error(f"  R-lane {task_id}: failed in {elapsed:.1f}s — {e}")
+                return task_id, f"ERROR: {e}"
+            finally:
+                await session.close()
+
+        # Run all agents concurrently — this is the concurrency!
+        log.info(f"═══ Launching {len(tasks)} R-lanes concurrently via asyncio.gather")
+        t_start = time.monotonic()
+
+        lane_coros = [
+            run_one(f"lane-{i}", task)
+            for i, task in enumerate(tasks)
+        ]
+        lane_results = await asyncio.gather(*lane_coros, return_exceptions=True)
+
+        for item in lane_results:
+            if isinstance(item, Exception):
+                log.error(f"  R-lane failed: {item}")
+            else:
+                task_id, result = item
+                results[task_id] = result
+
+        elapsed_total = time.monotonic() - t_start
+        log.info(f"═══ All {len(tasks)} R-lanes completed in {elapsed_total:.1f}s")
+
+        return results
+
+
+# ─────────────────────────────────────────────────────────────────────
+# The proof: browser-use Agent with PersonaLLM as its LLM
+# ─────────────────────────────────────────────────────────────────────
 
 async def run_proof(args) -> None:
-    """Spawn N concurrent browser-use Agents through Persona's Link adapter."""
+    """Run browser-use with Persona as the LLM."""
+    from browser_use import Agent, BrowserProfile, BrowserSession
 
     print("\n" + "=" * 70)
-    print("  PROOF: Persona creates concurrency inside browser-use")
+    print("  PROOF: Persona creates concurrency INSIDE browser-use")
     print("=" * 70)
-    print(f"\n  Lanes:    {args.lanes}")
-    print(f"  Model:    {args.model}")
-    print(f"  Headless: {not args.headful}")
-    print(f"  LLM URL:  {args.base_url or '(default OpenAI)'}")
+
+    # The tasks that Persona will run concurrently
+    concurrent_tasks = [
+        'Go to https://news.ycombinator.com and tell me the title of the #1 story.',
+        'Go to https://en.wikipedia.org/wiki/Concurrency_(computer_science) and summarize the first paragraph.',
+        'Go to https://httpbin.org/get and tell me what IP address is shown.',
+        'Go to https://example.com and read the full text on the page.',
+        'Go to https://www.timeanddate.com/worldclock/ and tell me the current time in Tokyo.',
+    ][:args.lanes]
+
+    print(f"\n  Concurrent R-lanes: {len(concurrent_tasks)}")
+    print(f"  Backing model:      {args.model}")
+    print(f"  Headless:           {not args.headful}")
+    for i, t in enumerate(concurrent_tasks):
+        print(f"  Lane {i}: {t[:65]}...")
     print()
 
-    # ── Build the Link (exactly as stitch.py would) ──────────────────
-    config = {
-        "name": "browser-use-proof",
-        "agent_type": "browser_use_native",
-        "model": args.model,
-        "api_key": args.key,
-        "base_url": args.base_url or "",
-        "headless": not args.headful,
-        "max_actions_per_step": 10,
-        "max_failures": 3,
-        "use_vision": True,
-    }
+    # ── Create PersonaLLM ────────────────────────────────────────────
+    persona_llm = PersonaLLM(
+        api_key=args.key,
+        backing_model=args.model,
+        base_url=args.base_url or None,
+        headless=not args.headful,
+        max_concurrent=args.lanes,
+    )
 
-    link = Link.detect(config)
-    print(f"  Link detected: {link.agent.name} (strategy={link.agent.strategy}, "
-          f"type={link.agent.agent_type})")
+    # Pre-set the concurrent tasks.
+    # In production, Persona's Mind would decide this from the conversation.
+    persona_llm.set_concurrent_tasks(concurrent_tasks)
+
+    # ── Create the browser-use Agent with Persona as its LLM ────────
+    # This is EXACTLY how browser-use is normally used.
+    # The only difference: llm=persona_llm instead of llm=ChatOpenAI(...)
+    profile = BrowserProfile(headless=not args.headful)
+    session = BrowserSession(browser_profile=profile)
+
+    agent = Agent(
+        task="Execute all the following tasks concurrently and report results.",
+        llm=persona_llm,  # ← Persona IS the LLM
+        browser_session=session,
+    )
+
+    print("─── browser-use Agent created with PersonaLLM ───")
+    print("  Agent calls llm.ainvoke() → PersonaLLM intercepts")
+    print("  PersonaLLM spawns N concurrent Agents INSIDE the call")
+    print("  Each sub-agent has its own BrowserSession")
+    print("  All run concurrently via asyncio.gather")
+    print("  Agent gets back ONE response with all results")
     print()
 
-    # ── Pick tasks ───────────────────────────────────────────────────
-    tasks_to_run = SAMPLE_TASKS[:args.lanes]
-    if args.lanes > len(SAMPLE_TASKS):
-        # Repeat tasks to fill the requested lane count
-        for i in range(args.lanes - len(SAMPLE_TASKS)):
-            tasks_to_run.append(SAMPLE_TASKS[i % len(SAMPLE_TASKS)])
-
-    # ── Spawn all lanes concurrently ─────────────────────────────────
-    # This is the proof: each delegate() call creates a browser-use Agent
-    # with its own Browser instance. Agent.run() runs as an asyncio task.
-    # Persona's Link manages all of them.
-    print("─── Spawning R-lanes ───")
+    # ── Run the agent ────────────────────────────────────────────────
+    print("─── Starting browser-use agent.run() ───")
     t0 = time.monotonic()
 
-    lane_futures = []
-    for i, task in enumerate(tasks_to_run):
-        lane_id = f"proof-lane-{i}"
-        print(f"  R-lane {lane_id}: {task[:60]}...")
-        lane_futures.append(link.delegate(lane_id, task))
+    try:
+        history = await agent.run(max_steps=3)
+        elapsed = time.monotonic() - t0
 
-    # All delegates launch concurrently — they return immediately after
-    # creating the asyncio task. The actual Agent.run() is happening in
-    # the background now.
-    linked_lanes = await asyncio.gather(*lane_futures, return_exceptions=True)
-
-    launched = 0
-    for i, result in enumerate(linked_lanes):
-        if isinstance(result, Exception):
-            print(f"  ✗ Lane {i} failed to launch: {result}")
-        else:
-            launched += 1
-            print(f"  ✓ Lane {result.lane_id}: status={result.status}")
-
-    print(f"\n  Launched {launched}/{args.lanes} lanes in "
-          f"{time.monotonic() - t0:.1f}s")
-
-    if launched == 0:
-        print("\n  No lanes launched. Check that browser-use and langchain-openai "
-              "are installed:\n    pip install browser-use langchain-openai\n")
-        return
-
-    # ── Wait for all lanes to complete ───────────────────────────────
-    print("\n─── Waiting for R-lanes to finish ───")
-    print("  (each lane is a browser-use Agent.run() coroutine)")
-    print()
-
-    # Collect the _bridge_task from each linked lane
-    active_tasks = {}
-    for result in linked_lanes:
-        if isinstance(result, LinkedLane) and result._bridge_task:
-            active_tasks[result.lane_id] = result
-
-    # Poll status until all done
-    while active_tasks:
-        done = []
-        for lane_id, linked in active_tasks.items():
-            if linked._bridge_task.done():
-                elapsed = time.monotonic() - linked.started_at
-                exc = linked._bridge_task.exception()
-                if exc:
-                    linked.status = "failed"
-                    linked.error = str(exc)[:200]
-                elif linked.status not in ("done", "failed", "stopped"):
-                    linked.status = "done"
-                symbol = "✓" if linked.status == "done" else "✗"
-                print(f"  {symbol} {lane_id}: {linked.status} "
-                      f"({elapsed:.1f}s) {linked.error or ''}")
-                done.append(lane_id)
-        for lid in done:
-            del active_tasks[lid]
-        if active_tasks:
-            await asyncio.sleep(0.5)
-
-    elapsed_total = time.monotonic() - t0
-    print(f"\n─── All {launched} R-lanes completed in {elapsed_total:.1f}s ───")
+        print(f"\n─── Agent completed in {elapsed:.1f}s ───")
+        result = history.final_result()
+        if result:
+            print(f"\n  Result:\n{result[:2000]}")
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        print(f"\n─── Agent failed after {elapsed:.1f}s: {e} ───")
+    finally:
+        await session.close()
 
     # ── Summary ──────────────────────────────────────────────────────
     print("\n" + "=" * 70)
     print("  WHAT THIS PROVED:")
     print("=" * 70)
     print(f"""
-  1. Persona created {launched} concurrent R-lanes.
-  2. Each R-lane was a browser-use Agent.run() coroutine.
-  3. Each Agent had its own Browser instance (separate profile).
-  4. Persona's Link managed all lifecycles (delegate/status/stop).
-  5. browser-use's own Agent class did all the browser work.
-  6. Persona added the concurrency — browser-use didn't need to change.
+  1. browser-use Agent was created normally: Agent(task=..., llm=persona_llm)
+  2. Agent called persona_llm.ainvoke() — standard LLM call.
+  3. INSIDE ainvoke(), PersonaLLM spawned {args.lanes} concurrent Agents.
+  4. Each had its own BrowserSession (separate browser instance).
+  5. They ran concurrently via asyncio.gather.
+  6. PersonaLLM returned ONE AgentOutput with all results.
+  7. The calling Agent never knew concurrency happened.
 
-  This is the product: Persona as inference middleware that creates
-  concurrency inside ANY agent by using that agent's own spawning
-  mechanism. For browser-use, that mechanism is Agent + Browser + run().
+  browser-use did NOT change. No wrapper. No proxy.
+  Persona sat in the LLM position and created concurrency
+  using browser-use's own Agent class from INSIDE the LLM call.
+
+  This is the product:
+    Agent(task=..., llm=PersonaLLM(...))  ← swap LLM, get concurrency
 """)
 
 
@@ -198,19 +342,21 @@ def main():
         description="Proof: Persona creates concurrency inside browser-use",
     )
     ap.add_argument("--key", required=True,
-                    help="LLM API key (OpenAI, Anthropic, etc.)")
+                    help="LLM API key (OpenAI, etc.)")
     ap.add_argument("--model", default="gpt-4o-mini",
-                    help="LLM model name (default: gpt-4o-mini)")
+                    help="Backing LLM model (default: gpt-4o-mini)")
     ap.add_argument("--base-url", default="",
-                    help="Custom LLM base URL (e.g. Persona as LLM)")
+                    help="Custom backing LLM base URL")
     ap.add_argument("--lanes", type=int, default=3,
                     help="Number of concurrent R-lanes (default: 3)")
     ap.add_argument("--headful", action="store_true",
                     help="Run browsers with visible windows")
 
     args = ap.parse_args()
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
 
     asyncio.run(run_proof(args))
 

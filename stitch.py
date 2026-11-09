@@ -508,10 +508,11 @@ Examples:
   python stitch.py local --root ~/Projects --agent bu-native:_:$OPENAI_API_KEY:gpt-4o:browser_use_native
   python stitch.py remote --persona-url https://my-persona --persona-key sp_... --root ~/Projects
 
-Native browser-use (browser-use as in-process library, not API bridge):
+Persona-as-LLM for browser-use (Persona IS the LLM that browser-use calls):
   --agent bu:_:$OPENAI_API_KEY:gpt-4o-mini:browser_use_native
-  The _ placeholder means no API URL is needed — browser-use runs in-process.
-  The api_key is the LLM key (OpenAI/Anthropic), NOT a browser-use cloud key.
+  The _ placeholder means no API URL is needed — Persona runs inside browser-use.
+  The api_key is the backing LLM key (for sub-agents). Persona creates concurrency
+  by spawning concurrent browser-use Agents from INSIDE the LLM ainvoke() call.
 """,
     )
     sub = ap.add_subparsers(dest="mode")
