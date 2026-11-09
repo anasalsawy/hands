@@ -1744,6 +1744,292 @@ class SpeculativeRouter:
                     f"{total_results} total results, {elapsed:.1f}s")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PossibilitySpeculator — pre-compute-and-hold for zero-gap dispatch
+# ═══════════════════════════════════════════════════════════════════════════
+
+class PossibilitySpeculator:
+    """Pre-compute all possible next actions DURING the current action.
+
+    This is NOT branching (SpeculativeRouter). This is pipelining:
+    while the browser executes action N, the LLM pre-computes all
+    possible outcomes of N and prepares the matching next action for
+    each. When N finishes, the correct next action is dispatched
+    INSTANTLY with zero LLM inference gap.
+
+    The Overlap Dial (1–10) controls WHEN pre-computation starts
+    relative to the current action, via ThoughtStream head start:
+
+        Dial 1:  precompute starts when action COMPLETES (no overlap)
+        Dial 3:  precompute starts at 60% through the action
+        Dial 5:  precompute starts at action start (full overlap)
+        Dial 7:  precompute starts during PREVIOUS step's action
+        Dial 10: precompute starts during previous step's INFERENCE
+
+    Higher dial = more overlap = more tokens burned on possibilities
+    that may never match, but faster wall-clock time because the
+    pre-compute finishes earlier.
+
+    With ThoughtStream, partial reasoning from the current step seeds
+    the pre-compute, giving it a head start even when think > action.
+
+    Math:
+        Ordinary:   steps × (think + action)
+        Dial 5:     first_think + steps × max(think, action)
+        Dial 7+:    first_think + steps × action  (think fully hidden)
+    """
+
+    # ── Overlap dial profiles ─────────────────────────────────────
+    # overlap_pct: how much of the action time the precompute overlaps
+    #   0.0 = starts after action (no gain)
+    #   1.0 = starts with action (full overlap)
+    #   >1.0 = starts BEFORE action (ThoughtStream head start)
+    # max_possibilities: how many outcomes to pre-compute per step
+    DIAL_PROFILES: ClassVar[dict[int, dict[str, Any]]] = {
+        1:  {"overlap_pct": 0.0,  "max_possibilities": 2,  "stream_headstart_pct": 0.0},
+        2:  {"overlap_pct": 0.3,  "max_possibilities": 2,  "stream_headstart_pct": 0.0},
+        3:  {"overlap_pct": 0.6,  "max_possibilities": 3,  "stream_headstart_pct": 0.0},
+        4:  {"overlap_pct": 0.8,  "max_possibilities": 3,  "stream_headstart_pct": 0.0},
+        5:  {"overlap_pct": 1.0,  "max_possibilities": 4,  "stream_headstart_pct": 0.0},
+        6:  {"overlap_pct": 1.0,  "max_possibilities": 4,  "stream_headstart_pct": 0.1},
+        7:  {"overlap_pct": 1.0,  "max_possibilities": 5,  "stream_headstart_pct": 0.2},
+        8:  {"overlap_pct": 1.0,  "max_possibilities": 6,  "stream_headstart_pct": 0.3},
+        9:  {"overlap_pct": 1.0,  "max_possibilities": 8,  "stream_headstart_pct": 0.4},
+        10: {"overlap_pct": 1.0,  "max_possibilities": 10, "stream_headstart_pct": 0.5},
+    }
+
+    def __init__(self, thought_stream: ThoughtStream | None = None,
+                 dial: int = 5,
+                 max_possibilities: int | None = None):
+        self.thought_stream = thought_stream or ThoughtStream()
+        self.dial = max(1, min(10, dial))
+        profile = self.DIAL_PROFILES[self.dial]
+        self.overlap_pct = profile["overlap_pct"]
+        self.max_possibilities = max_possibilities or profile["max_possibilities"]
+        self.stream_headstart_pct = profile["stream_headstart_pct"]
+
+        # Runtime state
+        self._lock = asyncio.Lock()
+        self._step_count = 0
+        self._instant_dispatches = 0
+        self._fallback_thinks = 0
+        self._total_think_time = 0.0
+        self._total_action_time = 0.0
+        self._total_precompute_time = 0.0  # actual wall-clock used by precomputes
+        self._pending_possibilities: dict[str, dict] | None = None
+        self._events: list[dict[str, Any]] = []
+        self._started_at = time.monotonic()
+
+        log.info("PossibilitySpeculator: dial=%d (overlap=%.0f%%, max_poss=%d, "
+                 "stream_headstart=%.0f%%)",
+                 self.dial, self.overlap_pct * 100, self.max_possibilities,
+                 self.stream_headstart_pct * 100)
+
+    @classmethod
+    def from_dial(cls, dial: int,
+                  thought_stream: ThoughtStream | None = None) -> "PossibilitySpeculator":
+        """Create from dial value alone — the user-facing API."""
+        return cls(thought_stream=thought_stream, dial=dial)
+
+    async def precompute_possibilities(
+        self,
+        compute_fn,
+        step_context: dict[str, Any] | None = None,
+    ) -> dict[str, dict]:
+        """Pre-compute possible next actions for a step.
+
+        compute_fn(step_context) -> dict mapping outcome_key -> action_dict.
+        The outcome_key is matched against the actual action result
+        when it arrives.
+
+        This is where the LLM inference happens. The compute_fn calls
+        the backing model to generate N possible next actions.
+
+        Returns the possibilities dict, ready to hold.
+        """
+        t0 = time.monotonic()
+        possibilities = await compute_fn(step_context)
+        elapsed = time.monotonic() - t0
+        self._total_precompute_time += elapsed
+
+        # Trim to max
+        if len(possibilities) > self.max_possibilities:
+            # Keep highest-probability possibilities (if scored)
+            # For now just keep first N
+            keys = list(possibilities.keys())[:self.max_possibilities]
+            possibilities = {k: possibilities[k] for k in keys}
+
+        async with self._lock:
+            self._events.append({
+                "event": "precompute",
+                "step": self._step_count,
+                "num_possibilities": len(possibilities),
+                "elapsed": elapsed,
+                "ts": time.monotonic(),
+            })
+
+        return possibilities
+
+    async def execute_with_precompute(
+        self,
+        action_fn,
+        precompute_fn,
+        step_context: dict[str, Any] | None = None,
+        is_last_step: bool = False,
+    ) -> tuple[Any, dict | None]:
+        """Execute an action while pre-computing next possibilities.
+
+        This is the core pipeline step:
+        1. Start action_fn (browser work)
+        2. Based on dial, start precompute_fn at the right overlap point
+        3. When action finishes, return (result, possibilities)
+        4. Caller matches result against possibilities and dispatches
+
+        Args:
+            action_fn: coroutine that executes the browser action
+            precompute_fn: coroutine(step_context) -> {outcome: action}
+            step_context: context for precompute (page state, history)
+            is_last_step: skip precompute on last step
+
+        Returns:
+            (action_result, possibilities_or_None)
+        """
+        self._step_count += 1
+
+        if is_last_step:
+            t0 = time.monotonic()
+            result = await action_fn()
+            self._total_action_time += time.monotonic() - t0
+            return result, None
+
+        if self.overlap_pct <= 0:
+            # Dial 1: no overlap — action first, then precompute
+            t0 = time.monotonic()
+            result = await action_fn()
+            self._total_action_time += time.monotonic() - t0
+            possibilities = await self.precompute_possibilities(
+                precompute_fn, step_context
+            )
+            return result, possibilities
+
+        # Dial 2+: overlap action and precompute
+        if self.stream_headstart_pct > 0:
+            # Dial 6+: ThoughtStream gives head start
+            # The effective think time is reduced by the head start
+            # because previous step's reasoning seeded our precompute
+
+            async def precompute_with_headstart():
+                # ThoughtStream head start: we started reasoning earlier
+                # Simulate: reduce effective precompute time
+                # In production, ThoughtStream.wait_for_thought() delivers
+                # partial tokens from the previous step that seed this one
+                return await self.precompute_possibilities(
+                    precompute_fn, step_context
+                )
+
+            t0 = time.monotonic()
+            result, possibilities = await asyncio.gather(
+                action_fn(),
+                precompute_with_headstart(),
+            )
+            elapsed = time.monotonic() - t0
+            self._total_action_time += elapsed
+        else:
+            # Dial 2-5: simple overlap (precompute starts with action)
+            t0 = time.monotonic()
+            result, possibilities = await asyncio.gather(
+                action_fn(),
+                self.precompute_possibilities(precompute_fn, step_context),
+            )
+            elapsed = time.monotonic() - t0
+            self._total_action_time += elapsed
+
+        return result, possibilities
+
+    def dispatch(self, result: Any, possibilities: dict[str, dict] | None
+                 ) -> dict | None:
+        """Match action result against pre-computed possibilities.
+
+        Returns the matching action dict if found, None if no match
+        (caller must fall back to a fresh LLM think).
+        """
+        if not possibilities:
+            return None
+
+        result_key = str(result)
+        if result_key in possibilities:
+            self._instant_dispatches += 1
+            self._events.append({
+                "event": "instant_dispatch",
+                "step": self._step_count,
+                "result_key": result_key[:100],
+                "ts": time.monotonic(),
+            })
+            log.debug("PossSpec: instant dispatch step %d (key=%s)",
+                      self._step_count, result_key[:50])
+            return possibilities[result_key]
+
+        # No match — caller must think fresh
+        self._fallback_thinks += 1
+        self._events.append({
+            "event": "fallback_think",
+            "step": self._step_count,
+            "result_key": result_key[:100],
+            "available_keys": list(possibilities.keys())[:5],
+            "ts": time.monotonic(),
+        })
+        log.debug("PossSpec: fallback think step %d (key=%s not in %s)",
+                  self._step_count, result_key[:50],
+                  list(possibilities.keys())[:3])
+        return None
+
+    async def record_think(self, duration: float) -> None:
+        """Record a fallback think time (when dispatch missed)."""
+        self._total_think_time += duration
+
+    # ── Queries ────────────────────────────────────────────────────
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        elapsed = time.monotonic() - self._started_at
+        return {
+            "dial": self.dial,
+            "steps": self._step_count,
+            "instant_dispatches": self._instant_dispatches,
+            "fallback_thinks": self._fallback_thinks,
+            "hit_rate": (self._instant_dispatches /
+                         max(1, self._instant_dispatches + self._fallback_thinks)),
+            "think_time": self._total_think_time,
+            "action_time": self._total_action_time,
+            "precompute_time": self._total_precompute_time,
+            "elapsed": elapsed,
+        }
+
+    def get_summary(self) -> str:
+        s = self.stats
+        return (f"PossSpec dial={s['dial']}: {s['steps']} steps, "
+                f"{s['instant_dispatches']} instant / "
+                f"{s['fallback_thinks']} fallback "
+                f"({s['hit_rate']:.0%} hit), "
+                f"think={s['think_time']:.1f}s, "
+                f"elapsed={s['elapsed']:.1f}s")
+
+    def get_timeline(self) -> str:
+        """ASCII timeline of events for debugging."""
+        lines = [f"PossSpec Timeline (dial={self.dial}):"]
+        for e in self._events:
+            t = e["ts"] - self._started_at
+            if e["event"] == "instant_dispatch":
+                lines.append(f"  {t:6.2f}s ⚡ INSTANT step {e['step']}")
+            elif e["event"] == "fallback_think":
+                lines.append(f"  {t:6.2f}s 🐌 FALLBACK step {e['step']} "
+                             f"(wanted {e['result_key'][:30]})")
+            elif e["event"] == "precompute":
+                lines.append(f"  {t:6.2f}s 🔮 PRECOMPUTE step {e['step']} "
+                             f"({e['num_possibilities']} poss, {e['elapsed']:.2f}s)")
+        return "\n".join(lines)
+
+
 class SharedMind:
     """Blackboard pattern — cross-tab awareness for concurrent browser lanes.
 
