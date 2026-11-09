@@ -212,6 +212,58 @@ class AgentDriver(ABC):
         """
         return {"agent_id": "", "status": "active", "output": result}
 
+    async def speculative_delegate(
+        self,
+        lane_id: str,
+        instruction: str,
+        profile: AgentProfile,
+        execute_fn,
+        engine: "SpeculativeEngine | None" = None,
+        confidence: float = 0.7,
+        precompute_fn=None,
+        step_context: dict[str, Any] | None = None,
+        is_last_step: bool = False,
+    ) -> dict[str, Any]:
+        """Delegate with speculative pre-computation.
+
+        Wraps build_delegate_call + execution through SpeculativeEngine,
+        so ANY agent driver (Hermes, Cursor, Claude Code, Cline) gets
+        zero-gap dispatch on delegation results.
+
+        execute_fn: async callable that sends the built tool call and
+                    returns the raw result string.
+        engine:     SpeculativeEngine instance. If None, falls back to
+                    plain sequential delegation (no speculation).
+
+        Returns SpeculativeEngine step result or plain delegate result.
+        """
+        call = self.build_delegate_call(lane_id, instruction, profile)
+
+        if engine is None:
+            # No speculation — plain sequential
+            raw = await execute_fn(call)
+            return self.parse_delegate_result(raw)
+
+        # Pre-compute what happens when delegation succeeds/fails
+        default_precompute = precompute_fn or (lambda ctx: {
+            "active": {"status": "active", "action": "monitor"},
+            "completed": {"status": "completed", "action": "collect_result"},
+            "failed": {"status": "failed", "action": "retry_or_escalate"},
+        })
+
+        result = await engine.step(
+            confidence=confidence,
+            action_fn=lambda: execute_fn(call),
+            precompute_fn=default_precompute,
+            step_context=step_context or {"lane_id": lane_id, "instruction": instruction},
+            is_last_step=is_last_step,
+        )
+
+        # Parse the raw result through the driver
+        parsed = self.parse_delegate_result(result["result"])
+        result["parsed"] = parsed
+        return result
+
 
 # ─── Hermes ───────────────────────────────────────────────────────────────
 
@@ -1330,18 +1382,20 @@ class SpeculativeRouter:
     pursuing different strategies simultaneously, with a shared mind
     that prunes losers and amplifies winners mid-execution.
 
-    Example: filling a complex form where the right approach is unclear.
-        Branch A (p=0.4): "This is a multi-step wizard — click Next first"
-        Branch B (p=0.35): "All fields visible — fill top to bottom"
-        Branch C (p=0.25): "Need to expand collapsed sections first"
+    Example: delegating a task where the right approach is unclear.
+        Branch A (p=0.4): "Delegate to Hermes — it has the right tools"
+        Branch B (p=0.35): "Call the API directly — faster for this"
+        Branch C (p=0.25): "Run a shell command — simpler path"
 
-    As Branch B's hand starts finding visible fields and filling them,
-    its probability rises. Branch A clicks Next and gets an error —
-    its probability drops below threshold and is halted. Branch C
-    expands a section and finds more fields — its results feed into
-    Branch B's task queue. Final output: Branch B's filled form,
-    enriched by Branch C's discovery, with Branch A's wasted work
-    cut short after 1 action instead of running to completion.
+    As Branch B's API call returns a 200, its probability rises.
+    Branch A's delegation times out — its probability drops below
+    threshold and is halted. Branch C's command finds the data —
+    its results feed into Branch B's pipeline. Final output:
+    Branch B's result, enriched by Branch C's discovery, with
+    Branch A's wasted work cut short early.
+
+    Works with any tool call — browser, agent delegation, API,
+    file operations, shell commands.
 
     Integration with ThoughtStream:
         Every branch's reasoning is visible to all other branches.
@@ -1751,31 +1805,36 @@ class SpeculativeRouter:
 class PossibilitySpeculator:
     """Pre-compute outcomes AT DECISION TIME, before the tool even executes.
 
-    This is how humans think about browsers. The moment you decide
-    "I'm going to click Submit", you already know:
-        - It works → I'll fill the next field
-        - It doesn't work → I'll retry or try something else
+    This is how humans think. The moment you decide to do something —
+    click a button, call an API, delegate a task, run a command — you
+    already know the realistic outcomes:
+        - It works → do the next thing
+        - It fails → handle the error
 
-    So you pre-compute BOTH paths RIGHT THEN, at decision time, before
-    the click even fires. Pre-compute and action run in parallel.
-    By the time the click result comes back, the next action is already
+    So you pre-compute ALL paths RIGHT THEN, at decision time, before
+    the tool even fires. Pre-compute and action run in parallel.
+    By the time the result comes back, the next action is already
     waiting — zero inference gap.
 
+    Works with ANY tool call — browser actions, agent delegation
+    (Hermes/Cursor/Claude Code/Cline), API calls, file operations,
+    shell commands — anything that's an async callable.
+
     Timeline:
-        DECIDE "click Submit"
-            ├── START action (click Submit)           ← runs in browser
+        DECIDE "execute tool X"
+            ├── START action (tool call)              ← runs anywhere
             └── START pre-compute                     ← runs in LLM, same moment
-                    ├── if success → prepare "fill next field"
-                    └── if error   → prepare "retry click"
+                    ├── if success → prepare next step
+                    └── if error   → prepare fallback
         ACTION COMPLETES → match result → INSTANT dispatch
 
     The dial (1–10) controls how many outcomes to pre-compute:
         Dial 1:  2 outcomes (success/fail — the minimum)
-        Dial 5:  4 outcomes (success/fail/modal/redirect)
+        Dial 5:  4 outcomes (covers most tool results)
         Dial 10: 10 outcomes (every conceivable result)
 
     Higher dial = more token burn, but more likely to hit on dispatch.
-    Most browser actions have 2–3 realistic outcomes, so dial 3–5
+    Most tool calls have 2–3 realistic outcomes, so dial 3–5
     covers nearly everything without waste.
     """
 
@@ -1865,7 +1924,7 @@ class PossibilitySpeculator:
 
         At decision time (NOW), we already know what we're about to do.
         So we SIMULTANEOUSLY:
-            1. Execute the action (browser work)
+            1. Execute the action (any tool call — browser, API, delegation)
             2. Pre-compute what happens next for each possible outcome
 
         Both start at the same moment — the decision point.
@@ -2006,12 +2065,12 @@ class SpeculativeEngine:
         If confidence >= threshold (we KNOW what's next):
             → ALSO batch-fire the next action immediately
             → If the batch was WRONG, possibilities are still ready
-            → Example: minimize → Start menu (95% sure, but pre-compute
-              covers the 5% where something else happened)
+            → Example: delegated task to Hermes → 95% sure it'll succeed,
+              pre-compute covers the 5% where agent fails
 
         If confidence < threshold (uncertain):
             → Only possibilities — wait for result, instant-dispatch match
-            → Example: clicked Submit → could be success/error/modal
+            → Example: called API → could be success/error/rate-limit
 
     This means high-confidence steps get BOTH speed AND safety:
         - The batch fires with zero delay (speed)
