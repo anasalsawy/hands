@@ -12,6 +12,7 @@ import asyncio
 import os
 from pathlib import Path
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -226,6 +227,41 @@ class PlanningTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MotorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stop_kills_descendants_before_delayed_mutation_without_stopping_other_lane(self):
+        profile = AgentProfile(name="test", strategy="spawn")
+        link = Link(profile)
+        with tempfile.TemporaryDirectory() as directory:
+            sentinel = Path(directory) / "must-not-exist"
+            child = ("import signal,time; from pathlib import Path; "
+                     "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                     "print('ready',flush=True); time.sleep(5); "
+                     f"Path({str(sentinel)!r}).write_text('SURVIVED')")
+            parent = ("import subprocess,sys,time; "
+                      f"p=subprocess.Popen([sys.executable,'-c',{child!r}],stdout=subprocess.PIPE); "
+                      "print(p.stdout.readline().decode().strip(),flush=True); time.sleep(60)")
+            async def motor(lane, code):
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "-c", code, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE, start_new_session=os.name != "nt")
+                linked = LinkedLane(lane_id=lane, agent=profile, process=proc, status="active",
+                                    _process_group=os.name != "nt")
+                link._lanes[lane] = linked
+                return proc
+            a = await motor("a", parent)
+            b = await motor("b", "import time; time.sleep(60)")
+            try:
+                self.assertEqual(await asyncio.wait_for(a.stdout.readline(), 10), b"ready\n")
+                await link.stop("a")
+                self.assertIsNotNone(a.returncode)
+                self.assertIsNone(b.returncode)
+                await asyncio.sleep(5.2)
+                self.assertFalse(sentinel.exists(), "a stopped lane's child performed a later write")
+                self.assertEqual(link._lanes["a"].status, "stopped")
+            finally:
+                if a.returncode is None:
+                    await link.stop("a")
+                await link.stop("b")
+
     async def test_intentional_sigterm_remains_stopped_not_failed(self):
         profile = AgentProfile(name="test", strategy="spawn")
         link = Link(profile)

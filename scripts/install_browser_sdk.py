@@ -5,6 +5,9 @@ import json
 import subprocess
 import sys
 
+if sys.version_info < (3, 11):
+    raise SystemExit('The patched browser SDK requires Python 3.11+; use that interpreter before cloning/installing.')
+
 root = Path(__file__).resolve().parents[1]
 vendor = root / 'vendor/browser-use'
 source = json.loads((vendor / 'SOURCE.json').read_text())

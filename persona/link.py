@@ -60,6 +60,7 @@ import logging
 import math
 import os
 import secrets
+import signal
 import subprocess
 import sys
 import time
@@ -130,6 +131,7 @@ class LinkedLane:
 
     # Spawn state
     process: Any = None
+    _process_group: bool = False
     _bridge_task: asyncio.Task | None = None
 
     # Identity this motor runs as (set by Link.delegate kwargs). The spawned
@@ -3531,14 +3533,37 @@ class Link:
 
         elif self.agent.strategy == "spawn" and linked.process:
             try:
-                linked.process.terminate()
+                if os.name == "nt":
+                    killer = await asyncio.create_subprocess_exec(
+                        "taskkill", "/PID", str(linked.process.pid), "/T", "/F",
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+                    _, detail = await killer.communicate()
+                    if killer.returncode and linked.process.returncode is None:
+                        raise RuntimeError(detail.decode(errors="replace")[:200] or "taskkill failed")
+                elif linked._process_group:
+                    os.killpg(linked.process.pid, signal.SIGTERM)
+                else:
+                    linked.process.terminate()
                 try:
                     await asyncio.wait_for(linked.process.wait(), timeout=PROCESS_KILL_GRACE)
                 except asyncio.TimeoutError:
-                    linked.process.kill()
+                    if linked._process_group:
+                        os.killpg(linked.process.pid, signal.SIGKILL)
+                    else:
+                        linked.process.kill()
                     await linked.process.wait()
-            except (OSError, ProcessLookupError):
+                if linked._process_group:
+                    # The parent may exit before a child that ignores SIGTERM.
+                    try:
+                        os.killpg(linked.process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            except ProcessLookupError:
                 pass
+            except Exception as exc:
+                linked.status = "failed"
+                linked.error = f"could not stop engine process tree: {exc}"[:300]
+                raise RuntimeError(linked.error) from exc
 
         return True
 
@@ -3735,11 +3760,13 @@ class Link:
         env["SAWII_HANDS_LANE"] = linked.lane_id
 
         try:
+            linked._process_group = os.name != "nt"
             linked.process = await asyncio.create_subprocess_exec(
                 *cmd,
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=linked._process_group,
             )
             linked.status = "active"
             log.info("Link: spawned %s (pid %d) for lane %s (persona %s, place %s, roots %s)",

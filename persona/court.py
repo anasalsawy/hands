@@ -644,7 +644,9 @@ class HandsDeck:
         if link is not None and c.lane:
             try:
                 await link.stop(c.lane)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                self._touch(c, status="failed", error=f"could not stop engine: {exc}"[:300])
+                self.emit(c, "court.status", status=c.status, error=c.error)
                 log.debug("court %s worker stop failed", c.id, exc_info=True)
         c.worker = None
 
