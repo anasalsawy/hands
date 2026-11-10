@@ -4,6 +4,7 @@
 // faking a picture.
 import { useEffect, useRef, useState } from "react";
 import { systemApi, type CourtTarget } from "../lib/client";
+import { frameBlob, latestFrames, paintBitmap } from "../lib/frames";
 
 type StreamState = "probing" | "live" | "down" | "off";
 
@@ -20,23 +21,9 @@ function paintIdle(ctx: CanvasRenderingContext2D, w: number, h: number, note: st
   ctx.fillText(note.slice(0, 72), 22, h / 2 + 14);
 }
 
-async function paintFrame(canvas: HTMLCanvasElement, blob: Blob) {
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  const bmp = await createImageBitmap(blob);
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  const scale = Math.min(canvas.width / bmp.width, canvas.height / bmp.height);
-  const dw = Math.round(bmp.width * scale);
-  const dh = Math.round(bmp.height * scale);
-  ctx.drawImage(bmp, (canvas.width - dw) / 2, (canvas.height - dh) / 2, dw, dh);
-  bmp.close();
-}
-
 export function LiveSurface({
   target,
   kind,
-  active,
 }: {
   target: CourtTarget;
   kind: string;
@@ -51,19 +38,43 @@ export function LiveSurface({
     let alive = true;
     let gotFrame = false;
     let sock: WebSocket | null = null;
-    let raf = 0;
     let timer = 0;
+    let count = 0;
+    let lastUpdate = 0;
+    setState("probing");
+    setNote("connecting");
+    setFrames(0);
 
-    const idleLoop = (message: string) => {
-      const tick = () => {
-        if (!alive || gotFrame) return;
-        const c = canvasRef.current;
-        const ctx = c?.getContext("2d");
-        if (c && ctx) paintIdle(ctx, c.width, c.height, message);
-        raf = requestAnimationFrame(tick);
-      };
-      tick();
+    const paintPlaceholder = (message: string) => {
+      if (!alive) return;
+      const c = canvasRef.current;
+      const ctx = c?.getContext("2d");
+      if (c && ctx) paintIdle(ctx, c.width, c.height, message);
     };
+    paintPlaceholder("connecting");
+
+    const renderer = latestFrames({
+      decode: (blob) => createImageBitmap(blob),
+      paint: (bitmap) => {
+        const canvas = canvasRef.current;
+        if (!alive || !canvas || sock?.readyState !== WebSocket.OPEN) return;
+        paintBitmap(canvas, bitmap);
+        gotFrame = true;
+        window.clearTimeout(timer);
+        setState("live");
+        setNote("live capture");
+        count += 1;
+        const now = performance.now();
+        if (count === 1 || now - lastUpdate >= 1000) {
+          lastUpdate = now;
+          setFrames(count);
+        }
+      },
+      onError: () => {
+        setState("down");
+        setNote("invalid capture frame");
+      },
+    });
 
     // A browser card shows the browser hub surface; everything else uses the
     // computer capture route with the card's own target.
@@ -71,10 +82,10 @@ export function LiveSurface({
     if (!url) {
       setState("off");
       setNote("no backend configured");
-      idleLoop("no backend configured");
+      paintPlaceholder("no backend configured");
       return () => {
         alive = false;
-        cancelAnimationFrame(raf);
+        renderer.dispose();
       };
     }
 
@@ -84,10 +95,10 @@ export function LiveSurface({
     } catch {
       setState("down");
       setNote("socket refused");
-      idleLoop("socket refused");
+      paintPlaceholder("socket refused");
       return () => {
         alive = false;
-        cancelAnimationFrame(raf);
+        renderer.dispose();
       };
     }
 
@@ -95,20 +106,13 @@ export function LiveSurface({
       if (!alive || gotFrame) return;
       setState("down");
       setNote("no frames — capture route off or busy");
-      idleLoop("no frames — capture route off or busy");
+      paintPlaceholder("no frames — capture route off or busy");
     }, 4000);
 
     sock.onmessage = (ev) => {
       if (!alive) return;
-      const canvas = canvasRef.current;
       if (ev.data instanceof ArrayBuffer) {
-        if (!canvas) return;
-        gotFrame = true;
-        setState("live");
-        setNote("live capture");
-        void paintFrame(canvas, new Blob([ev.data], { type: "image/jpeg" })).then(() => {
-          if (alive) setFrames((n) => n + 1);
-        });
+        renderer.push(new Blob([ev.data], { type: "image/jpeg" }));
         return;
       }
       let data: Record<string, unknown> | null = null;
@@ -119,53 +123,45 @@ export function LiveSurface({
       }
       if (!data) return;
       if (data.type === "error") {
+        window.clearTimeout(timer);
+        renderer.dispose();
         setState("down");
         setNote(String(data.detail || data.message || "capture refused"));
         return;
       }
       if (data.type === "ready") {
         setNote(`${String(data.kind || target.kind)} · ${String(data.backend || "capture")}`);
-        window.clearTimeout(timer);
         return;
       }
-      const b64 = (data.jpeg_b64 || data.png_b64 || data.data_b64) as string | undefined;
-      if (!b64 || !canvas) return;
-      gotFrame = true;
-      setState("live");
-      setNote("live capture");
-      const bin = atob(b64);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
-      const mime = (data.mime as string) || (data.png_b64 ? "image/png" : "image/jpeg");
-      void paintFrame(canvas, new Blob([bytes], { type: mime })).then(() => {
-        if (alive) setFrames((n) => n + 1);
-      });
+      try {
+        const blob = frameBlob(data);
+        if (blob) renderer.push(blob);
+      } catch {
+        setState("down");
+        setNote("invalid capture frame");
+      }
     };
 
     sock.onerror = () => {
       if (!alive) return;
       window.clearTimeout(timer);
-      if (!gotFrame) {
-        setState("down");
-        setNote("capture socket error");
-        idleLoop("capture socket error");
-      }
+      renderer.dispose();
+      setState("down");
+      setNote("capture socket error");
     };
 
     sock.onclose = () => {
       if (!alive) return;
       window.clearTimeout(timer);
-      if (!gotFrame) {
-        setState("down");
-        setNote("capture closed");
-        idleLoop("capture closed");
-      }
+      renderer.dispose();
+      setState("down");
+      setNote("capture closed");
     };
 
     return () => {
       alive = false;
       window.clearTimeout(timer);
-      cancelAnimationFrame(raf);
+      renderer.dispose();
       try {
         sock?.close();
       } catch {
@@ -173,14 +169,6 @@ export function LiveSurface({
       }
     };
   }, [target.hwnd, target.pid, target.title, target.x, target.y, target.w, target.h, target.fps, target.kind, kind]);
-
-  useEffect(() => {
-    if (!active) return;
-    const c = canvasRef.current;
-    if (!c) return;
-    c.width = 960;
-    c.height = 540;
-  }, [active]);
 
   return (
     <div className="screen">

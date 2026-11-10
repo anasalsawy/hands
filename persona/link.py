@@ -54,8 +54,10 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
+import math
 import os
 import secrets
 import subprocess
@@ -1853,11 +1855,13 @@ class PossibilitySpeculator:
 
     def __init__(self, thought_stream: ThoughtStream | None = None,
                  dial: int = 5,
-                 max_possibilities: int | None = None):
+                 max_possibilities: int | None = None,
+                 precompute_grace: float = 0.05):
         self.thought_stream = thought_stream or ThoughtStream()
         self.dial = max(1, min(10, dial))
         profile = self.DIAL_PROFILES[self.dial]
         self.max_possibilities = max_possibilities or profile["max_possibilities"]
+        self.precompute_grace = max(0.0, precompute_grace)
 
         # Runtime state
         self._lock = asyncio.Lock()
@@ -1893,7 +1897,11 @@ class PossibilitySpeculator:
         action result arrives.
         """
         t0 = time.monotonic()
-        possibilities = await compute_fn(step_context)
+        possibilities = compute_fn(step_context)
+        if inspect.isawaitable(possibilities):
+            possibilities = await possibilities
+        if not isinstance(possibilities, dict):
+            raise TypeError("possibilities must be a dict")
         elapsed = time.monotonic() - t0
         self._total_precompute_time += elapsed
 
@@ -1946,19 +1954,42 @@ class PossibilitySpeculator:
             self._total_action_time += time.monotonic() - t0
             return result, None
 
-        # ── DECISION POINT: action + precompute start together ─────
+        # Speculation is advisory: slow or failed guesses cannot hold the result.
         t0 = time.monotonic()
-        result, possibilities = await asyncio.gather(
-            action_fn(),
-            self.precompute_possibilities(precompute_fn, step_context),
+        precompute = asyncio.create_task(
+            self.precompute_possibilities(precompute_fn, step_context)
         )
-        elapsed = time.monotonic() - t0
-        self._total_action_time += elapsed
-
-        return result, possibilities
+        try:
+            result = await action_fn()
+            self._total_action_time += time.monotonic() - t0
+            try:
+                if not precompute.done():
+                    await asyncio.wait({precompute}, timeout=self.precompute_grace)
+                possibilities = (precompute.result()
+                                 if precompute.done() and not precompute.cancelled() else None)
+            except Exception:
+                log.debug("possibility precompute failed; use fresh evidence", exc_info=True)
+                possibilities = None
+            return result, possibilities
+        finally:
+            if not precompute.done():
+                precompute.cancel()
+            await asyncio.gather(precompute, return_exceptions=True)
 
     # Keep old name as alias for SpeculativeEngine compatibility
     execute_with_precompute = decide_and_act
+
+    @staticmethod
+    def outcome_key(result: Any) -> str:
+        raw = result
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(raw, dict) and isinstance(raw.get("status"), str):
+            return raw["status"]
+        return str(result)
 
     def dispatch(self, result: Any, possibilities: dict[str, dict] | None
                  ) -> dict | None:
@@ -1971,6 +2002,8 @@ class PossibilitySpeculator:
             return None
 
         result_key = str(result)
+        if result_key not in possibilities:
+            result_key = self.outcome_key(result)
         if result_key in possibilities:
             self._instant_dispatches += 1
             self._events.append({
@@ -2117,6 +2150,7 @@ class SpeculativeEngine:
         self.speculator = PossibilitySpeculator(
             thought_stream=self.thought_stream,
             dial=self.dial,
+            max_possibilities=self.max_possibilities,
         )
 
         # Stats
@@ -2158,7 +2192,8 @@ class SpeculativeEngine:
             precompute_fn: async callable(ctx) → {outcome_key: action_dict}.
                            ALWAYS runs (unless is_last_step).
             batch_actions: list of actions to batch-fire immediately when
-                          confidence is high. Layered on top of possibilities.
+                          confidence is high and _expected_outcome matches.
+                          These are suggestions; the caller executes them.
             step_context: context dict passed to precompute_fn.
             is_last_step: if True, skip pre-computation.
 
@@ -2172,6 +2207,8 @@ class SpeculativeEngine:
                 "confidence": float,
             }
         """
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            raise ValueError("confidence must be a finite probability between 0 and 1")
         async with self._lock:
             self._step_count += 1
             step_num = self._step_count
@@ -2200,26 +2237,11 @@ class SpeculativeEngine:
             # Now also use the batch action — it's what we're confident about.
             batch_size = min(len(batch_actions), self.max_batch)
             batch_to_fire = batch_actions[:batch_size]
-            next_action = batch_to_fire[0] if batch_to_fire else None
-            batch_fired = True
-
-            # Check: did the result match our confident prediction?
-            # If not, override the batch with the matching possibility
-            if possibilities and not is_last_step:
-                dispatched = self.speculator.dispatch(result, possibilities)
-                if dispatched is not None and next_action is not None:
-                    # Result matched a possibility — check if it agrees
-                    # with our batch. If the batch was wrong, use the
-                    # possibility instead (the safety net catches it).
-                    result_key = str(result)
-                    batch_key = next_action.get("_expected_outcome", "")
-                    if batch_key and result_key != batch_key:
-                        # Batch was WRONG — safety net kicks in
-                        next_action = dispatched
-                        batch_fired = False
-                        log.info("SpecEngine: batch miss step %d — "
-                                 "safety net caught it (conf=%.0f%%)",
-                                 step_num, confidence * 100)
+            predicted = batch_to_fire[0] if batch_to_fire else None
+            expected = predicted.get("_expected_outcome") if predicted else None
+            batch_fired = bool(expected and (
+                expected == str(result) or expected == self.speculator.outcome_key(result)))
+            next_action = predicted if batch_fired else self.speculator.dispatch(result, possibilities)
 
             self._events.append({
                 "event": "high_plus_precompute",

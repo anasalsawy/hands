@@ -867,12 +867,14 @@ class HandsDeck:
             self._touch(c, status="failed", error="the engine for this lane never connected")
             self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
             return
-        schemas = list(getattr(runner, "tools", []) or [])
-        msgs = [{"role": "system", "content": (
+        from .tars_loop import PLAN_TOOL, run_tars_loop
+
+        schemas = [*list(getattr(runner, "tools", []) or []), PLAN_TOOL]
+        instructions = (
             f"You are Sawii's R line {lane}, working on one computer with the tools "
             "in front of you. Do the task with real tool calls, then say in one short "
             "line what you actually did. Never claim a tool ran unless it did."
-        )}, {"role": "user", "content": goal[:4000]}]
+        )
         receipts: list[str] = []
         # The last tool-level failure this lane saw, and whether anything
         # succeeded after it. A goal whose hand died mid-flight must end
@@ -880,76 +882,86 @@ class HandsDeck:
         # reading "done" over work that never ran is the exact lie this deck
         # exists to prevent. A recovery (error, then a good call) clears it.
         last_tool_error = ""
-        for _step in range(MAX_LANE_STEPS):
+        names = {tool["function"]["name"] for tool in schemas}
+        steps = 0
+
+        def active() -> Court:
             c = self.get(persona_id, court_id)
             if c is None or c.status == "stopped":
-                return
+                raise asyncio.CancelledError
+            return c
+
+        async def infer(messages: list[dict]) -> dict:
+            nonlocal steps
+            c = active()
+            steps += 1
+            c.meta["steps"] = steps
+            if steps > MAX_LANE_STEPS:
+                raise RuntimeError("lane step limit reached")
+            reply = await asyncio.wait_for(
+                lobe.chat(messages, tools=schemas or None, max_tokens=700, temperature=0.2),
+                timeout=GOAL_STEP_TIMEOUT)
+            calls = []
+            for tc in getattr(reply, "tool_calls", None) or []:
+                args = _json.loads(tc.arguments or "{}")
+                if tc.name not in names or not isinstance(args, dict):
+                    raise RuntimeError("R requested an unadvertised tool or invalid arguments")
+                calls.append({"id": tc.id, "name": tc.name, "arguments": args})
+            return {"text": getattr(reply, "text", "") or "", "tool_calls": calls,
+                    "finish_reason": getattr(reply, "finish_reason", "stop")}
+
+        async def execute(name: str, args: dict) -> str:
+            nonlocal last_tool_error
+            c = active()
+            timeline = getattr(self.mind, "shared_timeline", None)
+            call_id = f"{lane}:{len(receipts) + 1}"
+            if timeline is not None:
+                await timeline.append(persona_id, producer=c.meta.get("lane_label") or lane,
+                                      kind="tool_call", task_id=lane,
+                                      payload={"tool": name, "args": str(args)[:1500],
+                                               "call_id": call_id, "part": goal[:500]})
+            out = await asyncio.wait_for(hub.call(persona_id, name, args, lane=lane),
+                                         timeout=GOAL_TOOL_TIMEOUT)
+            text = str(out)
+            receipts.append(f"{name}: {text[:200]}")
             try:
-                reply = await asyncio.wait_for(
-                    lobe.chat(msgs, tools=schemas or None, max_tokens=700, temperature=0.2),
-                    timeout=GOAL_STEP_TIMEOUT)
-            except Exception as exc:  # noqa: BLE001 - a dead mind must be reported
-                self._touch(c, status="failed",
-                            error=f"R could not think ({type(exc).__name__}: {exc})"[:300])
-                self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
-                return
-            calls = list(getattr(reply, "tool_calls", None) or [])
-            if not calls:
-                said = str(getattr(reply, "text", "") or "").strip()
-                c.meta["result"] = said[:500]
-                if last_tool_error:
-                    self._touch(c, status="failed", error=last_tool_error)
-                    self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
-                    await self._retire(persona_id, c, lane)
-                    return
-                self._touch(c, status="done", error="")
-                self.emit(c, "court.status", status="done", lane=lane, result=said[:300])
-                await self._retire(persona_id, c, lane)
-                return
-            msgs.append({"role": "assistant", "content": getattr(reply, "text", "") or None,
-                         "tool_calls": [{"id": tc.id, "type": "function",
-                                         "function": {"name": tc.name, "arguments": tc.arguments}}
-                                        for tc in calls]})
-            for tc in calls:
-                try:
-                    args = _json.loads(tc.arguments or "{}")
-                except ValueError:
-                    args = {}
-                try:
-                    # Addressed to THIS lane's hand, so two lanes never share a
-                    # tool. A hand that dies mid-call raises here — the card must
-                    # say so, not let the exception kill the loop in silence.
-                    out = await asyncio.wait_for(
-                        hub.call(persona_id, tc.name, args, lane=lane),
-                        timeout=GOAL_TOOL_TIMEOUT)
-                except Exception as exc:  # noqa: BLE001
-                    c = self.get(persona_id, court_id)
-                    if c is not None:
-                        self._touch(c, status="failed",
-                                    error=f"{tc.name} did not come back "
-                                          f"({type(exc).__name__}: {exc})"[:300])
-                        self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
-                    return
-                text = str(out)
-                receipts.append(f"{tc.name}: {text[:200]}")
-                # The hub answers a dead hand with an {"error": ...} body rather
-                # than raising. Record it, and clear it only when a later call
-                # on this lane actually works.
-                try:
-                    parsed = _json.loads(text)
-                    bad = isinstance(parsed, dict) and bool(parsed.get("error"))
-                    last_tool_error = (str(parsed.get("error"))[:300] if bad
-                                       else "")
-                except ValueError:
-                    last_tool_error = ""
-                msgs.append({"role": "tool", "tool_call_id": tc.id, "name": tc.name,
-                             "content": text[:8000]})
+                parsed = _json.loads(text)
+                bad = isinstance(parsed, dict) and bool(parsed.get("error") or parsed.get("isError"))
+                last_tool_error = str(parsed.get("error") or "tool failed")[:300] if bad else ""
+            except ValueError:
+                last_tool_error = ""
             c.meta["last_tools"] = receipts[-3:]
+            if timeline is not None:
+                await timeline.append(persona_id, producer=c.meta.get("lane_label") or lane,
+                                      kind="tool_result", task_id=lane,
+                                      payload={"tool": name, "call_id": call_id, "part": goal[:500],
+                                               "result": {"text": text[:2000]}})
+            return text[:8000]
+
+        async def observe() -> dict | None:
+            active()
+            return await asyncio.wait_for(hub.observe(persona_id, place, lane=lane), timeout=3)
+
+        c.meta["agent_loop"] = "omni-tars"
+        try:
+            said = await run_tars_loop(
+                goal=goal[:4000], instructions=instructions, tools=schemas,
+                infer=infer, execute=execute, observe=observe,
+                max_steps=MAX_LANE_STEPS,
+                timeout=max(GOAL_STEP_TIMEOUT, GOAL_TOOL_TIMEOUT) + 5)
+        except Exception as exc:  # noqa: BLE001 - a dead loop must be reported
+            c = self.get(persona_id, court_id)
+            if c is not None and c.status != "stopped":
+                self._touch(c, status="failed", error=f"R loop failed ({type(exc).__name__}: {exc})"[:300])
+                self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
+                await self._retire(persona_id, c, lane)
+            return
         c = self.get(persona_id, court_id)
         if c is not None and c.status in ("running", "waiting"):
-            self._touch(c, status="failed",
-                        error=f"reached the {MAX_LANE_STEPS}-step limit for this lane")
-            self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
+            c.meta["result"] = said[:500]
+            self._touch(c, status="failed" if last_tool_error else "done", error=last_tool_error)
+            self.emit(c, "court.status", status=c.status, error=c.error, lane=lane, result=said[:300])
+            await self._retire(persona_id, c, lane)
 
     # ───────────────────────────────────────────────────────────── voice hooks
 

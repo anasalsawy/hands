@@ -1,6 +1,7 @@
 # Python bytecode
 __pycache__/
 *.pyc
+node_modules/
 
 # Runtime data and databases
 data/

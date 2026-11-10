@@ -81,9 +81,9 @@ async def main() -> int:
     for i, r in enumerate(bench["replies"]):
         print(f"  reply[{i}]:       {r[:100]!r}")
 
-    ok = bool(turn.reply) and not turn.error
+    ok = bool(turn.reply) and not turn.error and not bench["errors"] and all(bench["replies"])
     print("\nhands checks:", "PASSED" if ok else "COMPLETED WITH ERRORS")
-    return 0 if ok else 0  # a report, not a gate
+    return 0 if ok else 1
 
 
 def lobby_reply() -> "object":
