@@ -250,7 +250,8 @@ class MotorTests(unittest.IsolatedAsyncioTestCase):
             a = await motor("a", parent)
             b = await motor("b", "import time; time.sleep(60)")
             try:
-                self.assertEqual(await asyncio.wait_for(a.stdout.readline(), 10), b"ready\n")
+                ready = await asyncio.wait_for(a.stdout.readline(), 10)
+                self.assertEqual(ready.strip(), b"ready")
                 await link.stop("a")
                 self.assertIsNotNone(a.returncode)
                 self.assertIsNone(b.returncode)
