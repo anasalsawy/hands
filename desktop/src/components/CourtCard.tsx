@@ -30,9 +30,11 @@ export function CourtCard({
   const [target, setTarget] = useState<CourtTarget>(court.target || { kind: court.kind });
   const [showTarget, setShowTarget] = useState(false);
 
+  // Deck polling hands back a fresh object each refresh; only reset local edits when the value changes.
+  const serverTarget = JSON.stringify(court.target || { kind: court.kind });
   useEffect(() => {
-    setTarget(court.target || { kind: court.kind });
-  }, [court.target, court.kind]);
+    setTarget(JSON.parse(serverTarget) as CourtTarget);
+  }, [serverTarget]);
 
   const live = LIVE.includes(court.status);
 
