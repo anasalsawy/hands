@@ -627,6 +627,12 @@ class HandsDeck:
         return _died
 
     async def _stop_worker(self, c: Court) -> None:
+        own = [task for task in self._work_tasks
+               if task.get_name() == f"court-work-{c.id}" and task is not asyncio.current_task()]
+        for task in own:
+            task.cancel()
+        if own:
+            await asyncio.gather(*own, return_exceptions=True)
         links = getattr(self.mind, "links", None)
         link = links.get(c.link) if links and hasattr(links, "get") and c.link else None
         if link is not None and c.lane:
@@ -773,6 +779,7 @@ class HandsDeck:
         c = self.get(persona_id, court_id)
         if c is None:
             return None
+        self._touch(c, status="stopped", error="")
         await self._stop_worker(c)
         lanes = getattr(self.mind, "lanes", None)
         if lanes is not None and c.lane and hasattr(lanes, "stop"):
@@ -782,7 +789,6 @@ class HandsDeck:
                     await maybe
             except Exception:  # noqa: BLE001
                 log.debug("court %s lane stop failed", c.id, exc_info=True)
-        self._touch(c, status="stopped")
         self.emit(c, "court.cancelled")
         if forget:
             return c if self.remove(persona_id, court_id) else c

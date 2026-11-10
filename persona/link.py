@@ -3512,6 +3512,8 @@ class Link:
         linked = self._lanes.get(lane_id)
         if not linked or linked.status not in ("active", "starting"):
             return False
+        linked.status = "stopped"
+        linked.error = ""
 
         if self.agent.strategy == "hijack" and self.driver:
             call = self.driver.build_stop_call(
@@ -3530,13 +3532,14 @@ class Link:
         elif self.agent.strategy == "spawn" and linked.process:
             try:
                 linked.process.terminate()
-                await asyncio.sleep(PROCESS_KILL_GRACE)
-                if linked.process.returncode is None:
+                try:
+                    await asyncio.wait_for(linked.process.wait(), timeout=PROCESS_KILL_GRACE)
+                except asyncio.TimeoutError:
                     linked.process.kill()
+                    await linked.process.wait()
             except (OSError, ProcessLookupError):
                 pass
 
-        linked.status = "stopped"
         return True
 
     async def status(self, lane_id: str) -> str:
@@ -3855,7 +3858,9 @@ class Link:
             detail = (stderr or stdout or b"").decode("utf-8", errors="replace").strip()
             # The engine talks to its own stdout/stderr; capture the tail of it
             # in the error so an operator sees WHY (bad key, refused, no roots).
-            if rc != 0:
+            if linked.status == "stopped":
+                linked.error = ""
+            elif rc != 0:
                 linked.status = "failed"
                 linked.error = (detail[-400:] or f"engine exited with code {rc}")
                 log.warning("Link: spawned process for lane %s exited with %d: %s",

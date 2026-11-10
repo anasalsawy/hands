@@ -41,6 +41,7 @@ export function LiveSurface({
     let timer = 0;
     let count = 0;
     let lastUpdate = 0;
+    let failureNote = "";
     setState("probing");
     setNote("connecting");
     setFrames(0);
@@ -60,6 +61,7 @@ export function LiveSurface({
         if (!alive || !canvas || sock?.readyState !== WebSocket.OPEN) return;
         paintBitmap(canvas, bitmap);
         gotFrame = true;
+        failureNote = "";
         window.clearTimeout(timer);
         setState("live");
         setNote("live capture");
@@ -71,8 +73,9 @@ export function LiveSurface({
         }
       },
       onError: () => {
+        failureNote = "invalid capture frame";
         setState("down");
-        setNote("invalid capture frame");
+        setNote(failureNote);
       },
     });
 
@@ -105,8 +108,9 @@ export function LiveSurface({
     timer = window.setTimeout(() => {
       if (!alive || gotFrame) return;
       setState("down");
-      setNote("no frames — capture route off or busy");
-      paintPlaceholder("no frames — capture route off or busy");
+      failureNote = "no frames — capture route off or busy";
+      setNote(failureNote);
+      paintPlaceholder(failureNote);
     }, 4000);
 
     sock.onmessage = (ev) => {
@@ -126,7 +130,9 @@ export function LiveSurface({
         window.clearTimeout(timer);
         renderer.dispose();
         setState("down");
-        setNote(String(data.detail || data.message || "capture refused"));
+        failureNote = String(data.detail || data.message || "capture refused");
+        setNote(failureNote);
+        paintPlaceholder(failureNote);
         return;
       }
       if (data.type === "ready") {
@@ -137,8 +143,9 @@ export function LiveSurface({
         const blob = frameBlob(data);
         if (blob) renderer.push(blob);
       } catch {
+        failureNote = "invalid capture frame";
         setState("down");
-        setNote("invalid capture frame");
+        setNote(failureNote);
       }
     };
 
@@ -147,15 +154,18 @@ export function LiveSurface({
       window.clearTimeout(timer);
       renderer.dispose();
       setState("down");
-      setNote("capture socket error");
+      failureNote ||= "capture socket error";
+      setNote(failureNote);
     };
 
-    sock.onclose = () => {
+    sock.onclose = (event) => {
       if (!alive) return;
       window.clearTimeout(timer);
       renderer.dispose();
       setState("down");
-      setNote("capture closed");
+      const message = failureNote || event.reason || "capture closed";
+      setNote(message);
+      paintPlaceholder(message);
     };
 
     return () => {

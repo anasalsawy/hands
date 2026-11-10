@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from persona.court import HandsDeck
 from persona.llm import ChatResult, ToolCall
+from persona.link import AgentProfile, Link, LinkedLane
 from persona.tars_loop import LanePlan, PLAN_NAME, PLAN_TOOL, run_tars_loop
 
 TOOL = {"type": "function", "function": {
@@ -224,7 +225,85 @@ class PlanningTests(unittest.IsolatedAsyncioTestCase):
                 LanePlan([TOOL]).prepare(arguments)
 
 
+class MotorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_intentional_sigterm_remains_stopped_not_failed(self):
+        profile = AgentProfile(name="test", strategy="spawn")
+        link = Link(profile)
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "import time; time.sleep(60)",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        linked = LinkedLane(lane_id="test", agent=profile, process=process,
+                            status="active", connected=True)
+        exits = []
+        linked.on_exit = lambda rc, error: exits.append((rc, error))
+        link._lanes[linked.lane_id] = linked
+        monitor = asyncio.create_task(link._monitor_process(linked))
+        try:
+            self.assertTrue(await link.stop(linked.lane_id))
+            await monitor
+            self.assertIsNotNone(process.returncode)
+            self.assertEqual(linked.status, "stopped")
+            self.assertEqual(linked.error, "")
+            self.assertEqual(len(exits), 1)
+            self.assertEqual(exits[0][1], "")
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+
+    async def test_unexpected_exit_still_reports_failure(self):
+        profile = AgentProfile(name="test", strategy="spawn")
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "raise SystemExit(3)",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        linked = LinkedLane(lane_id="test", agent=profile, process=process, status="active")
+        await Link(profile)._monitor_process(linked)
+        self.assertEqual(linked.status, "failed")
+        self.assertIn("code 3", linked.error)
+
+
 class CourtTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stop_cancels_only_own_r_task_and_never_emits_failure(self):
+        stopped = asyncio.Event()
+        link = SimpleNamespace()
+        mind = SimpleNamespace(bus=None, links=SimpleNamespace(get=lambda name: link))
+        deck = HandsDeck(mind)
+        court = deck.create(7, title="cancel")
+        court.status, court.lane, court.link = "running", "r-cancel", "hands-engine"
+        court.error = "old error"
+        events = deck.subscribe(7)
+
+        async def wait_for_cancel():
+            try:
+                await asyncio.Future()
+            finally:
+                stopped.set()
+
+        async def stop(lane):
+            self.assertEqual(lane, "r-cancel")
+            self.assertEqual(court.status, "stopped")
+            self.assertTrue(stopped.is_set(), "R must stop before killing its motor")
+            deck._motor_died(7, court.id)(-15, "intentional SIGTERM")
+
+        link.stop = stop
+        own = asyncio.create_task(wait_for_cancel(), name=f"court-work-{court.id}")
+        other = asyncio.create_task(asyncio.sleep(10), name="court-work-other")
+        deck._work_tasks.update([own, other])
+        await asyncio.sleep(0)
+        try:
+            await deck.cancel(7, court.id)
+            self.assertTrue(own.cancelled())
+            self.assertFalse(other.done())
+            self.assertEqual(court.status, "stopped")
+            self.assertEqual(court.error, "")
+            recorded = []
+            while not events.empty():
+                recorded.append(events.get_nowait())
+            self.assertFalse(any(ev.get('status') == 'failed' for ev in recorded))
+        finally:
+            other.cancel()
+            await asyncio.gather(other, return_exceptions=True)
+
     async def drive(self, replies, outputs=("receipt",), *, lane="r-one"):
         seen, calls, frames, records = [], [], [], []
         scripted = iter(replies)
