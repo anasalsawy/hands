@@ -934,8 +934,9 @@ class HandsDeck:
             "line what you actually did. Never claim a tool ran unless it did. "
             f"When the next step depends on what a hand call returns, put {PLAN_NAME} "
             "first in the same batch as that call: give your confidence and the likely "
-            "outcomes mapped to the next action, so the follow-up is ready the moment "
-            "the real result and fresh screen confirm it."
+            "outcomes (ok/error or exact status) mapped to the next action, plus an "
+            "ordered batch with each step's _expected_outcome. A step whose outcome the "
+            "real receipt matches fires at once when you are confident; verify it after."
         )
         receipts: list[str] = []
         # The last tool-level failure this lane saw, and whether anything
@@ -1071,7 +1072,9 @@ class HandsDeck:
                     goal=goal[:4000], instructions=instructions, tools=schemas,
                     infer=infer, execute=execute, observe=observe,
                     max_steps=MAX_LANE_STEPS,
-                    timeout=max(GOAL_STEP_TIMEOUT, GOAL_TOOL_TIMEOUT) + 5)
+                    timeout=max(GOAL_STEP_TIMEOUT, GOAL_TOOL_TIMEOUT) + 5,
+                    autofire=os.getenv("SAWII_HANDS_AUTOFIRE", "1") != "0",
+                    stats=active().meta.setdefault("spec", {}))
             finally:
                 if v_next is not None:
                     v_next.cancel()

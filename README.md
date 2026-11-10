@@ -47,13 +47,17 @@ Fresh lane observations (including images) accompany each decision. Old images
 do not accumulate in history. Read-only multi-surface perception for L is
 concurrent and timeout-bounded independently of these execution loops.
 
-R may call `persona_prepare_next_actions` before a hand call, in the **same
-ordered tool batch**, to prepare possible outcomes and confidence estimates.
-Persona's `SpeculativeEngine` matches the actual result before returning advice
-to R. An unmatched/unguarded prediction is discarded; even matched advice needs
-R to validate the fresh observation. Speculation never fires an extra click or
-creates another inference agent. Estimates are model-supplied, not calibrated
-probabilities or a guarantee of end-to-end speed.
+Persona sends its own spec in the **same reply** as the hand call (no extra
+inference): `persona_prepare_next_actions` carries a confidence, possible
+outcomes (`ok`/`error` or an exact status) mapped to next actions, and an
+ordered batch whose steps each carry an `_expected_outcome`. Persona's
+`SpeculativeEngine` matches the real receipt; when it matches and confidence is
+at least 0.85, the prepared step is dispatched on the same lane immediately,
+skipping one think (at most 3 in a row, the batch stops at the first mismatch).
+Fired receipts are labelled so R verifies them against the fresh screen.
+Unmatched predictions are discarded. `SAWII_HANDS_AUTOFIRE=0` turns firing off
+(matched steps then return as advice only). Estimates are model-supplied, not
+calibrated probabilities.
 
 This reuses the UI-TARS-2 **agent architecture**, not its model weights. Any
 model remains configured in Persona; no UI-TARS-1/1.5 model is substituted.

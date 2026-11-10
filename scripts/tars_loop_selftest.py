@@ -15,6 +15,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -214,6 +215,66 @@ class PlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.with_advice([]), [])
         await plan.execute(lambda: asyncio.sleep(0, result='{"status":"ok"}'))
         self.assertIsNone(plan.advice, "an old batch must not be replayed on the next call")
+
+    async def spec_run(self, spec, autofire, receipt="receipt"):
+        calls, thinks, stats = [], [], {}
+
+        async def infer(messages):
+            thinks.append(messages)
+            if len(thinks) == 1:
+                return {"text": "", "tool_calls": [
+                    {"id": "p1", "name": PLAN_NAME, "arguments": spec},
+                    {"id": "c1", "name": "computer_click", "arguments": {"x": 1}}]}
+            return {"text": "done", "tool_calls": []}
+
+        async def call(name, args):
+            calls.append(args["x"])
+            return receipt
+
+        async def frame():
+            return None
+
+        result = await run_tars_loop(goal="test", instructions="test", tools=[TOOL, PLAN_TOOL],
+                                     infer=infer, execute=call, observe=frame,
+                                     autofire=autofire, stats=stats)
+        return result, calls, thinks, stats
+
+    async def test_persona_spec_is_advice_when_autofire_is_off(self):
+        spec = {"confidence": 0.95, "possibilities": {
+            "ok": {"name": "computer_click", "arguments": {"x": 2}}}}
+        result, calls, thinks, stats = await self.spec_run(spec, autofire=False)
+        self.assertEqual((result, calls), ("done", [1]))
+        self.assertIn('"x": 2', str(thinks[1][-1]))
+        self.assertEqual(stats.get("matched"), 1)
+        self.assertNotIn("fired", stats)
+
+    async def test_confident_matching_spec_fires_without_another_think(self):
+        spec = {"confidence": 0.95, "possibilities": {
+            "ok": {"name": "computer_click", "arguments": {"x": 2}}}}
+        result, calls, thinks, stats = await self.spec_run(spec, autofire=True)
+        self.assertEqual((result, calls, len(thinks)), ("done", [1, 2], 2))
+        self.assertEqual(stats.get("fired"), 1)
+        self.assertIn("prepared step fired", str(thinks[1]))
+
+    async def test_batch_fires_in_order_only_while_each_outcome_matches(self):
+        spec = {"confidence": 0.95, "possibilities": {}, "batch": [
+            {"name": "computer_click", "arguments": {"x": 2}, "_expected_outcome": "ok"},
+            {"name": "computer_click", "arguments": {"x": 3}, "_expected_outcome": "ok"}]}
+        result, calls, thinks, stats = await self.spec_run(spec, autofire=True)
+        self.assertEqual((result, calls, len(thinks), stats.get("fired")), ("done", [1, 2, 3], 2, 2))
+        result, calls, thinks, stats = await self.spec_run(spec, True, '{"error": "gone"}')
+        self.assertEqual((result, calls), ("done", [1]), "a failed step stops the batch")
+
+    async def test_spec_never_fires_on_wrong_outcome_or_low_confidence(self):
+        for spec, receipt in (
+            ({"confidence": 0.95, "possibilities": {
+                "ok": {"name": "computer_click", "arguments": {"x": 2}}}}, '{"error": "no window"}'),
+            ({"confidence": 0.6, "possibilities": {
+                "ok": {"name": "computer_click", "arguments": {"x": 2}}}}, "receipt"),
+        ):
+            result, calls, thinks, stats = await self.spec_run(spec, True, receipt)
+            self.assertEqual((result, calls), ("done", [1]), spec)
+            self.assertNotIn("fired", stats)
 
     async def test_invalid_confidence_actions_and_unguarded_batches_rejected(self):
         for arguments in [
