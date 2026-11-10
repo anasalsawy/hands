@@ -335,6 +335,9 @@ class HandsDeck:
         # Stop the worker if we own one, but never block the caller on it.
         if c.worker is not None:
             self._schedule(c, self._stop_worker(c))
+        browser = getattr(self.mind, "browser_hub", None)
+        if c.kind == "browser" and c.lane and hasattr(browser, "close_lane"):
+            self._schedule(c, browser.close_lane(persona_id, c.lane))
         self._courts.pop(court_id, None)
         self._send_locks.pop(court_id, None)
         self.emit(c, "court.removed")
@@ -906,7 +909,7 @@ class HandsDeck:
             self._touch(c, status="failed", error="the engine for this lane never connected")
             self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
             return
-        from .tars_loop import PLAN_TOOL, run_tars_loop
+        from .tars_loop import PLAN_NAME, PLAN_TOOL, run_tars_loop
 
         if browser is not None:
             # A browser card drives its own lane browser (the one its surface
@@ -928,7 +931,11 @@ class HandsDeck:
         instructions = (
             f"You are Sawii's R line {lane}, working on one computer with the tools "
             "in front of you. Do the task with real tool calls, then say in one short "
-            "line what you actually did. Never claim a tool ran unless it did."
+            "line what you actually did. Never claim a tool ran unless it did. "
+            f"When the next step depends on what a hand call returns, put {PLAN_NAME} "
+            "first in the same batch as that call: give your confidence and the likely "
+            "outcomes mapped to the next action, so the follow-up is ready the moment "
+            "the real result and fresh screen confirm it."
         )
         receipts: list[str] = []
         # The last tool-level failure this lane saw, and whether anything

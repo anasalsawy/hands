@@ -512,6 +512,13 @@ class CourtTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(7, browser._ones, "the persona's own pane browser is untouched")
         self.assertIn("example.com", str(l_seen[0]))
         self.assertIn("L sees: Example Domain page", str(r_seen[1]))
+        self.assertIn("persona_prepare_next_actions", str(r_seen[0]), "R is told to plan ahead")
+        deck.remove(7, court.id)
+        for _ in range(20):
+            if (7, "r-web") not in browser._ones:
+                break
+            await asyncio.sleep(0.01)
+        self.assertNotIn((7, "r-web"), browser._ones, "removing the card closes its lane browser")
         await browser.shutdown()
 
     async def test_l_vision_failure_falls_back_to_raw_frame(self):
