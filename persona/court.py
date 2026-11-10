@@ -51,6 +51,7 @@ import asyncio
 import json as _json
 import logging
 import os
+import hashlib
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -78,6 +79,12 @@ MAX_SPLIT_PARTS = max(1, int(os.environ.get("SAWII_MAX_SPLIT_PARTS", "4")))
 # How much work one R line may take on its own card before it must report.
 MAX_LANE_STEPS = max(1, int(os.environ.get("SAWII_MAX_LANE_STEPS", "8")))
 GOAL_STEP_TIMEOUT = float(os.environ.get("SAWII_GOAL_STEP_TIMEOUT", "90"))
+L_VISION_TIMEOUT = float(os.environ.get("SAWII_L_VISION_TIMEOUT", "12"))
+L_VISION_PROMPT = (
+    "You are Persona's L side looking at one R lane's current screen. You do not act. "
+    "In at most 4 short lines say what is actually visible that matters for the goal: "
+    "page/app state, key controls or text, errors, and whether the last action seems to "
+    "have worked. Say 'unclear' instead of guessing.")
 # A tool with no answer in this long means the hand went quiet: report it.
 GOAL_TOOL_TIMEOUT = float(os.environ.get("SAWII_GOAL_TOOL_TIMEOUT", "300"))
 
@@ -970,19 +977,75 @@ class HandsDeck:
                                       kind="tool_result", task_id=lane,
                                       payload={"tool": name, "call_id": call_id, "part": goal[:500],
                                                "result": {"text": text[:2000]}})
+            v_prefetch()
             return text[:8000]
 
+        v_reads: dict[str, str] = {}
+        v_next: asyncio.Task | None = None
+
+        async def v_look() -> dict | None:
+            # V: pull the lane's screen and have L read it (same Persona model,
+            # read-only, no tools). An unchanged screen reuses L's last read.
+            c = active()
+            frame = await asyncio.wait_for(hub.observe(persona_id, place, lane=lane), timeout=3)
+            image = frame.get("image_url") if isinstance(frame, dict) else None
+            if not image:
+                return frame
+            key = hashlib.sha1(str(image).encode()).hexdigest()
+            read = v_reads.get(key, "")
+            started = time.monotonic()
+            if read:
+                c.meta["l_vision_reused"] = int(c.meta.get("l_vision_reused", 0)) + 1
+            else:
+                try:
+                    seen = await asyncio.wait_for(lobe.chat([
+                        {"role": "system", "content": L_VISION_PROMPT},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": f"Goal: {goal[:600]}\n{str(frame.get('text') or '')[:600]}"},
+                            {"type": "image_url", "image_url": {"url": image}}]},
+                    ], tools=None, max_tokens=160, temperature=0.0), timeout=L_VISION_TIMEOUT)
+                    read = str(getattr(seen, "text", "") or "").strip()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - R still gets the raw frame
+                    c.meta["l_vision_error"] = f"{type(exc).__name__}: {exc}"[:200]
+                c.meta["l_vision_ms"] = int((time.monotonic() - started) * 1000)
+                if not read:
+                    return frame
+                v_reads.clear()
+                v_reads[key] = read
+                timeline = getattr(self.mind, "shared_timeline", None)
+                if timeline is not None:
+                    await timeline.append(persona_id, producer="L", kind="l_vision", task_id=lane,
+                                          payload={"text": read[:1500], "lane": lane})
+            c.meta["l_vision"] = read[:500]
+            return {**frame, "text": f"L sees: {read[:1500]}\n{str(frame.get('text') or '')}".strip()}
+
+        def v_prefetch() -> None:
+            nonlocal v_next
+            if v_next is not None:
+                v_next.cancel()
+            v_next = asyncio.create_task(v_look(), name=f"court-v-{c.id}")
+            v_next.add_done_callback(lambda t: t.cancelled() or t.exception())
+
         async def observe() -> dict | None:
-            active()
-            return await asyncio.wait_for(hub.observe(persona_id, place, lane=lane), timeout=3)
+            nonlocal v_next
+            task, v_next = v_next, None
+            if task is not None:
+                return await task
+            return await v_look()
 
         c.meta["agent_loop"] = "omni-tars"
         try:
-            said = await run_tars_loop(
-                goal=goal[:4000], instructions=instructions, tools=schemas,
-                infer=infer, execute=execute, observe=observe,
-                max_steps=MAX_LANE_STEPS,
-                timeout=max(GOAL_STEP_TIMEOUT, GOAL_TOOL_TIMEOUT) + 5)
+            try:
+                said = await run_tars_loop(
+                    goal=goal[:4000], instructions=instructions, tools=schemas,
+                    infer=infer, execute=execute, observe=observe,
+                    max_steps=MAX_LANE_STEPS,
+                    timeout=max(GOAL_STEP_TIMEOUT, GOAL_TOOL_TIMEOUT) + 5)
+            finally:
+                if v_next is not None:
+                    v_next.cancel()
         except Exception as exc:  # noqa: BLE001 - a dead loop must be reported
             c = self.get(persona_id, court_id)
             if c is not None and c.status != "stopped":

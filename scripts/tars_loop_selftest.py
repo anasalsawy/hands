@@ -383,12 +383,20 @@ class CourtTests(unittest.IsolatedAsyncioTestCase):
             other.cancel()
             await asyncio.gather(other, return_exceptions=True)
 
-    async def drive(self, replies, outputs=("receipt",), *, lane="r-one"):
+    async def drive(self, replies, outputs=("receipt",), *, lane="r-one", image=None, l_read="",
+                    l_seen=None):
         seen, calls, frames, records = [], [], [], []
         scripted = iter(replies)
         results = iter(outputs)
 
         async def chat(messages, **kwargs):
+            if kwargs["tools"] is None:
+                if l_seen is None:
+                    raise AssertionError("L read without a frame")
+                l_seen.append(messages)
+                if isinstance(l_read, Exception):
+                    raise l_read
+                return ChatResult(l_read)
             seen.append(messages)
             self.assertEqual(kwargs["tools"], [TOOL, PLAN_TOOL])
             return next(scripted)
@@ -401,7 +409,9 @@ class CourtTests(unittest.IsolatedAsyncioTestCase):
         async def observe(pid, place, **kwargs):
             self.assertEqual(kwargs["lane"], lane)
             frames.append(kwargs["lane"])
-            return {"text": f"only-{lane}"}
+            frame = {"text": f"only-{lane}"}
+            shot = image.pop(0) if isinstance(image, list) else image
+            return {**frame, "image_url": shot} if shot else frame
 
         async def append(pid, **kwargs):
             self.assertEqual(pid, 7)
@@ -417,7 +427,7 @@ class CourtTests(unittest.IsolatedAsyncioTestCase):
         court = deck.create(7, title="test")
         court.lane, court.status = lane, "running"
         await deck._drive(7, court.id, lane, "click")
-        self.assertEqual([record['kind'] for record in records],
+        self.assertEqual([record['kind'] for record in records if record['kind'] != 'l_vision'],
                          ['tool_call', 'tool_result'] * len(calls),
                          "L and R must share the real call/result receipts")
         return court, calls, seen, frames
@@ -432,6 +442,43 @@ class CourtTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("only-r-one", str(seen[0]))
         self.assertIn("receipt", str(seen[1]))
         self.assertEqual(frames, ["r-one", "r-one"])
+
+    async def test_screen_goes_through_l_and_r_gets_ls_words_with_pixels(self):
+        l_seen, img = [], "data:image/png;base64,AAAA"
+        court, calls, seen, _ = await self.drive([
+            ChatResult("", [ToolCall("c1", "computer_click", '{"x":1}')]), ChatResult("clicked")],
+            image=img, l_read="Login form; Submit button bottom right", l_seen=l_seen)
+        self.assertEqual(court.status, "done")
+        self.assertEqual(len(l_seen), 1, "an unchanged screen reuses L's read")
+        self.assertEqual(court.meta["l_vision_reused"], 1)
+        self.assertIn(img, str(l_seen[0]))
+        self.assertIn("only-r-one", str(l_seen[0]), "L reads only its own lane")
+        for messages in seen:
+            self.assertIn("L sees: Login form; Submit button bottom right", str(messages))
+            self.assertIn(img, str(messages), "R still gets the raw pixels")
+        self.assertEqual(len(calls), 1, "L never dispatches tools")
+        self.assertIn("l_vision_ms", court.meta)
+
+    async def test_v_rereads_changed_screen_and_never_lets_l_act(self):
+        l_seen, shots = [], ["data:image/png;base64,ONE", "data:image/png;base64,TWO"]
+        court, calls, seen, _ = await self.drive([
+            ChatResult("", [ToolCall("c1", "computer_click", '{"x":1}')]), ChatResult("clicked")],
+            image=shots, l_read="screen", l_seen=l_seen)
+        self.assertEqual(court.status, "done")
+        self.assertEqual(len(l_seen), 2)
+        self.assertIn("ONE", str(l_seen[0]))
+        self.assertIn("TWO", str(l_seen[1]))
+        self.assertIn("TWO", str(seen[1]), "R gets the frame captured after its action")
+        self.assertEqual(len(calls), 1)
+
+    async def test_l_vision_failure_falls_back_to_raw_frame(self):
+        l_seen, img = [], "data:image/png;base64,BBBB"
+        court, _, seen, _ = await self.drive([ChatResult("nothing to do")], image=img,
+                                             l_read=RuntimeError("L down"), l_seen=l_seen)
+        self.assertEqual(court.status, "done")
+        self.assertIn(img, str(seen[0]))
+        self.assertNotIn("L sees:", str(seen[0]))
+        self.assertIn("L down", court.meta["l_vision_error"])
 
     async def test_dead_hand_cannot_be_hidden_by_final_answer(self):
         court, _, _, _ = await self.drive([
