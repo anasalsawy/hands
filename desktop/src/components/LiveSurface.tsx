@@ -24,9 +24,11 @@ function paintIdle(ctx: CanvasRenderingContext2D, w: number, h: number, note: st
 export function LiveSurface({
   target,
   kind,
+  lane,
 }: {
   target: CourtTarget;
   kind: string;
+  lane?: string;
   active: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -81,7 +83,7 @@ export function LiveSurface({
 
     // A browser card shows the browser hub surface; everything else uses the
     // computer capture route with the card's own target.
-    const url = kind === "browser" ? systemApi.browserStreamUrl() : systemApi.computerStreamUrl(target);
+    const url = kind === "browser" ? systemApi.browserStreamUrl(lane) : systemApi.computerStreamUrl(target);
     if (!url) {
       setState("off");
       setNote("no backend configured");
@@ -178,7 +180,7 @@ export function LiveSurface({
         /* already closed */
       }
     };
-  }, [target.hwnd, target.pid, target.title, target.x, target.y, target.w, target.h, target.fps, target.kind, kind]);
+  }, [target.hwnd, target.pid, target.title, target.x, target.y, target.w, target.h, target.fps, target.kind, kind, lane]);
 
   return (
     <div className="screen">

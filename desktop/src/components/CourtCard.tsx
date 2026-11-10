@@ -68,7 +68,7 @@ export function CourtCard({
         </button>
       </header>
 
-      <LiveSurface target={target} kind={court.kind} active />
+      <LiveSurface target={target} kind={court.kind} lane={court.lane || undefined} active />
 
       <div className="card-body">
         {showTarget && (

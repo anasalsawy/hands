@@ -231,7 +231,8 @@ class BrowserStream(WebSocketEndpoint):
             await websocket.close(code=4401)
             return
         hub: BrowserHub = websocket.app.state.browser_hub
-        bc = await hub.broadcast(pid)
+        lane = str(websocket.query_params.get("lane") or "")[:64]
+        bc = await hub.broadcast((pid, lane) if lane else pid)
         queue = bc.attach()
         websocket.state.queue = queue
         websocket.state.bc = bc

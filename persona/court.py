@@ -51,6 +51,7 @@ import asyncio
 import json as _json
 import logging
 import os
+import base64
 import hashlib
 import time
 import uuid
@@ -900,13 +901,30 @@ class HandsDeck:
             runner = hub.runners.get(hub._key(persona_id, place, lane))
         except Exception:  # noqa: BLE001
             runner = None
-        if runner is None:
+        browser = getattr(self.mind, "browser_hub", None) if c.kind == "browser" else None
+        if runner is None and browser is None:
             self._touch(c, status="failed", error="the engine for this lane never connected")
             self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
             return
         from .tars_loop import PLAN_TOOL, run_tars_loop
 
-        schemas = [*list(getattr(runner, "tools", []) or []), PLAN_TOOL]
+        if browser is not None:
+            # A browser card drives its own lane browser (the one its surface
+            # streams), not a shell or a separate headless Chrome.
+            from .gateway.browser.tools import BrowserTools
+            schemas = [*BrowserTools(None).schemas(), PLAN_TOOL]
+        else:
+            schemas = [*list(getattr(runner, "tools", []) or []), PLAN_TOOL]
+
+        async def browser_frame() -> dict:
+            from .gateway.browser.session import read_page
+            from .gateway.browser.tools import _render_snapshot
+            one = await browser._get((persona_id, lane))
+            snap = await read_page(one.session, screenshot=True, ground=False)
+            frame = {"source": "browser", "lane": lane, "text": _render_snapshot(snap)[:4000]}
+            if snap.screenshot_png:
+                frame["image_url"] = "data:image/png;base64," + base64.b64encode(snap.screenshot_png).decode()
+            return frame
         instructions = (
             f"You are Sawii's R line {lane}, working on one computer with the tools "
             "in front of you. Do the task with real tool calls, then say in one short "
@@ -961,7 +979,9 @@ class HandsDeck:
                                       kind="tool_call", task_id=lane,
                                       payload={"tool": name, "args": str(args)[:1500],
                                                "call_id": call_id, "part": goal[:500]})
-            out = await asyncio.wait_for(hub.call(persona_id, name, args, lane=lane),
+            out = await asyncio.wait_for(
+                browser.run(persona_id, name, args, lane=lane) if browser is not None
+                else hub.call(persona_id, name, args, lane=lane),
                                          timeout=GOAL_TOOL_TIMEOUT)
             text = str(out)
             receipts.append(f"{name}: {text[:200]}")
@@ -987,7 +1007,9 @@ class HandsDeck:
             # V: pull the lane's screen and have L read it (same Persona model,
             # read-only, no tools). An unchanged screen reuses L's last read.
             c = active()
-            frame = await asyncio.wait_for(hub.observe(persona_id, place, lane=lane), timeout=3)
+            frame = await asyncio.wait_for(
+                browser_frame() if browser is not None else hub.observe(persona_id, place, lane=lane),
+                timeout=8 if browser is not None else 3)
             image = frame.get("image_url") if isinstance(frame, dict) else None
             if not image:
                 return frame

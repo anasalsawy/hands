@@ -471,6 +471,49 @@ class CourtTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("TWO", str(seen[1]), "R gets the frame captured after its action")
         self.assertEqual(len(calls), 1)
 
+    async def test_browser_card_drives_its_own_lane_browser_and_l_reads_it(self):
+        import dataclasses
+        from persona.gateway.browser.routes import BrowserHub
+        from persona.gateway.browser.session import DryRunSession
+        original = DryRunSession.snapshot
+
+        async def snapshot(self, **kwargs):
+            return dataclasses.replace(await original(self, **kwargs), screenshot_png=b"PNG-" + self.current_url.encode())
+
+        r_seen, l_seen, advertised = [], [], []
+        replies = iter([ChatResult("", [ToolCall("b1", "browser_navigate", '{"url":"https://example.com"}')]),
+                        ChatResult("Learn more")])
+
+        async def chat(messages, **kwargs):
+            if kwargs["tools"] is None:
+                l_seen.append(messages)
+                return ChatResult("Example Domain page with a Learn more link")
+            advertised.append([t["function"]["name"] for t in kwargs["tools"]])
+            r_seen.append(messages)
+            return next(replies)
+
+        async def append(pid, **kwargs):
+            pass
+
+        browser = BrowserHub(dry_run=True)
+        hub = SimpleNamespace(_key=lambda pid, place, lane: (pid, place, lane), runners={})
+        mind = SimpleNamespace(a=SimpleNamespace(chat=chat), hands=hub, links=None, bus=None,
+                               browser_hub=browser, shared_timeline=SimpleNamespace(append=append))
+        deck = HandsDeck(mind)
+        court = deck.create(7, title="web", kind="browser")
+        court.lane, court.status = "r-web", "running"
+        with patch.object(DryRunSession, "snapshot", snapshot):
+            await deck._drive(7, court.id, "r-web", "open example.com")
+        self.assertEqual(court.status, "done", court.error)
+        self.assertIn("browser_navigate", advertised[0])
+        self.assertNotIn("computer_shell", advertised[0])
+        lane_browser = browser._ones[(7, "r-web")].session
+        self.assertEqual(lane_browser.current_url, "https://example.com")
+        self.assertNotIn(7, browser._ones, "the persona's own pane browser is untouched")
+        self.assertIn("example.com", str(l_seen[0]))
+        self.assertIn("L sees: Example Domain page", str(r_seen[1]))
+        await browser.shutdown()
+
     async def test_l_vision_failure_falls_back_to_raw_frame(self):
         l_seen, img = [], "data:image/png;base64,BBBB"
         court, _, seen, _ = await self.drive([ChatResult("nothing to do")], image=img,
