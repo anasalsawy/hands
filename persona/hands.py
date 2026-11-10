@@ -160,7 +160,7 @@ class HandsHub:
 
     async def observe(self, pid: int, place: str, lane: str = "") -> dict | None:
         runner = self.runners.get(self._key(pid, place, lane))
-        if runner is None:
+        if runner is None and not lane:
             # No lane given (or no lane-bound hand): the first hand on this place.
             runner = next((r for (p, pl, _), r in self.runners.items()
                            if p == pid and pl == place), None)
@@ -168,7 +168,7 @@ class HandsHub:
             return None
         tool = place + '_ocu_get_app_state'
         if runner.last_app and tool in runner.names:
-            await self.call(pid, tool, {'app':runner.last_app})
+            await self.call(pid, tool, {'app':runner.last_app}, lane=runner.lane)
         return runner.observation
 
     @staticmethod
@@ -290,4 +290,3 @@ def hands_status(mind, pid: int) -> dict:
             "lanes": sorted({r.lane for r in rs if r.lane}),
             "host": ", ".join(f"{r.place}: {r.host}" for r in rs),
             "tools": [t["function"]["name"] for r in rs for t in r.tools]}
-

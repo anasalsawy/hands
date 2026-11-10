@@ -1,6 +1,10 @@
 # Python bytecode
 __pycache__/
 *.pyc
+*.egg-info/
+vendor/persona-lanes/build/
+node_modules/
+.browser-use-sdk/
 
 # Runtime data and databases
 data/

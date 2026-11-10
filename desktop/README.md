@@ -67,6 +67,11 @@ First launch shows the connect screen. Enter `http://127.0.0.1:8800` and the key
 
 ## Build the exe
 
+`npm run build` produces the existing UI in `dist/` with relative asset paths.
+Tauri embeds that directory directly; the Python backend is still a separate
+process. A normal browser must serve the bundle over HTTP (for example,
+`npm run preview`), since ES modules cannot load from `file://` in Chrome.
+
 ```powershell
 cd hands\desktop
 npm install

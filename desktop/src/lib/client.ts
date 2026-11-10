@@ -229,7 +229,7 @@ export const systemApi = {
       fps: target.fps ?? 6,
       exclude_self: 1,
     }),
-  browserStreamUrl: () => keyedWsUrl("/v1/browser/stream"),
+  browserStreamUrl: (lane?: string) => keyedWsUrl("/v1/browser/stream", { lane: lane || undefined }),
   voiceSocketUrl: (lane = "L") => keyedWsUrl("/v1/voice", { lane }),
   hasKey: () => Boolean(personaKey()),
 };

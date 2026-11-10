@@ -127,7 +127,8 @@ async def main() -> int:
     mind.hands = FakeHub(link)
     mind.bus = None
     # No planner lobe: divide() falls back to the goal's own punctuation, which
-    # keeps this deterministic and free.
+    # keeps this deterministic and free. Once scheduled, the R drive must fail
+    # honestly for lack of inference, not pretend that a connected hand thought.
     mind.a = None
 
     deck = HandsDeck(mind)
@@ -157,7 +158,7 @@ async def main() -> int:
         if card.lane not in opened:
             fails.append(f"card {card.id} is on lane {card.lane!r}, "
                          f"not one of the mind's lanes {opened}")
-        if card.status == "failed":
+        if card.status == "failed" and "no inference lobe" not in (card.error or ""):
             fails.append(f"card {card.id} ({card.title!r}) FAILED: {card.error}")
         if not card.lane:
             fails.append(f"card {card.id} has no lane bound at all")

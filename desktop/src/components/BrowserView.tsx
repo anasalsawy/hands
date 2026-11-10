@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { probe, systemApi, type ComputerStatus } from "../lib/client";
 import { keyedWsUrl } from "../lib/connection";
+import { frameBlob, latestFrames, paintBitmap } from "../lib/frames";
 
 export function BrowserView() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -21,6 +22,24 @@ export function BrowserView() {
   useEffect(() => {
     let alive = true;
     let sock: WebSocket | null = null;
+    let count = 0;
+    let lastUpdate = 0;
+    const renderer = latestFrames({
+      decode: (blob) => createImageBitmap(blob),
+      paint: (bitmap) => {
+        const canvas = canvasRef.current;
+        if (!alive || !canvas || sock?.readyState !== WebSocket.OPEN) return;
+        paintBitmap(canvas, bitmap);
+        count += 1;
+        const now = performance.now();
+        if (count === 1 || now - lastUpdate >= 1000) {
+          lastUpdate = now;
+          setFrames(count);
+        }
+        setNote("");
+      },
+      onError: () => setNote("invalid browser frame"),
+    });
     setFrames(0);
     setNote("");
     try {
@@ -30,16 +49,19 @@ export function BrowserView() {
       setNote("browser stream socket refused — no hub on this backend");
       return () => {
         alive = false;
+        renderer.dispose();
       };
     }
     sock.onopen = () => setConn("open");
     sock.onclose = () => {
       if (!alive) return;
+      renderer.dispose();
       setConn("closed");
       setNote("closed — the browser hub is not attached, or the session ended");
     };
     sock.onerror = () => {
       if (!alive) return;
+      renderer.dispose();
       setConn("error");
       setNote("error — no browser hub on this backend");
     };
@@ -53,27 +75,16 @@ export function BrowserView() {
       }
       if (data.type !== "frame") return;
       setMeta({ title: String(data.title || ""), url: String(data.url || "") });
-      const b64 = data.screenshot_png_b64 as string | undefined;
-      const canvas = canvasRef.current;
-      if (!b64 || !canvas) return;
-      const bin = atob(b64);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
-      void createImageBitmap(new Blob([bytes], { type: "image/png" })).then((bmp) => {
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return;
-        ctx.fillStyle = "#000";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        const scale = Math.min(canvas.width / bmp.width, canvas.height / bmp.height);
-        const dw = Math.round(bmp.width * scale);
-        const dh = Math.round(bmp.height * scale);
-        ctx.drawImage(bmp, (canvas.width - dw) / 2, (canvas.height - dh) / 2, dw, dh);
-        bmp.close();
-        if (alive) setFrames((n) => n + 1);
-      });
+      try {
+        const blob = frameBlob(data);
+        if (blob) renderer.push(blob);
+      } catch {
+        setNote("invalid browser frame");
+      }
     };
     return () => {
       alive = false;
+      renderer.dispose();
       try {
         sock?.close();
       } catch {

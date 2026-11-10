@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc -b",
+    "test": "node --experimental-strip-types --test scripts/frames.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "backend": "node scripts/backend.mjs",

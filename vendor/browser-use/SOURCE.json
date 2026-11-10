@@ -1,0 +1,10 @@
+{
+  "source": "anasalsawy/sawii-hands",
+  "source_commit": "8ef7ea602e9ad60e8a8df346e7732ec2402d57ab",
+  "upstream": "browser-use/browser-use",
+  "upstream_commit": "b49a68e4060acb226da8f784194fef301c53a6d7",
+  "patches": {
+    "browser-use-persona.patch": "801ae62525da528cb99e97d13e8f1ae25018aea88a930145c274910c019a8223",
+    "fixed-speed.patch": "b094cf408719399fa426acd1f33c88397bfd3dd9fccdbaf7cad527765063858b"
+  }
+}

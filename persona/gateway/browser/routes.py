@@ -123,6 +123,24 @@ class BrowserHub:
             log.warning("browser broadcast failed: %s", exc)
         return result
 
+    async def close_lane(self, pid, lane: str) -> bool:
+        """Close one execution lane's own browser (never the persona's pane)."""
+        if not lane:
+            return False
+        async with self._lock:
+            one = self._ones.pop((pid, lane), None)
+        if one is None:
+            return False
+        pending = one.broadcast._pending
+        if pending is not None and not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        try:
+            await one.session.close()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("browser lane close: %s", exc)
+        return True
+
     async def shutdown(self) -> None:
         if self.tasks:
             await self.tasks.close()
@@ -231,7 +249,8 @@ class BrowserStream(WebSocketEndpoint):
             await websocket.close(code=4401)
             return
         hub: BrowserHub = websocket.app.state.browser_hub
-        bc = await hub.broadcast(pid)
+        lane = str(websocket.query_params.get("lane") or "")[:64]
+        bc = await hub.broadcast((pid, lane) if lane else pid)
         queue = bc.attach()
         websocket.state.queue = queue
         websocket.state.bc = bc
