@@ -52,7 +52,7 @@ inference): `persona_prepare_next_actions` carries a confidence, possible
 outcomes (`ok`/`error` or an exact status) mapped to next actions, and an
 ordered batch whose steps each carry an `_expected_outcome`. Persona's
 `SpeculativeEngine` matches the real receipt; when it matches and confidence is
-at least 0.85, the prepared step is dispatched on the same lane immediately,
+at least Persona's speculation threshold (0.70 at its default dial), the prepared step is dispatched on the same lane immediately,
 skipping one think (at most 3 in a row, the batch stops at the first mismatch).
 Fired receipts are labelled so R verifies them against the fresh screen.
 Unmatched predictions are discarded. `SAWII_HANDS_AUTOFIRE=0` turns firing off

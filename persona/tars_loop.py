@@ -40,7 +40,6 @@ PLAN_TOOL = {"type": "function", "function": {
 
 
 FIRE_MAX = 3
-FIRE_CONFIDENCE = 0.85
 
 
 def outcome_of(result: str) -> str:
@@ -149,9 +148,14 @@ class LanePlan:
             else:
                 self._count("missed")
             self.queue = []
+        if plan:
+            self.stats["last_confidence"] = confidence
         if nxt:
+            if not (self.autofire and self.fired < FIRE_MAX
+                    and confidence >= self.engine.confidence_threshold):
+                self._count("held")
             if (self.autofire and self.fired < FIRE_MAX
-                    and confidence >= max(FIRE_CONFIDENCE, self.engine.confidence_threshold)):
+                    and confidence >= self.engine.confidence_threshold):
                 self.fire_next = {"name": nxt["name"], "arguments": nxt["arguments"]}
                 self.queue = rest
             else:

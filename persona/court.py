@@ -993,6 +993,7 @@ class HandsDeck:
                                          timeout=GOAL_TOOL_TIMEOUT)
             text = str(out)
             receipts.append(f"{name}: {text[:200]}")
+            last_action[0] = f"{name} {_json.dumps(args)[:300]} -> {text[:200]}"
             try:
                 parsed = _json.loads(text)
                 bad = isinstance(parsed, dict) and bool(parsed.get("error") or parsed.get("isError"))
@@ -1009,6 +1010,7 @@ class HandsDeck:
             return text[:8000]
 
         v_reads: dict[str, str] = {}
+        last_action = [""]
         v_next: asyncio.Task | None = None
 
         async def v_look() -> dict | None:
@@ -1031,7 +1033,9 @@ class HandsDeck:
                     seen = await asyncio.wait_for(lobe.chat([
                         {"role": "system", "content": L_VISION_PROMPT},
                         {"role": "user", "content": [
-                            {"type": "text", "text": f"Goal: {goal[:600]}\n{str(frame.get('text') or '')[:600]}"},
+                            {"type": "text", "text": (
+                                f"Goal: {goal[:600]}\nLast action: {last_action[0] or 'none yet'}\n"
+                                f"{str(frame.get('text') or '')[:600]}")},
                             {"type": "image_url", "image_url": {"url": image}}]},
                     ], tools=None, max_tokens=160, temperature=0.0), timeout=L_VISION_TIMEOUT)
                     read = str(getattr(seen, "text", "") or "").strip()
