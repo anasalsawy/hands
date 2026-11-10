@@ -263,6 +263,48 @@ class MotorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CourtTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_goal_on_listening_motor_starts_r_and_steering_reuses_loop(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        seen, calls, steered = [], [], []
+
+        async def chat(messages, **kwargs):
+            seen.append(messages)
+            if len(seen) == 1:
+                entered.set()
+                await release.wait()
+                return ChatResult("", [ToolCall("c1", "computer_click", '{"x":1}')])
+            return ChatResult("clicked with guidance")
+
+        async def call(pid, name, args, **kwargs):
+            calls.append((name, args))
+            return "receipt"
+
+        async def steer(lane, goal):
+            steered.append((lane, goal))
+
+        hub = SimpleNamespace(_key=lambda pid, place, lane: (pid, place, lane),
+                              runners={(7, "computer", "ready"): SimpleNamespace(tools=[TOOL])},
+                              call=call, observe=lambda *args, **kw: asyncio.sleep(0))
+        link = SimpleNamespace(agent=SimpleNamespace(place="computer"), steer=steer)
+        mind = SimpleNamespace(a=SimpleNamespace(chat=chat), hands=hub,
+                               links=SimpleNamespace(get=lambda name: link), bus=None)
+        deck = HandsDeck(mind)
+        court = deck.create(7, title="already started")
+        court.lane, court.link, court.status = "ready", "hands-engine", "running"
+        self.assertEqual(court.goal, "")
+        await deck.send(7, court.id, "click once")
+        self.assertEqual(len(deck._work_tasks), 1)
+        await asyncio.wait_for(entered.wait(), 10)
+        original = next(iter(deck._work_tasks))
+        await deck.send(7, court.id, "then report briefly")
+        self.assertEqual(list(deck._work_tasks), [original], "steering must not start a second loop")
+        self.assertEqual(steered, [("ready", "then report briefly")])
+        release.set()
+        await asyncio.wait_for(original, 10)
+        self.assertEqual(court.status, "done", court.error)
+        self.assertEqual(calls, [("computer_click", {"x": 1})])
+        self.assertIn("Updated user guidance for this lane: then report briefly", str(seen[1]))
+
     async def test_stop_cancels_only_own_r_task_and_never_emits_failure(self):
         stopped = asyncio.Event()
         link = SimpleNamespace()

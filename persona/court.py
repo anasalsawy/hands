@@ -166,6 +166,7 @@ class HandsDeck:
         # holds only a weak reference to a bare create_task, and a goal silently
         # vanishing mid-flight is the exact bug this deck must not repeat.
         self._work_tasks: set[asyncio.Task] = set()
+        self._send_locks: dict[str, asyncio.Lock] = {}
         # Per-persona live event fan-out (each subscriber gets its own queue).
         self._subs: dict[int, list[asyncio.Queue]] = {}
 
@@ -327,6 +328,7 @@ class HandsDeck:
         if c.worker is not None:
             self._schedule(c, self._stop_worker(c))
         self._courts.pop(court_id, None)
+        self._send_locks.pop(court_id, None)
         self.emit(c, "court.removed")
         return True
 
@@ -464,6 +466,8 @@ class HandsDeck:
         if not c.goal or not hasattr(self.mind, "lanes"):
             return []
         parts = await self._plan_parts(c.goal)
+        if c.status == "stopped" or self._courts.get(c.id) is not c:
+            return []
         if len(parts) < 2:
             return []
         # Part 1 belongs to this card; remember it so the parent does that piece
@@ -473,6 +477,8 @@ class HandsDeck:
         # The card's own lane already carries part 1; open a lane per extra part.
         opened: list[str] = []
         for topic, instruction in parts[1:]:
+            if c.status == "stopped":
+                break
             try:
                 line = await self.mind.lanes.start(persona_id, topic, instruction)
             except Exception:  # noqa: BLE001 - the first lane is still real work
@@ -725,6 +731,12 @@ class HandsDeck:
             return True
 
     async def send(self, persona_id: int, court_id: str, goal: str) -> Court:
+        if self.get(persona_id, court_id) is None:
+            raise KeyError("unknown court")
+        async with self._send_locks.setdefault(court_id, asyncio.Lock()):
+            return await self._send(persona_id, court_id, goal)
+
+    async def _send(self, persona_id: int, court_id: str, goal: str) -> Court:
         """Send a goal to a court.
 
         The design rule this honours: *the user states a goal; the mind decides
@@ -740,13 +752,23 @@ class HandsDeck:
         link, link_name = self._link_for(c)
 
         if link is not None and c.lane and self._motor_live(c):
-            # There is a real hand on the other end: this is guidance, not a start.
-            if c.status in ("running", "waiting"):
+            working = any(task.get_name() == f"court-work-{c.id}" and not task.done()
+                          for task in self._work_tasks)
+            if working:
                 try:
                     await link.steer(c.lane, goal)
                 except Exception:  # noqa: BLE001
                     log.debug("court %s steer failed", c.id, exc_info=True)
-            self.emit(c, "court.goal", goal=goal, lane=c.lane, motor="steer")
+                self.emit(c, "court.goal", goal=goal, lane=c.lane, motor="steer")
+            else:
+                # A connected motor can just be listening (Start with no goal).
+                c.meta.pop("my_part", None)
+                self._touch(c, status="running", error="")
+                await self.divide(persona_id, c)
+                if c.status in ("running", "waiting"):
+                    own = str(c.meta.get("my_part") or "").strip() or goal
+                    self._work(persona_id, c.id, c.lane, own)
+                self.emit(c, "court.goal", goal=goal, lane=c.lane, motor="reuse")
             return c
 
         if link is not None:
@@ -890,6 +912,7 @@ class HandsDeck:
         last_tool_error = ""
         names = {tool["function"]["name"] for tool in schemas}
         steps = 0
+        initial_goal = c.goal
 
         def active() -> Court:
             c = self.get(persona_id, court_id)
@@ -904,6 +927,9 @@ class HandsDeck:
             c.meta["steps"] = steps
             if steps > MAX_LANE_STEPS:
                 raise RuntimeError("lane step limit reached")
+            if c.goal and c.goal != initial_goal:
+                messages = [*messages, {"role": "user", "content":
+                            "Updated user guidance for this lane: " + c.goal[:4000]}]
             reply = await asyncio.wait_for(
                 lobe.chat(messages, tools=schemas or None, max_tokens=700, temperature=0.2),
                 timeout=GOAL_STEP_TIMEOUT)
