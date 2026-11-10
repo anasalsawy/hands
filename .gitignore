@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 node_modules/
+.browser-use-sdk/
 
 # Runtime data and databases
 data/

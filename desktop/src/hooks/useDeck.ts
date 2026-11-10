@@ -3,14 +3,8 @@
 // stuck if the socket drops (dev reloads, backend restarts, proxy hiccups).
 import { useCallback, useEffect, useRef, useState } from "react";
 import { courtsApi, type Court, type CourtEvent, type DeckSnapshot } from "../lib/client";
-
-export interface DeckLogRow {
-  id: string;
-  at: number;
-  kind: string;
-  courtId: string;
-  text: string;
-}
+import { appendDeckEvent, type DeckLogRow } from "../lib/deckLog";
+export type { DeckLogRow } from "../lib/deckLog";
 
 export type LinkState = "connecting" | "live" | "down";
 
@@ -25,32 +19,6 @@ export interface DeckState {
   apply: (court: Court) => void;
 }
 
-const MAX_LOG = 60;
-
-function describe(ev: CourtEvent): string {
-  const c = ev.court;
-  switch (ev.kind) {
-    case "court.created":
-      return `card created · ${c.title}`;
-    case "court.removed":
-      return `card removed · ${c.title}`;
-    case "court.spawned":
-      return `instance started · ${c.title} · ${ev.motor || "link"}${ev.lane ? ` · ${ev.lane}` : ""}`;
-    case "court.attached":
-      return `bound ${ev.lane || "lane"} · ${c.title}`;
-    case "court.goal":
-      return `goal sent · ${c.title}`;
-    case "court.cancelled":
-      return `stopped · ${c.title}`;
-    case "court.voice":
-      return `voice ${ev.action || ""} · ${c.title}`;
-    case "court.status":
-      return `${ev.status || ""} · ${c.title}${ev.error ? ` · ${ev.error}` : ""}`;
-    default:
-      return `${ev.kind} · ${c?.title ?? ""}`;
-  }
-}
-
 export function useDeck(): DeckState {
   const [courts, setCourts] = useState<Court[]>([]);
   const [snapshot, setSnapshot] = useState<DeckSnapshot | null>(null);
@@ -62,18 +30,7 @@ export function useDeck(): DeckState {
 
   const pushLog = useCallback((ev: CourtEvent) => {
     seq.current += 1;
-    setLog((rows) =>
-      [
-        {
-          id: `${Date.now()}-${seq.current}`,
-          at: (ev.at || Date.now() / 1000) * 1000,
-          kind: ev.kind,
-          courtId: ev.court?.id || "",
-          text: describe(ev),
-        },
-        ...rows,
-      ].slice(0, MAX_LOG),
-    );
+    setLog(appendDeckEvent(ev, seq.current));
   }, []);
 
   const apply = useCallback((court: Court) => {

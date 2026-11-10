@@ -90,14 +90,27 @@ npm ci --prefix desktop
 python -m pip install -r scripts/requirements-test.txt  # offline checks/local server dependencies
 ```
 
+For browser surfaces, also install the exact edited Browser-Use SDK (Python
+3.11+, Git and Chrome required):
+
+```bash
+python scripts/install_browser_sdk.py
+```
+
+This restores the pinned Persona patches, not stock browser-use. See
+`vendor/browser-use/README.md`. Desktop capture itself requires Windows;
+browser capture is a separate cross-platform surface.
+
 **Local mode** (Persona plus lane-bound engine processes):
 
 ```bash
-python stitch.py local --root ~/Projects --deepinfra-key YOUR_KEY --port 8800
+python stitch.py local --root ~/Projects --port 8800 --approve auto
 ```
 
-`--deepinfra-key` is **Persona's** key (the mind). It seeds `DEEPINFRA_API_KEY` for the
-L/R lobes in `persona/llm.py`. The engine never sees it and needs no key of its own.
+Set Persona's configured provider key in the backend environment
+(`SAWII_FEATHERLESS_API_KEY` for the default Featherless provider). The optional
+`--deepinfra-key` flag is for explicitly configured DeepInfra lobes, not a
+second engine model. The engine never sees provider keys and needs none of its own.
 
 **Remote mode** (connect to an existing Persona server):
 

@@ -1,9 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { frameBlob, latestFrames } from "../src/lib/frames.ts";
+import { appendDeckEvent } from "../src/lib/deckLog.ts";
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const frame = (id) => new Blob([String(id)]);
+
+test("batched deck events capture distinct keys before React runs state updaters", () => {
+  const event = { kind: "court.status", at: 1, court: { id: "a", title: "A" }, status: "running" };
+  const pending = Array.from({ length: 100 }, (_, i) => appendDeckEvent(event, i));
+  const apply = () => pending.reduce((rows, update) => update(rows), []);
+  const rows = apply();
+  assert.equal(rows.length, 60);
+  assert.equal(new Set(rows.map(row => row.id)).size, 60);
+  assert.deepEqual(apply(), rows, "StrictMode updater replay must be pure");
+  assert.ok(rows[0].id.endsWith("-99"));
+  assert.ok(rows[59].id.endsWith("-40"));
+  assert.equal(rows[0].at, 1000);
+});
 
 function harness() {
   const decodes = [];
