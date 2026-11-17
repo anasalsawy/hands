@@ -39,6 +39,7 @@ jobs:
       - run: python scripts/engine_no_llm_guard.py
       - run: python scripts/court_selftest.py
       - run: python scripts/court_http_selftest.py
+      - run: python scripts/shared_mind_selftest.py
       - run: python scripts/split_engines_selftest.py
       - run: python scripts/run_checks.py
       - run: npm test --prefix desktop

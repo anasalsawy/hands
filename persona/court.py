@@ -48,6 +48,7 @@ Event kinds (typed; a client switches on ``kind``):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json as _json
 import logging
 import os
@@ -175,6 +176,7 @@ class HandsDeck:
         # vanishing mid-flight is the exact bug this deck must not repeat.
         self._work_tasks: set[asyncio.Task] = set()
         self._send_locks: dict[str, asyncio.Lock] = {}
+        self._shared = None   # shared-mind client, when SAWII_SHARED_MIND_URL is set
         # Per-persona live event fan-out (each subscriber gets its own queue).
         self._subs: dict[int, list[asyncio.Queue]] = {}
 
@@ -473,8 +475,14 @@ class HandsDeck:
         The card's own lane keeps part 1 and is driven with ONLY that part: if
         it were handed the whole goal, the parent and the new lane would both do
         every part and the same file would be written twice.
+
+        A browser card on the shared mind is not divided here: its hands split
+        the goal between themselves inside one task.
         """
         if not c.goal or not hasattr(self.mind, "lanes"):
+            return []
+        from . import shared_mind
+        if c.kind == "browser" and shared_mind.enabled():
             return []
         parts = await self._plan_parts(c.goal)
         if c.status == "stopped" or self._courts.get(c.id) is not c:
@@ -762,6 +770,13 @@ class HandsDeck:
             raise KeyError("unknown court")
         c.goal = goal
         c.updated_at = _now()
+        tid = c.meta.get("shared_tid")
+        if tid and self._shared is not None and any(
+                task.get_name() == f"court-work-{c.id}" and not task.done() for task in self._work_tasks):
+            # The live task takes the new guidance; its hands keep their work.
+            await self._shared.steer(tid, goal)
+            self.emit(c, "court.goal", goal=goal, lane=c.lane, motor="steer")
+            return c
         link, link_name = self._link_for(c)
 
         if link is not None and c.lane and self._motor_live(c):
@@ -889,6 +904,11 @@ class HandsDeck:
 
     async def _drive(self, persona_id: int, court_id: str, lane: str, goal: str) -> None:
         """The R loop for one lane: think, call this lane's hand, read, repeat."""
+        c = self.get(persona_id, court_id)
+        from . import shared_mind
+        if (c is not None and c.kind == "browser" and shared_mind.enabled()
+                and getattr(self.mind, "browser_hub", None) is not None):
+            return await self._drive_shared(persona_id, c, lane, goal)
         hub = getattr(self.mind, "hands", None)
         lobe = getattr(self.mind, "a", None)
         c = self.get(persona_id, court_id)
@@ -1094,6 +1114,113 @@ class HandsDeck:
             c.meta["result"] = said[:500]
             self._touch(c, status="failed" if last_tool_error else "done", error=last_tool_error)
             self.emit(c, "court.status", status=c.status, error=c.error, lane=lane, result=said[:300])
+            await self._retire(persona_id, c, lane)
+
+    async def _drive_shared(self, persona_id: int, c: Court, lane: str, goal: str) -> None:
+        """A browser card as one shared-mind task: its hands share one tab and one mind."""
+        from . import shared_mind
+        from .gateway.browser.session import read_page
+
+        browser = self.mind.browser_hub
+        if self._shared is None:
+            self._shared = shared_mind.SharedMindClient(os.environ["SAWII_SHARED_MIND_URL"])
+        court_id = c.id
+
+        def active() -> Court:
+            c = self.get(persona_id, court_id)
+            if c is None or c.status == "stopped":
+                raise asyncio.CancelledError
+            return c
+
+        one = await browser._get((persona_id, lane))
+
+        async def run_tool(name: str, args: dict) -> str:
+            active()
+            out = str(await asyncio.wait_for(browser.run(persona_id, name, args, lane=lane),
+                                             timeout=GOAL_TOOL_TIMEOUT))
+            c.meta["last_tools"] = [*c.meta.get("last_tools", [])[-2:], f"{name}: {out[:200]}"]
+            return out
+
+        async def read():
+            return await read_page(one.session, screenshot=False)
+
+        page = getattr(one.session, "_page", None)
+        native = getattr(one.session, "native", None)
+
+        async def cdp(method: str, params: dict) -> dict:
+            session = await native.get_or_create_cdp_session(focus=False)
+            domain, name = method.split(".")
+            send = getattr(getattr(session.cdp_client.send, domain), name)
+            return await send(params=params, session_id=session.session_id)
+
+        async def find(needle: str) -> list[str]:
+            if page is not None:
+                return await page.evaluate(shared_mind.FIND_JS, needle)
+            r = await cdp("Runtime.evaluate", {"expression": f"({shared_mind.FIND_JS})({_json.dumps(needle)})",
+                                               "returnByValue": True})
+            return list(r.get("result", {}).get("value") or [])
+
+        async def press_enter() -> None:
+            if page is not None:
+                await page.keyboard.press("Enter")
+                with contextlib.suppress(Exception):
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                return
+            key = {"key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13}
+            await cdp("Input.dispatchKeyEvent", {"type": "keyDown", "text": "\r", **key})
+            await cdp("Input.dispatchKeyEvent", {"type": "keyUp", **key})
+            await asyncio.sleep(0.8)
+
+        async def evaluate(expr: str):
+            if page is not None:
+                return await page.evaluate(expr)
+            r = await cdp("Runtime.evaluate", {"expression": expr, "returnByValue": True, "awaitPromise": True})
+            if r.get("exceptionDetails"):
+                raise RuntimeError(str(r["exceptionDetails"].get("text") or "evaluate failed")[:200])
+            return r.get("result", {}).get("value")
+
+        can = page is not None or native is not None
+        tab = shared_mind.TabHands(run_tool, read, find if can else None, press_enter if can else None,
+                                   evaluate if can else None)
+
+        def on_task(tid: str) -> None:
+            c.meta["shared_tid"] = tid
+
+        def on_event(ev: dict) -> None:
+            if ev["type"] in ("step", "act", "rejected"):
+                self.emit(c, "court.hand", lane=lane, hand=ev.get("name"), event=ev["type"],
+                          tool=ev.get("tool"), text=str(ev.get("text") or "")[-300:])
+
+        c.meta["agent_loop"] = "shared-mind"
+        try:
+            done = await shared_mind.drive(
+                self._shared, goal[:4000], tab,
+                hands=int(c.meta.get("hands") or os.getenv("SAWII_SHARED_MIND_HANDS", "2")),
+                on_event=on_event, on_task=on_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a dead task must be reported
+            c = self.get(persona_id, court_id)
+            if c is not None and c.status != "stopped":
+                self._touch(c, status="failed", error=f"shared mind failed ({type(exc).__name__}: {exc})"[:300])
+                self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
+            return
+        acts = [t["act_to_act"] for t in done["timings"] if t.get("act_to_act")]
+        c.meta["actions"] = len(done["timings"])
+        if acts:
+            c.meta["act_to_act_median"] = sorted(acts)[len(acts) // 2]
+        for key in ("think_secs", "tool_secs"):
+            vals = sorted(t[key] for t in done["timings"] if t.get(key) is not None)
+            if vals:
+                c.meta[key.replace("_secs", "_median")] = vals[len(vals) // 2]
+        c = self.get(persona_id, court_id)
+        if c is not None and c.status in ("running", "waiting"):
+            answer = str(done.get("answer") or "")
+            c.meta["result"] = answer[:500]
+            failed = done.get("cancelled") or not answer.strip()
+            self._touch(c, status="failed" if failed else "done",
+                        error="the task ended without an answer" if failed else "")
+            self.emit(c, "court.status", status=c.status, error=c.error, lane=lane, result=answer[:300])
             await self._retire(persona_id, c, lane)
 
     # ───────────────────────────────────────────────────────────── voice hooks
