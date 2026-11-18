@@ -1,5 +1,5 @@
 // The deck: one card per Court, plus the controls that act on the whole deck.
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import { courtsApi, type Court, type CourtKind } from "../lib/client";
 import type { DeckState } from "../hooks/useDeck";
 import { CourtCard } from "./CourtCard";
@@ -15,6 +15,9 @@ export function DeckView({ deck }: { deck: DeckState }) {
   const [busy, setBusy] = useState<Record<string, Busy>>({});
   const [error, setError] = useState("");
   const [creating, setCreating] = useState(false);
+  const cardCount = deck.courts.length;
+  // A create error (e.g. the card limit) is stale once the deck changes size.
+  useEffect(() => setError(""), [cardCount]);
 
   const errors = useMemo(() => {
     const rows: string[] = [];

@@ -33,6 +33,36 @@ Each delegated R-lane gets its own engine instance. The **Link** adapter connect
 
 The UI, the voice orb, the phone dialer, and the sketchboards attach around that. Do not rebuild any component. Do not edit Persona mind logic.
 
+### Omni-TARS loop, Persona mind
+
+Court work runs the **vendored Omni-TARS `ComposableAgent` / `AgentComposer`**
+used by ByteDance's UI-TARS-2 integration, not the legacy GUI-agent V1 selector.
+`engine/persona-loop.ts` composes a Hands tool/observation plugin into that loop.
+Its injected LLM client sends every decision over private stdio to this lane's
+existing Persona R lobe. It has no model endpoint or provider credentials.
+Tools return through the same channel to `HandsHub`, always with the explicit
+lane. Mutations on one surface are ordered; separate lanes remain concurrent.
+
+Fresh lane observations (including images) accompany each decision. Old images
+do not accumulate in history. Read-only multi-surface perception for L is
+concurrent and timeout-bounded independently of these execution loops.
+
+Persona sends its own spec in the **same reply** as the hand call (no extra
+inference): `persona_prepare_next_actions` carries a confidence, possible
+outcomes (`ok`/`error` or an exact status) mapped to next actions, and an
+ordered batch whose steps each carry an `_expected_outcome`. Persona's
+`SpeculativeEngine` matches the real receipt; when it matches and confidence is
+at least Persona's speculation threshold (0.70 at its default dial), the prepared step is dispatched on the same lane immediately,
+skipping one think (at most 3 in a row, the batch stops at the first mismatch).
+Fired receipts are labelled so R verifies them against the fresh screen.
+Unmatched predictions are discarded. `SAWII_HANDS_AUTOFIRE=0` turns firing off
+(matched steps then return as advice only). Estimates are model-supplied, not
+calibrated probabilities.
+
+This reuses the UI-TARS-2 **agent architecture**, not its model weights. Any
+model remains configured in Persona; no UI-TARS-1/1.5 model is substituted.
+See `engine/PROVENANCE.md` for the exact upstream seam and dependency caveat.
+
 ## The courts (the element layer)
 
 The product is built around **cards**, and each card hosts a **live desktop instance**. Many run at once — *the courts*. That layer is UI-agnostic: `persona/court.py` (`HandsDeck`) is the headless controller, and any front end binds to it over the same typed wire.
@@ -56,15 +86,35 @@ The deck is mounted by the real app (`persona/api/app.py`, `SAWII_COURTS=1`, def
 
 ## Quick start
 
-**Local mode** (Persona + engine in one process):
+Install Node.js 22+ (24 recommended), then the loop and desktop dependencies:
 
 ```bash
-pip install -r persona/requirements.txt  # if present, or install starlette uvicorn httpx
-python stitch.py local --root ~/Projects --deepinfra-key YOUR_KEY --port 8800
+npm ci --prefix engine
+npm ci --prefix desktop
+python -m pip install -r scripts/requirements-test.txt  # offline checks/local server dependencies
 ```
 
-`--deepinfra-key` is **Persona's** key (the mind). It seeds `DEEPINFRA_API_KEY` for the
-L/R lobes in `persona/llm.py`. The engine never sees it and needs no key of its own.
+For browser surfaces, also install the exact edited Browser-Use SDK (Python
+3.11+, Git and Chrome required):
+
+```bash
+python scripts/install_browser_sdk.py
+```
+
+This restores the pinned Persona patches, not stock browser-use. See
+`vendor/browser-use/README.md`. Desktop capture itself requires Windows;
+browser capture is a separate cross-platform surface.
+
+**Local mode** (Persona plus lane-bound engine processes):
+
+```bash
+python stitch.py local --root ~/Projects --port 8800 --approve auto
+```
+
+Set Persona's configured provider key in the backend environment
+(`SAWII_FEATHERLESS_API_KEY` for the default Featherless provider). The optional
+`--deepinfra-key` flag is for explicitly configured DeepInfra lobes, not a
+second engine model. The engine never sees provider keys and needs none of its own.
 
 **Remote mode** (connect to an existing Persona server):
 
@@ -101,7 +151,23 @@ python scripts/run_checks.py
 
 # 4. the front end builds (from ui/webview/)
 npm run typecheck && npm run build
+
+# 5. production desktop shell + bounded frame renderer
+npm test --prefix desktop
+npm run typecheck --prefix desktop
+npm run build --prefix desktop
+
+# 6. real Omni-TARS loop + scripted inference/tools; no network/key required
+python scripts/tars_loop_selftest.py
+python scripts/speed_selftest.py
+python scripts/engine_no_llm_guard.py
+python scripts/split_engines_selftest.py
 ```
+
+GitHub Actions runs the regression suite on Linux and Windows, and builds
+NSIS/MSI installers as `Hands-Windows-installers`. The installer embeds the UI;
+Persona and its Node/Python runtime still run separately. A successful installer
+build is not proof of live Windows GUI automation or model/vision quality.
 
 ## stitch.py
 

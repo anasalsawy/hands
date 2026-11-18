@@ -48,9 +48,12 @@ Event kinds (typed; a client switches on ``kind``):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json as _json
 import logging
 import os
+import base64
+import hashlib
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -78,6 +81,12 @@ MAX_SPLIT_PARTS = max(1, int(os.environ.get("SAWII_MAX_SPLIT_PARTS", "4")))
 # How much work one R line may take on its own card before it must report.
 MAX_LANE_STEPS = max(1, int(os.environ.get("SAWII_MAX_LANE_STEPS", "8")))
 GOAL_STEP_TIMEOUT = float(os.environ.get("SAWII_GOAL_STEP_TIMEOUT", "90"))
+L_VISION_TIMEOUT = float(os.environ.get("SAWII_L_VISION_TIMEOUT", "12"))
+L_VISION_PROMPT = (
+    "You are Persona's L side looking at one R lane's current screen. You do not act. "
+    "In at most 4 short lines say what is actually visible that matters for the goal: "
+    "page/app state, key controls or text, errors, and whether the last action seems to "
+    "have worked. Say 'unclear' instead of guessing.")
 # A tool with no answer in this long means the hand went quiet: report it.
 GOAL_TOOL_TIMEOUT = float(os.environ.get("SAWII_GOAL_TOOL_TIMEOUT", "300"))
 
@@ -166,6 +175,8 @@ class HandsDeck:
         # holds only a weak reference to a bare create_task, and a goal silently
         # vanishing mid-flight is the exact bug this deck must not repeat.
         self._work_tasks: set[asyncio.Task] = set()
+        self._send_locks: dict[str, asyncio.Lock] = {}
+        self._shared = None   # shared-mind client, when SAWII_SHARED_MIND_URL is set
         # Per-persona live event fan-out (each subscriber gets its own queue).
         self._subs: dict[int, list[asyncio.Queue]] = {}
 
@@ -326,7 +337,11 @@ class HandsDeck:
         # Stop the worker if we own one, but never block the caller on it.
         if c.worker is not None:
             self._schedule(c, self._stop_worker(c))
+        browser = getattr(self.mind, "browser_hub", None)
+        if c.kind == "browser" and c.lane and hasattr(browser, "close_lane"):
+            self._schedule(c, browser.close_lane(persona_id, c.lane))
         self._courts.pop(court_id, None)
+        self._send_locks.pop(court_id, None)
         self.emit(c, "court.removed")
         return True
 
@@ -460,10 +475,18 @@ class HandsDeck:
         The card's own lane keeps part 1 and is driven with ONLY that part: if
         it were handed the whole goal, the parent and the new lane would both do
         every part and the same file would be written twice.
+
+        A browser card on the shared mind is not divided here: its hands split
+        the goal between themselves inside one task.
         """
         if not c.goal or not hasattr(self.mind, "lanes"):
             return []
+        from . import shared_mind
+        if c.kind == "browser" and shared_mind.enabled():
+            return []
         parts = await self._plan_parts(c.goal)
+        if c.status == "stopped" or self._courts.get(c.id) is not c:
+            return []
         if len(parts) < 2:
             return []
         # Part 1 belongs to this card; remember it so the parent does that piece
@@ -473,6 +496,8 @@ class HandsDeck:
         # The card's own lane already carries part 1; open a lane per extra part.
         opened: list[str] = []
         for topic, instruction in parts[1:]:
+            if c.status == "stopped":
+                break
             try:
                 line = await self.mind.lanes.start(persona_id, topic, instruction)
             except Exception:  # noqa: BLE001 - the first lane is still real work
@@ -627,12 +652,20 @@ class HandsDeck:
         return _died
 
     async def _stop_worker(self, c: Court) -> None:
+        own = [task for task in self._work_tasks
+               if task.get_name() == f"court-work-{c.id}" and task is not asyncio.current_task()]
+        for task in own:
+            task.cancel()
+        if own:
+            await asyncio.gather(*own, return_exceptions=True)
         links = getattr(self.mind, "links", None)
         link = links.get(c.link) if links and hasattr(links, "get") and c.link else None
         if link is not None and c.lane:
             try:
                 await link.stop(c.lane)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                self._touch(c, status="failed", error=f"could not stop engine: {exc}"[:300])
+                self.emit(c, "court.status", status=c.status, error=c.error)
                 log.debug("court %s worker stop failed", c.id, exc_info=True)
         c.worker = None
 
@@ -719,6 +752,12 @@ class HandsDeck:
             return True
 
     async def send(self, persona_id: int, court_id: str, goal: str) -> Court:
+        if self.get(persona_id, court_id) is None:
+            raise KeyError("unknown court")
+        async with self._send_locks.setdefault(court_id, asyncio.Lock()):
+            return await self._send(persona_id, court_id, goal)
+
+    async def _send(self, persona_id: int, court_id: str, goal: str) -> Court:
         """Send a goal to a court.
 
         The design rule this honours: *the user states a goal; the mind decides
@@ -731,16 +770,33 @@ class HandsDeck:
             raise KeyError("unknown court")
         c.goal = goal
         c.updated_at = _now()
+        tid = c.meta.get("shared_tid")
+        if tid and self._shared is not None and any(
+                task.get_name() == f"court-work-{c.id}" and not task.done() for task in self._work_tasks):
+            # The live task takes the new guidance; its hands keep their work.
+            await self._shared.steer(tid, goal)
+            self.emit(c, "court.goal", goal=goal, lane=c.lane, motor="steer")
+            return c
         link, link_name = self._link_for(c)
 
         if link is not None and c.lane and self._motor_live(c):
-            # There is a real hand on the other end: this is guidance, not a start.
-            if c.status in ("running", "waiting"):
+            working = any(task.get_name() == f"court-work-{c.id}" and not task.done()
+                          for task in self._work_tasks)
+            if working:
                 try:
                     await link.steer(c.lane, goal)
                 except Exception:  # noqa: BLE001
                     log.debug("court %s steer failed", c.id, exc_info=True)
-            self.emit(c, "court.goal", goal=goal, lane=c.lane, motor="steer")
+                self.emit(c, "court.goal", goal=goal, lane=c.lane, motor="steer")
+            else:
+                # A connected motor can just be listening (Start with no goal).
+                c.meta.pop("my_part", None)
+                self._touch(c, status="running", error="")
+                await self.divide(persona_id, c)
+                if c.status in ("running", "waiting"):
+                    own = str(c.meta.get("my_part") or "").strip() or goal
+                    self._work(persona_id, c.id, c.lane, own)
+                self.emit(c, "court.goal", goal=goal, lane=c.lane, motor="reuse")
             return c
 
         if link is not None:
@@ -773,6 +829,7 @@ class HandsDeck:
         c = self.get(persona_id, court_id)
         if c is None:
             return None
+        self._touch(c, status="stopped", error="")
         await self._stop_worker(c)
         lanes = getattr(self.mind, "lanes", None)
         if lanes is not None and c.lane and hasattr(lanes, "stop"):
@@ -782,7 +839,6 @@ class HandsDeck:
                     await maybe
             except Exception:  # noqa: BLE001
                 log.debug("court %s lane stop failed", c.id, exc_info=True)
-        self._touch(c, status="stopped")
         self.emit(c, "court.cancelled")
         if forget:
             return c if self.remove(persona_id, court_id) else c
@@ -848,6 +904,11 @@ class HandsDeck:
 
     async def _drive(self, persona_id: int, court_id: str, lane: str, goal: str) -> None:
         """The R loop for one lane: think, call this lane's hand, read, repeat."""
+        c = self.get(persona_id, court_id)
+        from . import shared_mind
+        if (c is not None and c.kind == "browser" and shared_mind.enabled()
+                and getattr(self.mind, "browser_hub", None) is not None):
+            return await self._drive_shared(persona_id, c, lane, goal)
         hub = getattr(self.mind, "hands", None)
         lobe = getattr(self.mind, "a", None)
         c = self.get(persona_id, court_id)
@@ -863,16 +924,40 @@ class HandsDeck:
             runner = hub.runners.get(hub._key(persona_id, place, lane))
         except Exception:  # noqa: BLE001
             runner = None
-        if runner is None:
+        browser = getattr(self.mind, "browser_hub", None) if c.kind == "browser" else None
+        if runner is None and browser is None:
             self._touch(c, status="failed", error="the engine for this lane never connected")
             self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
             return
-        schemas = list(getattr(runner, "tools", []) or [])
-        msgs = [{"role": "system", "content": (
+        from .tars_loop import PLAN_NAME, PLAN_TOOL, run_tars_loop
+
+        if browser is not None:
+            # A browser card drives its own lane browser (the one its surface
+            # streams), not a shell or a separate headless Chrome.
+            from .gateway.browser.tools import BrowserTools
+            schemas = [*BrowserTools(None).schemas(), PLAN_TOOL]
+        else:
+            schemas = [*list(getattr(runner, "tools", []) or []), PLAN_TOOL]
+
+        async def browser_frame() -> dict:
+            from .gateway.browser.session import read_page
+            from .gateway.browser.tools import _render_snapshot
+            one = await browser._get((persona_id, lane))
+            snap = await read_page(one.session, screenshot=True, ground=False)
+            frame = {"source": "browser", "lane": lane, "text": _render_snapshot(snap)[:4000]}
+            if snap.screenshot_png:
+                frame["image_url"] = "data:image/png;base64," + base64.b64encode(snap.screenshot_png).decode()
+            return frame
+        instructions = (
             f"You are Sawii's R line {lane}, working on one computer with the tools "
             "in front of you. Do the task with real tool calls, then say in one short "
-            "line what you actually did. Never claim a tool ran unless it did."
-        )}, {"role": "user", "content": goal[:4000]}]
+            "line what you actually did. Never claim a tool ran unless it did. "
+            f"When the next step depends on what a hand call returns, put {PLAN_NAME} "
+            "first in the same batch as that call: give your confidence and the likely "
+            "outcomes (ok/error or exact status) mapped to the next action, plus an "
+            "ordered batch with each step's _expected_outcome. A step whose outcome the "
+            "real receipt matches fires at once when you are confident; verify it after."
+        )
         receipts: list[str] = []
         # The last tool-level failure this lane saw, and whether anything
         # succeeded after it. A goal whose hand died mid-flight must end
@@ -880,76 +965,263 @@ class HandsDeck:
         # reading "done" over work that never ran is the exact lie this deck
         # exists to prevent. A recovery (error, then a good call) clears it.
         last_tool_error = ""
-        for _step in range(MAX_LANE_STEPS):
+        names = {tool["function"]["name"] for tool in schemas}
+        steps = 0
+        initial_goal = c.goal
+
+        def active() -> Court:
             c = self.get(persona_id, court_id)
             if c is None or c.status == "stopped":
-                return
+                raise asyncio.CancelledError
+            return c
+
+        async def infer(messages: list[dict]) -> dict:
+            nonlocal steps
+            c = active()
+            steps += 1
+            c.meta["steps"] = steps
+            if steps > MAX_LANE_STEPS:
+                raise RuntimeError("lane step limit reached")
+            if c.goal and c.goal != initial_goal:
+                messages = [*messages, {"role": "user", "content":
+                            "Updated user guidance for this lane: " + c.goal[:4000]}]
+            reply = await asyncio.wait_for(
+                lobe.chat(messages, tools=schemas or None, max_tokens=700, temperature=0.2),
+                timeout=GOAL_STEP_TIMEOUT)
+            calls = []
+            for tc in getattr(reply, "tool_calls", None) or []:
+                args = _json.loads(tc.arguments or "{}")
+                if tc.name not in names or not isinstance(args, dict):
+                    raise RuntimeError("R requested an unadvertised tool or invalid arguments")
+                calls.append({"id": tc.id, "name": tc.name, "arguments": args})
+            return {"text": getattr(reply, "text", "") or "", "tool_calls": calls,
+                    "finish_reason": getattr(reply, "finish_reason", "stop")}
+
+        async def execute(name: str, args: dict) -> str:
+            nonlocal last_tool_error
+            c = active()
+            timeline = getattr(self.mind, "shared_timeline", None)
+            call_id = f"{lane}:{len(receipts) + 1}"
+            if timeline is not None:
+                await timeline.append(persona_id, producer=c.meta.get("lane_label") or lane,
+                                      kind="tool_call", task_id=lane,
+                                      payload={"tool": name, "args": str(args)[:1500],
+                                               "call_id": call_id, "part": goal[:500]})
+            out = await asyncio.wait_for(
+                browser.run(persona_id, name, args, lane=lane) if browser is not None
+                else hub.call(persona_id, name, args, lane=lane),
+                                         timeout=GOAL_TOOL_TIMEOUT)
+            text = str(out)
+            receipts.append(f"{name}: {text[:200]}")
+            last_action[0] = f"{name} {_json.dumps(args)[:300]} -> {text[:200]}"
             try:
-                reply = await asyncio.wait_for(
-                    lobe.chat(msgs, tools=schemas or None, max_tokens=700, temperature=0.2),
-                    timeout=GOAL_STEP_TIMEOUT)
-            except Exception as exc:  # noqa: BLE001 - a dead mind must be reported
-                self._touch(c, status="failed",
-                            error=f"R could not think ({type(exc).__name__}: {exc})"[:300])
-                self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
-                return
-            calls = list(getattr(reply, "tool_calls", None) or [])
-            if not calls:
-                said = str(getattr(reply, "text", "") or "").strip()
-                c.meta["result"] = said[:500]
-                if last_tool_error:
-                    self._touch(c, status="failed", error=last_tool_error)
-                    self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
-                    await self._retire(persona_id, c, lane)
-                    return
-                self._touch(c, status="done", error="")
-                self.emit(c, "court.status", status="done", lane=lane, result=said[:300])
-                await self._retire(persona_id, c, lane)
-                return
-            msgs.append({"role": "assistant", "content": getattr(reply, "text", "") or None,
-                         "tool_calls": [{"id": tc.id, "type": "function",
-                                         "function": {"name": tc.name, "arguments": tc.arguments}}
-                                        for tc in calls]})
-            for tc in calls:
-                try:
-                    args = _json.loads(tc.arguments or "{}")
-                except ValueError:
-                    args = {}
-                try:
-                    # Addressed to THIS lane's hand, so two lanes never share a
-                    # tool. A hand that dies mid-call raises here — the card must
-                    # say so, not let the exception kill the loop in silence.
-                    out = await asyncio.wait_for(
-                        hub.call(persona_id, tc.name, args, lane=lane),
-                        timeout=GOAL_TOOL_TIMEOUT)
-                except Exception as exc:  # noqa: BLE001
-                    c = self.get(persona_id, court_id)
-                    if c is not None:
-                        self._touch(c, status="failed",
-                                    error=f"{tc.name} did not come back "
-                                          f"({type(exc).__name__}: {exc})"[:300])
-                        self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
-                    return
-                text = str(out)
-                receipts.append(f"{tc.name}: {text[:200]}")
-                # The hub answers a dead hand with an {"error": ...} body rather
-                # than raising. Record it, and clear it only when a later call
-                # on this lane actually works.
-                try:
-                    parsed = _json.loads(text)
-                    bad = isinstance(parsed, dict) and bool(parsed.get("error"))
-                    last_tool_error = (str(parsed.get("error"))[:300] if bad
-                                       else "")
-                except ValueError:
-                    last_tool_error = ""
-                msgs.append({"role": "tool", "tool_call_id": tc.id, "name": tc.name,
-                             "content": text[:8000]})
+                parsed = _json.loads(text)
+                bad = isinstance(parsed, dict) and bool(parsed.get("error") or parsed.get("isError"))
+                last_tool_error = str(parsed.get("error") or "tool failed")[:300] if bad else ""
+            except ValueError:
+                last_tool_error = ""
             c.meta["last_tools"] = receipts[-3:]
+            if timeline is not None:
+                await timeline.append(persona_id, producer=c.meta.get("lane_label") or lane,
+                                      kind="tool_result", task_id=lane,
+                                      payload={"tool": name, "call_id": call_id, "part": goal[:500],
+                                               "result": {"text": text[:2000]}})
+            v_prefetch()
+            return text[:8000]
+
+        v_reads: dict[str, str] = {}
+        last_action = [""]
+        v_next: asyncio.Task | None = None
+
+        async def v_look() -> dict | None:
+            # V: pull the lane's screen and have L read it (same Persona model,
+            # read-only, no tools). An unchanged screen reuses L's last read.
+            c = active()
+            frame = await asyncio.wait_for(
+                browser_frame() if browser is not None else hub.observe(persona_id, place, lane=lane),
+                timeout=8 if browser is not None else 3)
+            image = frame.get("image_url") if isinstance(frame, dict) else None
+            if not image:
+                return frame
+            key = hashlib.sha1(str(image).encode()).hexdigest()
+            read = v_reads.get(key, "")
+            started = time.monotonic()
+            if read:
+                c.meta["l_vision_reused"] = int(c.meta.get("l_vision_reused", 0)) + 1
+            else:
+                try:
+                    seen = await asyncio.wait_for(lobe.chat([
+                        {"role": "system", "content": L_VISION_PROMPT},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": (
+                                f"Goal: {goal[:600]}\nLast action: {last_action[0] or 'none yet'}\n"
+                                f"{str(frame.get('text') or '')[:600]}")},
+                            {"type": "image_url", "image_url": {"url": image}}]},
+                    ], tools=None, max_tokens=160, temperature=0.0), timeout=L_VISION_TIMEOUT)
+                    read = str(getattr(seen, "text", "") or "").strip()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - R still gets the raw frame
+                    c.meta["l_vision_error"] = f"{type(exc).__name__}: {exc}"[:200]
+                c.meta["l_vision_ms"] = int((time.monotonic() - started) * 1000)
+                if not read:
+                    return frame
+                v_reads.clear()
+                v_reads[key] = read
+                timeline = getattr(self.mind, "shared_timeline", None)
+                if timeline is not None:
+                    await timeline.append(persona_id, producer="L", kind="l_vision", task_id=lane,
+                                          payload={"text": read[:1500], "lane": lane})
+            c.meta["l_vision"] = read[:500]
+            return {**frame, "text": f"L sees: {read[:1500]}\n{str(frame.get('text') or '')}".strip()}
+
+        def v_prefetch() -> None:
+            nonlocal v_next
+            if v_next is not None:
+                v_next.cancel()
+            v_next = asyncio.create_task(v_look(), name=f"court-v-{c.id}")
+            v_next.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+        async def observe() -> dict | None:
+            nonlocal v_next
+            task, v_next = v_next, None
+            if task is not None:
+                return await task
+            return await v_look()
+
+        c.meta["agent_loop"] = "omni-tars"
+        try:
+            try:
+                said = await run_tars_loop(
+                    goal=goal[:4000], instructions=instructions, tools=schemas,
+                    infer=infer, execute=execute, observe=observe,
+                    max_steps=MAX_LANE_STEPS,
+                    timeout=max(GOAL_STEP_TIMEOUT, GOAL_TOOL_TIMEOUT) + 5,
+                    autofire=os.getenv("SAWII_HANDS_AUTOFIRE", "1") != "0",
+                    stats=active().meta.setdefault("spec", {}))
+            finally:
+                if v_next is not None:
+                    v_next.cancel()
+        except Exception as exc:  # noqa: BLE001 - a dead loop must be reported
+            c = self.get(persona_id, court_id)
+            if c is not None and c.status != "stopped":
+                self._touch(c, status="failed", error=f"R loop failed ({type(exc).__name__}: {exc})"[:300])
+                self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
+                await self._retire(persona_id, c, lane)
+            return
         c = self.get(persona_id, court_id)
         if c is not None and c.status in ("running", "waiting"):
-            self._touch(c, status="failed",
-                        error=f"reached the {MAX_LANE_STEPS}-step limit for this lane")
-            self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
+            c.meta["result"] = said[:500]
+            self._touch(c, status="failed" if last_tool_error else "done", error=last_tool_error)
+            self.emit(c, "court.status", status=c.status, error=c.error, lane=lane, result=said[:300])
+            await self._retire(persona_id, c, lane)
+
+    async def _drive_shared(self, persona_id: int, c: Court, lane: str, goal: str) -> None:
+        """A browser card as one shared-mind task: its hands share one tab and one mind."""
+        from . import shared_mind
+        from .gateway.browser.session import read_page
+
+        browser = self.mind.browser_hub
+        if self._shared is None:
+            self._shared = shared_mind.SharedMindClient(os.environ["SAWII_SHARED_MIND_URL"])
+        court_id = c.id
+
+        def active() -> Court:
+            c = self.get(persona_id, court_id)
+            if c is None or c.status == "stopped":
+                raise asyncio.CancelledError
+            return c
+
+        one = await browser._get((persona_id, lane))
+
+        async def run_tool(name: str, args: dict) -> str:
+            active()
+            out = str(await asyncio.wait_for(browser.run(persona_id, name, args, lane=lane),
+                                             timeout=GOAL_TOOL_TIMEOUT))
+            c.meta["last_tools"] = [*c.meta.get("last_tools", [])[-2:], f"{name}: {out[:200]}"]
+            return out
+
+        async def read():
+            return await read_page(one.session, screenshot=False)
+
+        page = getattr(one.session, "_page", None)
+        native = getattr(one.session, "native", None)
+
+        async def cdp(method: str, params: dict) -> dict:
+            session = await native.get_or_create_cdp_session(focus=False)
+            domain, name = method.split(".")
+            send = getattr(getattr(session.cdp_client.send, domain), name)
+            return await send(params=params, session_id=session.session_id)
+
+        async def find(needle: str) -> list[str]:
+            if page is not None:
+                return await page.evaluate(shared_mind.FIND_JS, needle)
+            r = await cdp("Runtime.evaluate", {"expression": f"({shared_mind.FIND_JS})({_json.dumps(needle)})",
+                                               "returnByValue": True})
+            return list(r.get("result", {}).get("value") or [])
+
+        async def press_enter() -> None:
+            if page is not None:
+                await page.keyboard.press("Enter")
+                with contextlib.suppress(Exception):
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                return
+            key = {"key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13}
+            await cdp("Input.dispatchKeyEvent", {"type": "keyDown", "text": "\r", **key})
+            await cdp("Input.dispatchKeyEvent", {"type": "keyUp", **key})
+            await asyncio.sleep(0.8)
+
+        async def evaluate(expr: str):
+            if page is not None:
+                return await page.evaluate(expr)
+            r = await cdp("Runtime.evaluate", {"expression": expr, "returnByValue": True, "awaitPromise": True})
+            if r.get("exceptionDetails"):
+                raise RuntimeError(str(r["exceptionDetails"].get("text") or "evaluate failed")[:200])
+            return r.get("result", {}).get("value")
+
+        can = page is not None or native is not None
+        tab = shared_mind.TabHands(run_tool, read, find if can else None, press_enter if can else None,
+                                   evaluate if can else None)
+
+        def on_task(tid: str) -> None:
+            c.meta["shared_tid"] = tid
+
+        def on_event(ev: dict) -> None:
+            if ev["type"] in ("step", "act", "rejected"):
+                self.emit(c, "court.hand", lane=lane, hand=ev.get("name"), event=ev["type"],
+                          tool=ev.get("tool"), text=str(ev.get("text") or "")[-300:])
+
+        c.meta["agent_loop"] = "shared-mind"
+        try:
+            done = await shared_mind.drive(
+                self._shared, goal[:4000], tab,
+                hands=int(c.meta.get("hands") or os.getenv("SAWII_SHARED_MIND_HANDS", "2")),
+                on_event=on_event, on_task=on_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a dead task must be reported
+            c = self.get(persona_id, court_id)
+            if c is not None and c.status != "stopped":
+                self._touch(c, status="failed", error=f"shared mind failed ({type(exc).__name__}: {exc})"[:300])
+                self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
+            return
+        acts = [t["act_to_act"] for t in done["timings"] if t.get("act_to_act")]
+        c.meta["actions"] = len(done["timings"])
+        if acts:
+            c.meta["act_to_act_median"] = sorted(acts)[len(acts) // 2]
+        for key in ("think_secs", "tool_secs"):
+            vals = sorted(t[key] for t in done["timings"] if t.get(key) is not None)
+            if vals:
+                c.meta[key.replace("_secs", "_median")] = vals[len(vals) // 2]
+        c = self.get(persona_id, court_id)
+        if c is not None and c.status in ("running", "waiting"):
+            answer = str(done.get("answer") or "")
+            c.meta["result"] = answer[:500]
+            failed = done.get("cancelled") or not answer.strip()
+            self._touch(c, status="failed" if failed else "done",
+                        error="the task ended without an answer" if failed else "")
+            self.emit(c, "court.status", status=c.status, error=c.error, lane=lane, result=answer[:300])
+            await self._retire(persona_id, c, lane)
 
     # ───────────────────────────────────────────────────────────── voice hooks
 

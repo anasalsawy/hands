@@ -1,0 +1,19 @@
+{
+  "name": "hands-tars-loop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "tsx persona-loop.ts"
+  },
+  "dependencies": {
+    "@tarko/agent": "0.3.1",
+    "tsx": "4.19.3"
+  },
+  "overrides": {
+    "uuid": "11.1.1"
+  }
+}

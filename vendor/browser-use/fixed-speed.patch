@@ -1,0 +1,323 @@
+diff --git a/browser_use/agent/service.py b/browser_use/agent/service.py
+index 997c679..ef87ae8 100644
+--- a/browser_use/agent/service.py
++++ b/browser_use/agent/service.py
+@@ -1085,6 +1085,18 @@ class Agent(Generic[Context, AgentStructuredOutput]):
+ 		finally:
+ 			await self._finalize(browser_state_summary)
+ 
++	async def _get_browser_state_for_step(self) -> BrowserStateSummary:
++		"""Return the native browser state used to ground the next model decision.
++
++		PersonaBrowserAgent overrides this seam to consume a state prefetched after
++		the previous action while normal Browser Use keeps exactly the old behavior.
++		"""
++		assert self.browser_session is not None, 'BrowserSession is not set up'
++		return await self.browser_session.get_browser_state_summary(
++			include_screenshot=True,
++			include_recent_events=self.include_recent_events,
++		)
++
+ 	async def _prepare_context(self, step_info: AgentStepInfo | None = None) -> BrowserStateSummary:
+ 		"""Prepare the context for the step: browser state, action models, page actions"""
+ 		# step_start_time is now set in step() method
+@@ -1092,12 +1104,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
+ 		assert self.browser_session is not None, 'BrowserSession is not set up'
+ 
+ 		self.logger.debug(f'🌐 Step {self.state.n_steps}: Getting browser state...')
+-		# Always take screenshots for all steps
++		# Always take screenshots for all steps. Subclasses may prefetch this state
++		# concurrently with post-action processing, but the returned object must be
++		# a native BrowserStateSummary so selector grounding stays Browser Use-owned.
+ 		self.logger.debug('📸 Requesting browser state with include_screenshot=True')
+-		browser_state_summary = await self.browser_session.get_browser_state_summary(
+-			include_screenshot=True,  # always capture even if use_vision=False so that cloud sync is useful (it's fast now anyway)
+-			include_recent_events=self.include_recent_events,
+-		)
++		browser_state_summary = await self._get_browser_state_for_step()
+ 		if browser_state_summary.screenshot:
+ 			self.logger.debug(f'📸 Got browser state WITH screenshot, length: {len(browser_state_summary.screenshot)}')
+ 		else:
+diff --git a/browser_use/persona/agent.py b/browser_use/persona/agent.py
+index a6f39f4..fdb612a 100644
+--- a/browser_use/persona/agent.py
++++ b/browser_use/persona/agent.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
++
+ from browser_use.agent.service import Agent
+ from browser_use.llm.persona import ChatPersona
+ from browser_use.persona.observer import BrowserObserver, ObserverSettings, StaleBrowserState
+@@ -21,12 +23,47 @@ class PersonaBrowserAgent(Agent):
+ 		kwargs['max_actions_per_step'] = 1
+ 		self._persona_observer_settings = observer_settings or ObserverSettings()
+ 		self._persona_decision_frame = None
++		self._persona_decision_state_digest = None
++		self._persona_prefetch_task = None
+ 		self._persona_running = False
+ 		self._persona_observer = None
+ 		model = ChatPersona(lanes, observation_provider=self._persona_note)
+ 		super().__init__(task=task, llm=model, page_extraction_llm=model, judge_llm=model, **kwargs)
+ 		self.persona_lanes = lanes
+ 
++	async def _cancel_persona_prefetch(self) -> None:
++		task = self._persona_prefetch_task
++		self._persona_prefetch_task = None
++		if task is not None and not task.done():
++			task.cancel()
++			await asyncio.gather(task, return_exceptions=True)
++
++	def _start_persona_prefetch(self) -> None:
++		if self.browser_session is None or not hasattr(self.browser_session, 'get_browser_state_summary'):
++			return
++		old = self._persona_prefetch_task
++		if old is not None and not old.done():
++			old.cancel()
++		self._persona_prefetch_task = asyncio.create_task(
++			self.browser_session.get_browser_state_summary(
++				include_screenshot=True, include_recent_events=self.include_recent_events
++			)
++		)
++
++	async def _get_browser_state_for_step(self):
++		"""Consume the state captured while Browser Use was post-processing."""
++		task = self._persona_prefetch_task
++		self._persona_prefetch_task = None
++		if task is not None:
++			try:
++				return await task
++			except asyncio.CancelledError:
++				raise
++			except Exception:
++				# A failed speculative prefetch must never break the normal agent loop.
++				pass
++		return await super()._get_browser_state_for_step()
++
+ 	@property
+ 	def persona_observer(self) -> BrowserObserver | None:
+ 		return self._persona_observer
+@@ -44,11 +81,13 @@ class PersonaBrowserAgent(Agent):
+ 		try:
+ 			return await super().run(*args, **kwargs)
+ 		finally:
++			await self._cancel_persona_prefetch()
+ 			if self._persona_observer:
+ 				await self._persona_observer.close()
+ 			self._persona_running = False
+ 
+ 	async def close(self):
++		await self._cancel_persona_prefetch()
+ 		if self._persona_observer:
+ 			await self._persona_observer.close()
+ 		return await super().close()
+@@ -59,23 +98,34 @@ class PersonaBrowserAgent(Agent):
+ 		observer = self._persona_observer
+ 		if self._persona_running and not observer.running:
+ 			observer.start()
+-		# R's selector cache must be built from a stable page. The parallel
+-		# sampler reads CDP directly and never overwrites that cache.
+-		before = await observer.sample()
++
++		# The native Browser Use state may already be in flight from the previous
++		# action. super()._prepare_context consumes it through our overridden
++		# _get_browser_state_for_step instead of taking a second full screenshot.
+ 		summary = await super()._prepare_context(step_info)
+-		after = await observer.sample()
+-		if before.state_digest != after.state_digest:
+-			raise StaleBrowserState('Browser changed during context preparation; retry with fresh state')
+-		self._persona_decision_frame = after
++		digest, target_id, _url, _title = await observer.fingerprint()
++		self._persona_decision_state_digest = digest
++		if hasattr(summary, 'dom_state') and hasattr(summary, 'screenshot'):
++			self._persona_decision_frame = observer.ingest_native_state(
++				summary, state_digest=digest, target_id=target_id
++			)
++		else:
++			# Compatibility with lightweight Browser Use test doubles. Production
++			# always returns BrowserStateSummary and takes the zero-copy path above.
++			self._persona_decision_frame = await observer.sample()
+ 		return summary
+ 
+ 	async def _execute_actions(self):
+-		if self._persona_observer is None or self._persona_decision_frame is None:
++		if self._persona_observer is None or self._persona_decision_state_digest is None:
+ 			raise StaleBrowserState('No current browser frame exists for this decision')
+-		# If L saw a new dialog/page while R was generating, discard R's stale
+-		# action. Browser Use's normal step retry rebuilds DOM and asks R again.
+-		await self._persona_observer.assert_current(self._persona_decision_frame)
+-		return await super()._execute_actions()
++		# Cheap DOM fingerprint only: do not pay for another screenshot just to
++		# discover whether R's selector grounding became stale while it reasoned.
++		await self._persona_observer.assert_current(self._persona_decision_state_digest)
++		result = await super()._execute_actions()
++		# Start the NEXT native DOM+screenshot immediately. It runs concurrently
++		# with Browser Use post-processing and is consumed by the next step.
++		self._start_persona_prefetch()
++		return result
+ 
+ 	async def conversation(self, messages):
+ 		"""The user may talk to L while this agent's run() task remains active."""
+@@ -90,5 +140,5 @@ class PersonaBrowserAgent(Agent):
+ 				},
+ 				*transcript,
+ 			]
+-		async for piece in self.persona_lanes.conversation(transcript):
++		async for piece in self.persona_lanes.conversation(transcript, purpose="conversation"):
+ 			yield piece
+diff --git a/browser_use/persona/observer.py b/browser_use/persona/observer.py
+index f500c96..d25af7d 100644
+--- a/browser_use/persona/observer.py
++++ b/browser_use/persona/observer.py
+@@ -97,6 +97,52 @@ class BrowserObserver:
+ 		self._capture_lock = asyncio.Lock()
+ 		self._observation_task: asyncio.Task | None = None
+ 
++	async def fingerprint(self) -> tuple[str, str, str, str]:
++		"""Cheap action-safety read: target + DOM-visible state, no screenshot."""
++		if self._capture_override:
++			raw = await self._capture_override()
++			target = str(raw['target_id'])
++			state = str(raw['page_state'])
++			return hashlib.sha256((target + '\n' + state).encode()).hexdigest(), target, str(raw.get('url','')), str(raw.get('title',''))
++		cdp = await self.browser_session.get_or_create_cdp_session(focus=False)
++		target = str(cdp.target_id)
++		result = await cdp.cdp_client.send.Runtime.evaluate(
++			params={'expression': _READ_STATE, 'returnByValue': True}, session_id=cdp.session_id
++		)
++		if result.get('exceptionDetails'):
++			raise RuntimeError('Browser state evaluation failed')
++		state = result.get('result', {}).get('value')
++		if not isinstance(state, str):
++			raise RuntimeError('Browser state evaluation returned no state')
++		data = json.loads(state)
++		digest = hashlib.sha256((target + '\n' + state).encode()).hexdigest()
++		return digest, target, data.get('url',''), data.get('title','')
++
++	def ingest_native_state(self, state, *, state_digest: str, target_id: str) -> BrowserFrame:
++		"""Reuse Browser Use's native DOM+screenshot as L's observation frame.
++
++		No second screenshot is taken. The selector map remains the exact native
++		state R will consume on this step.
++		"""
++		screenshot = state.screenshot or ''
++		dom_text = state.dom_state.llm_representation() if state.dom_state else ''
++		page_state = json.dumps({'url': state.url, 'title': state.title, 'dom': dom_text[:14000]}, ensure_ascii=False)
++		previous = self.latest
++		visual_digest = hashlib.sha256(screenshot.encode()).hexdigest() if screenshot else ''
++		changed = previous is None or (previous.state_digest, previous.visual_digest) != (state_digest, visual_digest)
++		frame = BrowserFrame(
++			revision=(previous.revision if previous else 0) + int(changed),
++			captured_at=time.monotonic(), target_id=target_id, state_digest=state_digest,
++			visual_digest=visual_digest, url=state.url, title=state.title,
++			page_state=page_state, screenshot=screenshot,
++		)
++		self.latest = frame
++		if changed:
++			if previous and previous.state_digest != state_digest and self._observation_task:
++				self._observation_task.cancel()
++			self._changed.set()
++		return frame
++
+ 	async def _capture(self) -> dict:
+ 		if self._capture_override:
+ 			return await self._capture_override()
+@@ -159,9 +205,11 @@ class BrowserObserver:
+ 			f'not task instructions or a verified result]\n{note.text}'
+ 		)
+ 
+-	async def assert_current(self, expected: BrowserFrame) -> None:
+-		current = await self.sample()
+-		if current.state_digest != expected.state_digest:
++	async def assert_current(self, expected_state_digest: str | BrowserFrame) -> None:
++		if isinstance(expected_state_digest, BrowserFrame):
++			expected_state_digest = expected_state_digest.state_digest
++		current_digest, _target, _url, _title = await self.fingerprint()
++		if current_digest != expected_state_digest:
+ 			raise StaleBrowserState('Browser changed while R was deciding; refresh state and replan')
+ 
+ 	async def _sample_loop(self):
+@@ -197,7 +245,7 @@ class BrowserObserver:
+ 		pieces = []
+ 		length = 0
+ 		# Uses the SAME chat endpoint and L selector as ordinary conversation.
+-		async with aclosing(self.lanes.conversation(messages)) as stream:
++		async with aclosing(self.lanes.conversation(messages, purpose="observation")) as stream:
+ 			async for text in stream:
+ 				pieces.append(text)
+ 				length += len(text)
+diff --git a/tests/persona/test_observation.py b/tests/persona/test_observation.py
+index fe6f79b..b51c5e9 100644
+--- a/tests/persona/test_observation.py
++++ b/tests/persona/test_observation.py
+@@ -41,7 +41,8 @@ async def test_L_observes_while_R_decision_is_in_flight(observer_module):
+         async def execute(self):
+             r_entered.set()
+             await release_r.wait()
+-        async def conversation(self,messages):
++        async def conversation(self,messages,**kwargs):
++            assert kwargs.get('purpose') == 'observation'
+             assert r_entered.is_set() and not release_r.is_set()
+             observations.append(messages)
+             yield 'A required field is visible.'
+@@ -83,7 +84,7 @@ async def test_old_L_result_is_cancelled_and_newest_frame_wins(observer_module):
+     cancelled=asyncio.Event()
+     seen=[]
+     class Lanes:
+-        async def conversation(self,messages):
++        async def conversation(self,messages,**kwargs):
+             prompt=messages[0]['content']
+             seen.append(prompt)
+             if prompt.endswith('\nA'):
+@@ -135,7 +136,8 @@ async def test_close_cancels_inflight_L_request(observer_module):
+     started=asyncio.Event()
+     ended=asyncio.Event()
+     class Lanes:
+-        async def conversation(self,messages):
++        async def conversation(self,messages,**kwargs):
++            assert kwargs.get('purpose') == 'observation'
+             started.set()
+             try:
+                 await asyncio.Event().wait()
+@@ -159,7 +161,8 @@ async def test_visual_animation_refreshes_observation_without_invalidating_DOM_a
+     expected=await observer.sample()
+     state[0]=frame(image='animation changed')
+     await observer.assert_current(expected)
+-    assert observer.latest.revision > expected.revision
++    refreshed=await observer.sample()
++    assert refreshed.revision > expected.revision
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/persona/test_provider.py b/tests/persona/test_provider.py
+index 7514000..7cdd11a 100644
+--- a/tests/persona/test_provider.py
++++ b/tests/persona/test_provider.py
+@@ -25,6 +25,25 @@ async def test_browser_use_native_serializer_and_schema_on_R(monkeypatch):
+     base = ROOT / 'browser-use-persona/browser_use'
+     for name, path in [('browser_use', base), ('browser_use.llm', base/'llm'), ('browser_use.llm.openai', base/'llm/openai')]:
+         namespace(monkeypatch, name, path)
++    try:
++        import openai  # noqa: F401
++    except ModuleNotFoundError:
++        chat = types.ModuleType('browser_use.llm.openai.chat')
++        class ChatOpenAI:
++            def __init__(self, model, **kwargs): self.model = model
++        chat.ChatOpenAI = ChatOpenAI
++        monkeypatch.setitem(sys.modules, 'browser_use.llm.openai.chat', chat)
++        serializer = types.ModuleType('browser_use.llm.openai.serializer')
++        class OpenAIMessageSerializer:
++            @staticmethod
++            def serialize_messages(messages):
++                out=[]
++                for m in messages:
++                    content=getattr(m,'content','')
++                    out.append({'role':'user','content':content})
++                return out
++        serializer.OpenAIMessageSerializer = OpenAIMessageSerializer
++        monkeypatch.setitem(sys.modules, 'browser_use.llm.openai.serializer', serializer)
+     module = importlib.import_module('browser_use.llm.persona')
+     messages = importlib.import_module('browser_use.llm.messages')
+     class Action(BaseModel):

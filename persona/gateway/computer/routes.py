@@ -18,13 +18,14 @@ import asyncio
 import contextlib
 import json
 import logging
+from typing import Any
 
 from starlette.applications import Starlette
 from starlette.endpoints import WebSocketEndpoint
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
-from starlette.websockets import WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocket
 
 from .capture import capture_available, list_windows
 from .stream import ComputerStreamSession, StreamSpec
@@ -111,7 +112,7 @@ async def computer_capture_status(request: Request) -> JSONResponse:
 class ComputerStream(WebSocketEndpoint):
     """One WebSocket = one live card. Binary JPEG frames after a JSON ready."""
 
-    encoding = "bytes"
+    encoding = None
 
     async def on_connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -157,55 +158,43 @@ class ComputerStream(WebSocketEndpoint):
             "title": spec.title,
         }))
         session.start()
-        # Allow late subscribe / retarget messages without tearing down the socket.
-        websocket.state.listener = asyncio.create_task(self._listen(websocket))
 
-    async def _listen(self, websocket: WebSocket) -> None:
-        try:
-            while True:
-                msg = await websocket.receive()
-                if msg.get("type") == "websocket.disconnect":
-                    return
-                text = msg.get("text")
-                if not text:
-                    continue
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(data, dict):
-                    continue
-                if data.get("type") in {"subscribe", "configure", "retarget"} or data.get("kind") or data.get("session"):
-                    new_spec = _spec_from_mapping(data, websocket.query_params)
-                    old: ComputerStreamSession | None = getattr(websocket.state, "session", None)
-                    if old is not None:
-                        await old.stop()
-
-                    async def on_frame(jpeg: bytes, meta: dict) -> None:
-                        await websocket.send_bytes(jpeg)
-
-                    session = ComputerStreamSession(spec=new_spec, on_frame=on_frame)
-                    websocket.state.session = session
-                    websocket.state.spec = new_spec
-                    await websocket.send_text(json.dumps({
-                        "type": "ready",
-                        "kind": new_spec.kind,
-                        "fps": new_spec.fps,
-                        "exclude_self": new_spec.exclude_self,
-                        "hwnd": new_spec.hwnd,
-                        "pid": new_spec.pid,
-                        "title": new_spec.title,
-                    }))
-                    session.start()
-        except (WebSocketDisconnect, asyncio.CancelledError):
+    async def on_receive(self, websocket: WebSocket, data: Any) -> None:
+        # Late subscribe / retarget messages arrive through the endpoint's own
+        # receive loop; a second reader would race it for the same socket.
+        if not isinstance(data, str):
             return
-        except Exception as exc:  # noqa: BLE001
-            log.warning("computer stream listen error: %s", exc)
+        try:
+            msg = json.loads(data)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(msg, dict):
+            return
+        if not (msg.get("type") in {"subscribe", "configure", "retarget"} or msg.get("kind") or msg.get("session")):
+            return
+        new_spec = _spec_from_mapping(msg, websocket.query_params)
+        old: ComputerStreamSession | None = getattr(websocket.state, "session", None)
+        if old is not None:
+            await old.stop()
+
+        async def on_frame(jpeg: bytes, meta: dict) -> None:
+            await websocket.send_bytes(jpeg)
+
+        session = ComputerStreamSession(spec=new_spec, on_frame=on_frame)
+        websocket.state.session = session
+        websocket.state.spec = new_spec
+        await websocket.send_text(json.dumps({
+            "type": "ready",
+            "kind": new_spec.kind,
+            "fps": new_spec.fps,
+            "exclude_self": new_spec.exclude_self,
+            "hwnd": new_spec.hwnd,
+            "pid": new_spec.pid,
+            "title": new_spec.title,
+        }))
+        session.start()
 
     async def on_disconnect(self, websocket: WebSocket, close_code: int) -> None:
-        listener = getattr(websocket.state, "listener", None)
-        if listener is not None:
-            listener.cancel()
         session: ComputerStreamSession | None = getattr(websocket.state, "session", None)
         if session is not None:
             with contextlib.suppress(Exception):
