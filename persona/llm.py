@@ -9,6 +9,7 @@ import copy
 import dataclasses
 import json
 import re
+import json as _json_mod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -294,6 +295,20 @@ class OpenAICompatLLM(LLM):
         calls = [ToolCall(id=c.get("id") or f"call_{i}", name=(c.get("function") or {}).get("name", ""),
                           arguments=(c.get("function") or {}).get("arguments") or "")
                  for i, c in enumerate(msg.get("tool_calls") or [])]
+        text_out = strip_reasoning(msg.get("content") or "")
+        if not calls and tools:
+            # Without a thinking preamble some models write the call as bare JSON
+            # ({"name":..., "arguments":{...}}) instead of a tool_calls entry.
+            known = {(t.get("function") or {}).get("name") for t in tools}
+            try:
+                obj = _json_mod.loads(text_out) if text_out.startswith("{") else None
+            except ValueError:
+                obj = None
+            if isinstance(obj, dict) and obj.get("name") in known and isinstance(obj.get("arguments"), (dict, str)):
+                a = obj["arguments"]
+                calls = [ToolCall(id="call_text_0", name=obj["name"],
+                                  arguments=a if isinstance(a, str) else _json_mod.dumps(a))]
+                text_out = ""
         if self.on_health is not None:
             self.on_health.ok(extra={"model": self.endpoint.model})
         pin, pout, pcached = usage_of(data)
@@ -303,7 +318,7 @@ class OpenAICompatLLM(LLM):
         self.call_stats["in_tokens"] = self.call_stats.get("in_tokens", 0) + pin
         self.call_stats["out_tokens"] = self.call_stats.get("out_tokens", 0) + pout
         self.call_stats["cached_tokens"] = self.call_stats.get("cached_tokens", 0) + pcached
-        return ChatResult(text=strip_reasoning(msg.get("content") or ""), tool_calls=calls,
+        return ChatResult(text=text_out, tool_calls=calls,
                           finish_reason=choice.get("finish_reason") or "stop", raw=data,
                           in_tokens=pin, out_tokens=pout, cached_tokens=pcached)
 
