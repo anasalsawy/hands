@@ -1004,7 +1004,7 @@ class HandsDeck:
                 messages = [*messages, {"role": "user", "content":
                             "Updated user guidance for this lane: " + c.goal[:4000]}]
             reply = await asyncio.wait_for(
-                lobe.chat(messages, tools=schemas or None, max_tokens=700, temperature=0.2),
+                lobe.chat(messages, tools=schemas or None, max_tokens=4096, temperature=0.2),
                 timeout=GOAL_STEP_TIMEOUT)
             calls = []
             for tc in getattr(reply, "tool_calls", None) or []:
