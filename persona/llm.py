@@ -300,8 +300,9 @@ class OpenAICompatLLM(LLM):
             # Without a thinking preamble some models write the call as bare JSON
             # ({"name":..., "arguments":{...}}) instead of a tool_calls entry.
             known = {(t.get("function") or {}).get("name") for t in tools}
+            body_txt = text_out.replace("<tool_call>", "").replace("</tool_call>", "").strip()
             try:
-                obj = _json_mod.loads(text_out) if text_out.startswith("{") else None
+                obj = _json_mod.JSONDecoder().raw_decode(body_txt)[0] if body_txt.startswith("{") else None
             except ValueError:
                 obj = None
             if isinstance(obj, dict) and obj.get("name") in known and isinstance(obj.get("arguments"), (dict, str)):
