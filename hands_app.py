@@ -449,10 +449,10 @@ def main() -> None:
         os.environ["HANDS_DATA_DIR"] = a.data_dir
     cfg = load_config()
     if CLOUD:
-        # a hosted app is configured from its environment; the UI can still change it
+        # a hosted app is configured from its environment (env wins on restart)
         for env_k, cfg_k in (("HANDS_BRAIN_URL", "brain_url"), ("HANDS_BRAIN_KEY", "brain_key"),
                              ("HANDS_BRAIN_MODEL", "brain_model")):
-            if os.environ.get(env_k, "").strip() and not cfg.get(cfg_k):
+            if os.environ.get(env_k, "").strip():
                 cfg[cfg_k] = os.environ[env_k].strip()
         ACCESS_KEY = os.environ.get("HANDS_ACCESS_KEY", "").strip()
         if not ACCESS_KEY:
