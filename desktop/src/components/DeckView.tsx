@@ -9,7 +9,7 @@ interface Busy {
   error?: string;
 }
 
-export function DeckView({ deck, computerUse = true }: { deck: DeckState; computerUse?: boolean }) {
+export function DeckView({ deck, missing = [] }: { deck: DeckState; missing?: string[] }) {
   const [title, setTitle] = useState("");
   const [kind, setKind] = useState<CourtKind>("desktop");
   const [busy, setBusy] = useState<Record<string, Busy>>({});
@@ -19,6 +19,7 @@ export function DeckView({ deck, computerUse = true }: { deck: DeckState; comput
   // A create error (e.g. the card limit) is stale once the deck changes size.
   useEffect(() => setError(""), [cardCount]);
   const [task, setTask] = useState("");
+  const [taskKind, setTaskKind] = useState<CourtKind>("desktop");
   const [sending, setSending] = useState(false);
 
   // The user states a goal; the mind decides how many lines of work it needs and
@@ -29,7 +30,7 @@ export function DeckView({ deck, computerUse = true }: { deck: DeckState; comput
     setSending(true);
     setError("");
     try {
-      const court = await courtsApi.create({ title: goal.slice(0, 48), kind: "desktop" });
+      const court = await courtsApi.create({ title: goal.slice(0, 48), kind: taskKind });
       deck.apply(court);
       deck.apply(await courtsApi.send(court.id, goal));
       setTask("");
@@ -68,11 +69,10 @@ export function DeckView({ deck, computerUse = true }: { deck: DeckState; comput
 
   return (
     <div className="stack">
-      {!computerUse && (
+      {missing.length > 0 && (
         <div className="panel warn">
-          Screen, mouse and keyboard control is off: the <code>open-computer-use</code> helper is not installed. Cards
-          can still read and write files in your folders. Install it with <code>npm install -g open-computer-use</code>{" "}
-          and restart Hands.
+          Not ready on this computer: {missing.join(" · ")}. The Windows bundle includes these; if you are running from
+          source see the README.
         </div>
       )}
       <div className="panel task">
@@ -86,6 +86,15 @@ export function DeckView({ deck, computerUse = true }: { deck: DeckState; comput
           }}
         />
         <div className="row">
+          <select
+            value={taskKind}
+            title="Where the cards work"
+            onChange={(e) => setTaskKind(e.target.value as CourtKind)}
+            style={{ width: 130 }}
+          >
+            <option value="desktop">Computer</option>
+            <option value="browser">Browser</option>
+          </select>
           <button className="btn" data-kind="primary" disabled={sending || !task.trim()} onClick={() => void runTask()}>
             {sending ? "Starting…" : "Run"}
           </button>

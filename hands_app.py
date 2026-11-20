@@ -97,6 +97,24 @@ def computer_use_ready() -> bool:
                 or shutil.which("open-computer-use.cmd"))
 
 
+def missing_parts() -> list[str]:
+    """What the cards need that this machine does not have yet (shown in the UI)."""
+    out = []
+    if not (shutil.which("node") or shutil.which("node.exe")):
+        out.append("Node.js 22+ (runs the Omni-TARS loop)")
+    elif not (ROOT / "engine" / "node_modules").exists():
+        out.append("engine dependencies (npm ci --prefix engine)")
+    if not computer_use_ready():
+        out.append("screen/mouse/keyboard helper (npm install -g open-computer-use)")
+    try:
+        import importlib.util
+        if importlib.util.find_spec("browser_use") is None:
+            out.append("browser SDK for Browser cards (python scripts/install_browser_sdk.py)")
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def _loopback(request) -> bool:
     """Config + key routes answer only the app itself: loopback client, own Host,
     and no foreign Origin (blocks DNS-rebinding and other websites' fetches)."""
@@ -141,6 +159,7 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
             "approve": approve,
             "port": port,
             "computer_use": computer_use_ready(),
+            "missing": missing_parts(),
         })
 
     async def put_config(request):

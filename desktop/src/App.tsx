@@ -227,7 +227,7 @@ export default function App() {
             </div>
           </div>
         )}
-        {tab === "courts" && <DeckView deck={deck} computerUse={boot ? boot.computer_use !== false : true} />}
+        {tab === "courts" && <DeckView deck={deck} missing={boot?.missing ?? []} />}
         {tab === "motor" && <MotorView deck={deck} />}
         {tab === "chat" && <ChatView />}
         {tab === "voice" && <VoiceView />}

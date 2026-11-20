@@ -17,6 +17,7 @@ export interface Boot {
   roots: string[];
   approve: "ask" | "writes" | "auto";
   computer_use?: boolean;
+  missing?: string[];
 }
 
 interface CheckResult {
