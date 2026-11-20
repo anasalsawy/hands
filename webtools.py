@@ -27,7 +27,7 @@ WEB_TOOLS = [
         "name": "web_fetch",
         "description": "Fetch a web page or text file and return its readable text (no scripts). Use for reading sources and docs.",
         "parameters": {"type": "object", "properties": {
-            "url": {"type": "string"}, "max_chars": {"type": "integer", "description": "default 12000, max 40000"}},
+            "url": {"type": "string"}, "max_chars": {"type": "integer", "description": "default 4000, max 40000"}},
             "required": ["url"]}}},
 ]
 WEB_NAMES = {t["function"]["name"] for t in WEB_TOOLS}
@@ -75,8 +75,8 @@ def _text(markup: str) -> str:
     return re.sub(r"\n\s*\n+", "\n\n", markup).strip()
 
 
-def web_fetch(url: str, max_chars: int = 12000) -> str:
-    max_chars = max(500, min(int(max_chars or 12000), 40000))
+def web_fetch(url: str, max_chars: int = 4000) -> str:
+    max_chars = max(500, min(int(max_chars or 4000), 40000))
     try:
         data, ctype = _get(url)
     except Exception as exc:  # noqa: BLE001

@@ -1047,7 +1047,7 @@ class HandsDeck:
                                       payload={"tool": name, "call_id": call_id, "part": goal[:500],
                                                "result": {"text": text[:2000]}})
             v_prefetch()
-            return text[:8000]
+            return text[:int(os.environ.get("HANDS_TOOL_RESULT_CHARS","2400"))]
 
         v_reads: dict[str, str] = {}
         last_action = [""]
