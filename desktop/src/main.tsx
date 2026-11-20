@@ -10,3 +10,6 @@ createRoot(el).render(
     <App />
   </React.StrictMode>,
 );
+if ("serviceWorker" in navigator && location.protocol.startsWith("http") && !/^(localhost|127\.)/.test(location.hostname)) {
+  navigator.serviceWorker.register("./sw.js").catch(() => {});
+}

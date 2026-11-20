@@ -158,9 +158,72 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
             "roots": list(roots),
             "approve": approve,
             "port": port,
+            "lan": bool(cfg.get("lan")),
             "computer_use": computer_use_ready(),
             "missing": missing_parts(),
         })
+
+    pair = {"code": "", "until": 0.0}
+    fails: dict[str, list[float]] = {}
+
+    def _lan_urls() -> list[str]:
+        import socket
+        ips: list[str] = []
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = info[4][0]
+                if not ip.startswith("127.") and ip not in ips:
+                    ips.append(ip)
+        except OSError:
+            pass
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("10.255.255.255", 1))  # no packet is sent; picks the LAN interface
+            ip = s.getsockname()[0]
+            s.close()
+            if not ip.startswith("127.") and ip not in ips:
+                ips.insert(0, ip)
+        except OSError:
+            pass
+        return [f"http://{ip}:{port}/ui/" for ip in ips]
+
+    async def pair_info(request):
+        """Loopback only: the code a phone types, and the addresses it can reach."""
+        if not _loopback(request):
+            return deny()
+        import secrets
+        if request.query_params.get("new") or time.time() > pair["until"]:
+            pair["code"] = f"{secrets.randbelow(10**6):06d}"
+            pair["until"] = time.time() + 600
+        cfg = load_config()
+        return JSONResponse({
+            "lan": bool(cfg.get("lan")),
+            "listening": bool(cfg.get("lan")),
+            "code": pair["code"],
+            "expires_in": max(0, int(pair["until"] - time.time())),
+            "urls": _lan_urls() if cfg.get("lan") else [],
+        })
+
+    async def pair_claim(request):
+        """A phone on the same network trades the code for the persona key."""
+        import secrets
+        client = request.client.host if request.client else "?"
+        now = time.time()
+        recent = [t for t in fails.get(client, []) if now - t < 300]
+        if len(recent) >= 5:
+            return JSONResponse({"error": {"message": "too many tries, wait a few minutes"}}, status_code=429)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        code = str(body.get("code", "")).strip()
+        ok = bool(pair["code"]) and now <= pair["until"] and secrets.compare_digest(code, pair["code"])
+        if not ok:
+            recent.append(now)
+            fails[client] = recent
+            return JSONResponse({"error": {"message": "wrong or expired code"}}, status_code=403)
+        pair["code"] = ""  # one use
+        return JSONResponse({"persona_key": persona_key, "persona_id": persona_id})
 
     async def put_config(request):
         if not _loopback(request):
@@ -179,6 +242,8 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
             cfg["roots"] = [str(r).strip() for r in body["roots"] if str(r).strip()]
         if body.get("approve") in ("ask", "writes", "auto"):
             cfg["approve"] = body["approve"]
+        if isinstance(body.get("lan"), bool):
+            cfg["lan"] = body["lan"]
         save_config(cfg)
         _schedule_restart()
         return JSONResponse({"ok": True, "restarting": True})
@@ -218,6 +283,14 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
             out["tools"] = {"supported": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
         return JSONResponse(out)
 
+    async def lane_windows(request):
+        """Which window each lane owns, so a card can show exactly that window."""
+        auth = (request.headers.get("authorization") or "")[7:].strip()
+        if auth != persona_key and not _loopback(request):
+            return deny()
+        import winhand
+        return JSONResponse({"lanes": winhand.LaneWindows().all()})
+
     async def index(request):
         return RedirectResponse("/ui/")
 
@@ -227,7 +300,10 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
     routes = [
         Route("/hands/bootstrap", bootstrap, methods=["GET"]),
         Route("/hands/config", put_config, methods=["POST"]),
+        Route("/hands/pair-info", pair_info, methods=["GET"]),
+        Route("/hands/pair", pair_claim, methods=["POST"]),
         Route("/hands/brain-check", brain_check, methods=["POST"]),
+        Route("/hands/lane-windows", lane_windows, methods=["GET"]),
         Route("/", index, methods=["GET"]),
     ]
     if Path(ui_dir, "index.html").exists():
@@ -302,7 +378,7 @@ def main() -> None:
         except OSError:
             pass
     roots = [str(Path(r).expanduser()) for r in roots]
-    approve = a.approve or cfg.get("approve") or "ask"
+    approve = a.approve or cfg.get("approve") or "auto"
     has_brain = apply_brain_env(cfg)
     if computer_use_ready():
         os.environ.setdefault("SAWII_HANDS_COMPUTER_USE", "1")
@@ -320,7 +396,7 @@ def main() -> None:
         return build_routes(**kw, port=a.port, roots=roots, approve=approve, ui_dir=ui_dir)
 
     ns = SimpleNamespace(
-        port=a.port, host="127.0.0.1", root=roots, approve=approve, deepinfra_key="",
+        port=a.port, host=("0.0.0.0" if cfg.get("lan") else "127.0.0.1"), root=roots, approve=approve, deepinfra_key="",
         persona_key="", data_dir=str(data_dir()), agent=[], no_voice=a.no_voice,
         extra_routes=extra_routes,
     )

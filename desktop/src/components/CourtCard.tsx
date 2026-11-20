@@ -7,6 +7,7 @@
 import { useEffect, useState } from "react";
 import { courtsApi, type Court, type CourtKind, type CourtTarget } from "../lib/client";
 import { LiveSurface } from "./LiveSurface";
+import { TaskDiagram } from "./TaskDiagram";
 
 const LIVE: Court["status"][] = ["spawning", "running", "waiting"];
 
@@ -71,7 +72,11 @@ export function CourtCard({
         </button>
       </header>
 
-      <LiveSurface target={target} kind={court.kind} lane={court.lane || undefined} active />
+      {court.kind === "browser" ? (
+        <LiveSurface target={target} kind={court.kind} lane={court.lane || undefined} active />
+      ) : (
+        <TaskDiagram court={court} />
+      )}
 
       <div className="card-body">
         {showTarget && (

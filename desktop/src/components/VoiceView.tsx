@@ -26,6 +26,9 @@ export function VoiceView() {
   const chunksRef = useRef<Blob[]>([]);
   const ctxRef = useRef<AudioContext | null>(null);
   const playRef = useRef<number>(0);
+  const srcsRef = useRef<AudioBufferSourceNode[]>([]);
+  const liveRef = useRef<{ stop: () => void } | null>(null);
+  const [live, setLive] = useState(false);
   const linesRef = useRef<HTMLDivElement | null>(null);
 
   const add = useCallback((who: Line["who"], text: string) => {
@@ -66,8 +69,13 @@ export function VoiceView() {
     const src = ctx.createBufferSource();
     src.buffer = out;
     src.connect(ctx.destination);
-    src.start(ctx.currentTime + playRef.current);
-    playRef.current += out.duration;
+    const startAt = Math.max(ctx.currentTime, playRef.current);
+    src.start(startAt);
+    playRef.current = startAt + out.duration;
+    srcsRef.current.push(src);
+    src.onended = () => {
+      srcsRef.current = srcsRef.current.filter((x) => x !== src);
+    };
   }, []);
 
   const connect = useCallback(() => {
@@ -135,6 +143,105 @@ export function VoiceView() {
     sock.send(JSON.stringify(frame));
   };
 
+  /** Cut whatever the persona is saying, now (barge-in). */
+  const hush = useCallback(() => {
+    for (const src of srcsRef.current) {
+      try {
+        src.stop();
+      } catch {
+        /* already ended */
+      }
+    }
+    srcsRef.current = [];
+    playRef.current = 0;
+    const sock = sockRef.current;
+    if (sock?.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "interrupt" }));
+  }, []);
+
+  // Hands-free: the browser transcribes as you talk; every partial goes to the persona
+  // so it starts answering before you finish, and talking over it cuts it off.
+  const stopLive = useCallback(() => {
+    liveRef.current?.stop();
+    liveRef.current = null;
+    setLive(false);
+  }, []);
+
+  const startLive = useCallback(() => {
+    type Rec = {
+      continuous: boolean;
+      interimResults: boolean;
+      lang: string;
+      start: () => void;
+      stop: () => void;
+      onresult: ((e: { resultIndex: number; results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal: boolean }> }) => void) | null;
+      onend: (() => void) | null;
+      onerror: ((e: { error: string }) => void) | null;
+    };
+    const w = window as unknown as { SpeechRecognition?: new () => Rec; webkitSpeechRecognition?: new () => Rec };
+    const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
+    if (!Ctor) {
+      setNote("this browser has no live speech recognition — use the push-to-talk button");
+      return;
+    }
+    connect();
+    const rec = new Ctor();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = navigator.language || "en-US";
+    let on = true;
+    let lastPartial = "";
+    rec.onresult = (e) => {
+      for (let i = e.resultIndex; i < e.results.length; i += 1) {
+        const r = e.results[i];
+        const text = (r[0]?.transcript || "").trim();
+        if (!text) continue;
+        const sock = sockRef.current;
+        if (!sock || sock.readyState !== WebSocket.OPEN) continue;
+        const speaking = srcsRef.current.length > 0;
+        if (r.isFinal) {
+          sock.send(JSON.stringify({ type: "text", text }));
+          add("you", text);
+          lastPartial = "";
+        } else if (text !== lastPartial) {
+          // talking over the persona: stop it as soon as real words appear
+          if (speaking && text.split(/\s+/).length >= 2) hush();
+          sock.send(JSON.stringify({ type: "partial", text }));
+          lastPartial = text;
+        }
+      }
+    };
+    rec.onerror = (e) => {
+      if (e.error !== "no-speech" && e.error !== "aborted") setNote(`listening problem: ${e.error}`);
+      if (e.error === "not-allowed" || e.error === "service-not-allowed") on = false;
+    };
+    rec.onend = () => {
+      if (on) {
+        try {
+          rec.start();
+        } catch {
+          /* already running */
+        }
+      } else setLive(false);
+    };
+    try {
+      rec.start();
+    } catch {
+      setNote("could not start listening");
+      return;
+    }
+    liveRef.current = {
+      stop: () => {
+        on = false;
+        try {
+          rec.stop();
+        } catch {
+          /* noop */
+        }
+      },
+    };
+    setLive(true);
+  }, [add, connect, hush]);
+
   const stopRecording = useCallback(async () => {
     const rec = recorderRef.current;
     if (!rec || rec.state === "inactive") {
@@ -187,6 +294,7 @@ export function VoiceView() {
 
   useEffect(
     () => () => {
+      liveRef.current?.stop();
       try {
         recorderRef.current?.stream.getTracks().forEach((t) => t.stop());
       } catch {
@@ -229,10 +337,13 @@ export function VoiceView() {
               Open session
             </button>
           )}
+          <button className="btn" data-kind="primary" onClick={() => (live ? stopLive() : startLive())}>
+            {live ? "Stop listening" : "Talk (hands-free)"}
+          </button>
           <button className="btn" onClick={() => void (recording ? stopRecording() : startRecording())}>
             {recording ? "Send take" : "Record and send"}
           </button>
-          <button className="btn" onClick={() => sendFrame({ type: "interrupt" })}>
+          <button className="btn" onClick={hush}>
             Interrupt
           </button>
           <button className="btn" onClick={() => sendFrame({ type: "discard_audio" })}>

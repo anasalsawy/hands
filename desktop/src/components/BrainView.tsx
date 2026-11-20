@@ -1,6 +1,7 @@
 // The Persona connection: which deployed Persona thinks for Hands, and which
 // folders the engines may touch. Saved by the local backend (hands_app.py) and
 // applied on restart. The key is write-only here: it is never shown again.
+import { PhoneAccess } from "./PairPanels";
 import { useEffect, useState } from "react";
 import { httpUrl, authHeaders } from "../lib/connection";
 
@@ -178,6 +179,7 @@ export function BrainView({ boot, first, onSaved }: { boot: Boot; first: boolean
           )}
         </div>
       )}
+      {!first && <PhoneAccess />}
     </div>
   );
 }

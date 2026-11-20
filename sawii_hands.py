@@ -70,7 +70,8 @@ TOOLS = [
 ]
 
 # GUI schemas are discovered from the installed Open Computer Use MCP server.
-READS = {"read_file", "list_files", "search_files", "ocu_list_apps", "ocu_get_app_state"}
+READS = {"read_file", "list_files", "search_files", "ocu_list_apps", "ocu_get_app_state",
+         "win_list", "win_screenshot", "win_wait", "win_release", "screen_text"}
 
 OCU_FILE = Path(__file__).with_name("ocu_mcp.py")
 
@@ -101,8 +102,21 @@ def load_ocu(path: str | None = None):
 
 
 class Hands:
-    def __init__(self, roots: list[str], approve: str = "ask", ask=None, computer_use: bool = False):
+    def __init__(self, roots: list[str], approve: str = "ask", ask=None, computer_use: bool = False,
+                 lane: str = "", window_hand: bool | None = None):
         self.computer_use = computer_use
+        # Window hand: this lane owns one app window, sees and acts only there. On by
+        # default wherever there is a screen; HANDS_WINDOW_HAND=0 turns it off.
+        self.win = None
+        if window_hand is None:
+            window_hand = os.environ.get("HANDS_WINDOW_HAND", "1") != "0"
+        if window_hand:
+            try:
+                import winhand
+                hand = winhand.WindowHand(lane)
+                self.win = hand if hand.available else None
+            except Exception as exc:  # noqa: BLE001 - never kill the engine over the screen hand
+                print(f"window hand OFF - {type(exc).__name__}: {exc}", file=sys.stderr)
         self.ocu = None
         self.ocu_error = ""
         if computer_use:
@@ -140,6 +154,18 @@ class Hands:
 
     # ---- tools ------------------------------------------------------------
     def run(self, name: str, a: dict, stop=None) -> str:
+        if name.startswith('win_') or name == 'screen_text':
+            if self.win is None:
+                return json.dumps({"error": "window hand unavailable on this machine"})
+            if not self.allowed(name, f"use your window: {name} {json.dumps(a)[:120]}"):
+                return json.dumps({"error": "the person declined"})
+            import winhand
+            try:
+                return winhand.dispatch(self.win, name, a)
+            except (KeyError, TypeError) as exc:
+                return json.dumps({"error": f"bad arguments: {exc}"})
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
         if name.startswith('ocu_'):
             if not self.computer_use:
                 return json.dumps({"error": "computer use is disabled (start with --computer-use)"})
@@ -167,15 +193,19 @@ class Hands:
         # A degraded computer-use start (ocu_mcp.py missing/broken, or the
         # open-computer-use server refusing to boot) advertises only the file
         # and shell tools rather than crashing the connection.
+        base = TOOLS
+        if self.win is not None:
+            import winhand
+            base = TOOLS + winhand.WIN_TOOLS
         if not self.computer_use or self.ocu is None:
-            return TOOLS
+            return base
         try:
-            return TOOLS + self.ocu.tools()
+            return base + self.ocu.tools()
         except Exception as exc:  # noqa: BLE001 - no GUI tools is not a reason to die
             self.ocu_error = f"Open Computer Use unavailable ({type(exc).__name__}: {exc})"
             self.ocu = None
             print(f"computer use OFF - {self.ocu_error}", file=sys.stderr)
-            return TOOLS
+            return base
 
     def t_shell(self, command: str, cwd: str | None = None, timeout_s: int = 120) -> str:
         where = self.resolve(cwd)
@@ -350,7 +380,7 @@ def main() -> None:
         raise SystemExit("--url and --key are required (or SAWII_HANDS_URL / SAWII_HANDS_KEY)")
     if a.place == "cloud" and a.approve == "ask":
         a.approve = "auto"   # nobody is at a terminal in the sandbox; it is hers to work in
-    asyncio.run(serve(a.url, a.key, Hands(a.root, a.approve, computer_use=a.computer_use), a.place,
+    asyncio.run(serve(a.url, a.key, Hands(a.root, a.approve, computer_use=a.computer_use, lane=str(a.lane or "")), a.place,
                       lane=str(a.lane or "")))
 
 

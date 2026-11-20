@@ -108,6 +108,24 @@ def _split_by_shape(goal: str) -> list[tuple[str, str]]:
 def _now() -> float:
     return time.time()
 
+def _trace(c, name: str, args, out: str) -> None:
+    """One step of what this card did, for the card's task diagram (last 40 kept)."""
+    try:
+        parsed = _json.loads(out)
+        bad = isinstance(parsed, dict) and bool(parsed.get("error") or parsed.get("isError"))
+    except (TypeError, ValueError):
+        bad = False
+    try:
+        arg = _json.dumps(args, ensure_ascii=False)[:160] if args else ""
+    except (TypeError, ValueError):
+        arg = str(args)[:160]
+    rows = c.meta.setdefault("trace", [])
+    rows.append({"t": time.time(), "tool": str(name)[:60], "arg": arg, "ok": not bad,
+                 "out": str(out)[:140]})
+    del rows[:-40]
+
+
+
 
 @dataclass
 class Court:
@@ -1021,6 +1039,8 @@ class HandsDeck:
             except ValueError:
                 last_tool_error = ""
             c.meta["last_tools"] = receipts[-3:]
+            _trace(c, name, args, text)
+            self.emit(c, "court.updated", changed="trace")
             if timeline is not None:
                 await timeline.append(persona_id, producer=c.meta.get("lane_label") or lane,
                                       kind="tool_result", task_id=lane,
@@ -1139,6 +1159,8 @@ class HandsDeck:
             out = str(await asyncio.wait_for(browser.run(persona_id, name, args, lane=lane),
                                              timeout=GOAL_TOOL_TIMEOUT))
             c.meta["last_tools"] = [*c.meta.get("last_tools", [])[-2:], f"{name}: {out[:200]}"]
+            _trace(c, name, args, out)
+            self.emit(c, "court.updated", changed="trace")
             return out
 
         async def read():

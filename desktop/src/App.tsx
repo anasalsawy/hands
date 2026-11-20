@@ -3,6 +3,7 @@ import { apiBase, hasConnection, isServedByBackend, personaKey, setApiBase, setP
 import { probe, systemApi, type ComputerStatus, type LinkInfo, type VoiceStatus } from "./lib/client";
 import { useDeck } from "./hooks/useDeck";
 import { ConnectView } from "./components/ConnectView";
+import { PairScreen } from "./components/PairPanels";
 import { DeckView } from "./components/DeckView";
 import { MotorView } from "./components/MotorView";
 import { ChatView } from "./components/ChatView";
@@ -53,6 +54,20 @@ export default function App() {
       setConnected(true);
       void deck.refresh();
     }
+    if (!b) {
+      // Not the computer itself (e.g. a phone): use a key from an earlier pairing.
+      let k = "";
+      try {
+        k = sessionStorage.getItem("hands.paired_key") || "";
+      } catch {
+        /* private mode */
+      }
+      if (k) {
+        setSessionKey(k);
+        setConnected(true);
+        void deck.refresh();
+      }
+    }
     setBooting(false);
     return b;
   }, [deck]);
@@ -98,6 +113,27 @@ export default function App() {
           <div className="empty">
             <p>Starting Hands…</p>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (embedded && !boot && !connected) {
+    return (
+      <div className="app">
+        <div className="bar">
+          <span className="brand">
+            <span className="mark" />
+            Hands
+          </span>
+        </div>
+        <div className="body">
+          <PairScreen
+            onPaired={() => {
+              setConnected(true);
+              void deck.refresh();
+            }}
+          />
         </div>
       </div>
     );
