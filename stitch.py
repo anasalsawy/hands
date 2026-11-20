@@ -399,7 +399,7 @@ async def run_local(args) -> None:
              engine_path)
     log.info("  Roots:      %s", ", ".join(args.root) if args.root else "(none — add --root)")
     log.info("  Agents:     %s", ", ".join(links.strategies()) or "(engine only)")
-    log.info("  Key:        %s", persona_key)
+    log.info("  Key:        %s…  (hidden)", persona_key[:6])
     log.info("  Link info:  http://0.0.0.0:%d/v1/link", args.port)
     log.info("  Courts:     http://0.0.0.0:%d/v1/courts  (the deck of concurrent desktop cards)", args.port)
     log.info("  Voice UI:   http://0.0.0.0:%d/app  (mic → /v1/voice)", args.port)
