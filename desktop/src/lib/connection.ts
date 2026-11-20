@@ -37,7 +37,14 @@ export function isStandaloneShell(): boolean {
   return !/^https?:$/.test(protocol) || hostname.endsWith(".localhost");
 }
 
+/** Served by the local Hands backend itself (hands_app.py serves the UI at /ui/). */
+export function isServedByBackend(): boolean {
+  if (typeof window === "undefined") return false;
+  return /^https?:$/.test(window.location.protocol) && window.location.pathname.startsWith("/ui");
+}
+
 export function apiBase(): string {
+  if (isServedByBackend()) return window.location.origin;
   const stored = safeGet(BASE_KEY).trim().replace(/\/+$/, "");
   return (stored || builtBase() || "http://127.0.0.1:8800").replace(/\/+$/, "");
 }
@@ -46,8 +53,15 @@ export function setApiBase(base: string): void {
   safeSet(BASE_KEY, base.trim().replace(/\/+$/, ""));
 }
 
+let sessionKey = "";
+
+/** The local backend hands its own key to its own window; kept in memory only. */
+export function setSessionKey(key: string): void {
+  sessionKey = key.trim();
+}
+
 export function personaKey(): string {
-  return safeGet(KEY_KEY) || (import.meta.env?.VITE_HANDS_PERSONA_KEY || "").trim();
+  return sessionKey || safeGet(KEY_KEY) || (import.meta.env?.VITE_HANDS_PERSONA_KEY || "").trim();
 }
 
 export function setPersonaKey(key: string): void {

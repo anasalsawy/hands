@@ -9,7 +9,7 @@ interface Busy {
   error?: string;
 }
 
-export function DeckView({ deck }: { deck: DeckState }) {
+export function DeckView({ deck, computerUse = true }: { deck: DeckState; computerUse?: boolean }) {
   const [title, setTitle] = useState("");
   const [kind, setKind] = useState<CourtKind>("desktop");
   const [busy, setBusy] = useState<Record<string, Busy>>({});
@@ -18,6 +18,28 @@ export function DeckView({ deck }: { deck: DeckState }) {
   const cardCount = deck.courts.length;
   // A create error (e.g. the card limit) is stale once the deck changes size.
   useEffect(() => setError(""), [cardCount]);
+  const [task, setTask] = useState("");
+  const [sending, setSending] = useState(false);
+
+  // The user states a goal; the mind decides how many lines of work it needs and
+  // the deck shows one card per line. Nobody picks a number of hands.
+  const runTask = async () => {
+    const goal = task.trim();
+    if (!goal) return;
+    setSending(true);
+    setError("");
+    try {
+      const court = await courtsApi.create({ title: goal.slice(0, 48), kind: "desktop" });
+      deck.apply(court);
+      deck.apply(await courtsApi.send(court.id, goal));
+      setTask("");
+      void deck.refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "could not start the task");
+    } finally {
+      setSending(false);
+    }
+  };
 
   const errors = useMemo(() => {
     const rows: string[] = [];
@@ -46,8 +68,44 @@ export function DeckView({ deck }: { deck: DeckState }) {
 
   return (
     <div className="stack">
-      <div className="panel">
-        <h3>Deck</h3>
+      {!computerUse && (
+        <div className="panel warn">
+          Screen, mouse and keyboard control is off: the <code>open-computer-use</code> helper is not installed. Cards
+          can still read and write files in your folders. Install it with <code>npm install -g open-computer-use</code>{" "}
+          and restart Hands.
+        </div>
+      )}
+      <div className="panel task">
+        <textarea
+          value={task}
+          rows={2}
+          placeholder="What should Hands do?  e.g. “open the invoices folder and total this month”, or “research three laptops in two browser tabs at once”"
+          onChange={(e) => setTask(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) void runTask();
+          }}
+        />
+        <div className="row">
+          <button className="btn" data-kind="primary" disabled={sending || !task.trim()} onClick={() => void runTask()}>
+            {sending ? "Starting…" : "Run"}
+          </button>
+          <span className="card-meta">Ctrl+Enter · Persona splits the goal into parallel lines; each gets a card</span>
+          <span className="spacer" />
+          <span className="pill">
+            <span className="dot" data-s={deck.link === "live" ? "live" : deck.link === "down" ? "down" : "idle"} />
+            {deck.snapshot ? `${deck.snapshot.count} cards · ${deck.snapshot.running} running` : "no snapshot"}
+          </span>
+        </div>
+        {errors.map((e) => (
+          <div className="err" key={e}>
+            {e}
+          </div>
+        ))}
+        {deck.error && <div className="err">deck: {deck.error}</div>}
+      </div>
+
+      <details className="panel manual">
+        <summary>Add a card by hand</summary>
         <div className="row">
           <label className="field" style={{ flex: "0 0 240px" }}>
             <span className="label">Card title</span>
@@ -84,13 +142,7 @@ export function DeckView({ deck }: { deck: DeckState }) {
             Refresh
           </button>
         </div>
-        {errors.map((e) => (
-          <div className="err" key={e}>
-            {e}
-          </div>
-        ))}
-        {deck.error && <div className="err">deck: {deck.error}</div>}
-      </div>
+      </details>
 
       {deck.loading ? (
         <div className="empty">
@@ -98,10 +150,10 @@ export function DeckView({ deck }: { deck: DeckState }) {
         </div>
       ) : deck.courts.length === 0 ? (
         <div className="empty">
-          <h2>No cards yet</h2>
+          <h2>Nothing running</h2>
           <p className="hint">
-            Add a card above. Each card runs its own desktop instance, and they run at the same time — a card holds
-            its own work line and its own engine process.
+            Type a goal above. Persona splits it into lines of work that can run at the same time; each line appears
+            here as a card with its own live view of the computer.
           </p>
         </div>
       ) : (

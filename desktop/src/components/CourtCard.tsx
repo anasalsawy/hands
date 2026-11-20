@@ -26,7 +26,8 @@ export function CourtCard({
   onChanged: (c: Court) => void;
   onBusy: (id: string, busy: boolean, error?: string) => void;
 }) {
-  const [goal, setGoal] = useState(court.goal || "");
+  const part = typeof court.meta?.my_part === "string" ? court.meta.my_part : "";
+  const [goal, setGoal] = useState(part || court.goal || "");
   const [target, setTarget] = useState<CourtTarget>(court.target || { kind: court.kind });
   const [showTarget, setShowTarget] = useState(false);
 
@@ -145,7 +146,7 @@ export function CourtCard({
               data-kind="primary"
               onClick={() => void run("start", () => courtsApi.spawn(court.id, { goal: goal || undefined }))}
             >
-              Start instance
+              {court.status === "done" || court.status === "failed" ? "Run again" : "Start instance"}
             </button>
           )}
           <button
@@ -187,6 +188,9 @@ export function CourtCard({
           </button>
         </div>
 
+        {court.status === "done" && typeof court.meta?.result === "string" && court.meta.result && (
+          <div className="result">{court.meta.result}</div>
+        )}
         {court.error && <div className="err">{court.error}</div>}
       </div>
     </section>

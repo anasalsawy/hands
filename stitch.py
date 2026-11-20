@@ -153,6 +153,20 @@ async def run_local(args) -> None:
     # was provided on the CLI or in the environment.
     persona_key = args.persona_key or os.environ.get("SAWII_PERSONA_KEY", "")
     persona_id = 0
+    key_file = Path(args.data_dir) / "local_key"
+
+    if not persona_key and key_file.exists():
+        # Reuse the persona this machine already created, so the app reconnects
+        # on its own after a restart instead of asking for a key it can't show twice.
+        try:
+            saved = key_file.read_text().strip()
+            from persona.identity import persona_by_key
+            row = await persona_by_key(rt.mind.store, saved) if saved else None
+            if row:
+                persona_key, persona_id = saved, int(row["id"])
+                log.info("Reusing local persona id=%d", persona_id)
+        except Exception:  # noqa: BLE001
+            log.debug("saved local key unusable; creating a new persona", exc_info=True)
 
     if not persona_key:
         # Create a default persona so spawned engines can auth.
@@ -170,6 +184,15 @@ async def run_local(args) -> None:
             # an elided hint here makes the deck unreachable (every /v1/courts
             # call 401s and /v1/court-events closes straight away with 4401).
             log.info("Created local persona id=%d key=%s", persona_id, persona_key)
+            try:
+                key_file.parent.mkdir(parents=True, exist_ok=True)
+                key_file.write_text(persona_key)
+                try:
+                    key_file.chmod(0o600)
+                except OSError:
+                    pass
+            except OSError:
+                log.warning("could not save the local persona key to %s", key_file)
         except Exception:
             # Table may not exist yet or DB might be read-only on first run.
             # Fall back to a generated key — the hands_ws endpoint
@@ -326,6 +349,11 @@ async def run_local(args) -> None:
     # Inject our routes into the app (Persona already owns /v1/voice).
     app.routes.insert(0, Route("/v1/link", link_status))
     app.routes.insert(0, Route("/v1/voice-status", voice_status_view))
+    extra = getattr(args, "extra_routes", None)
+    if extra is not None:
+        for r in extra(app=app, rt=rt, settings=settings, persona_key=persona_key,
+                       persona_id=persona_id, links=links):
+            app.routes.insert(0, r)
 
     # ── Which key is this persona using? ──────────────────────────────
     # A spawned engine registers on /v1/hands under whatever key it connects
@@ -360,13 +388,13 @@ async def run_local(args) -> None:
 
     # ── Start the Starlette/ASGI server ───────────────────────────────
     import uvicorn
-    config = uvicorn.Config(serve_app, host="0.0.0.0", port=args.port, log_level="info")
+    config = uvicorn.Config(serve_app, host=getattr(args, "host", "127.0.0.1"), port=args.port, log_level="info")
     server = uvicorn.Server(config)
 
     _install_shutdown_handlers(server, links, voice_sidecar)
 
     log.info("─── Hands stitched ───")
-    log.info("  Persona:    http://0.0.0.0:%d", args.port)
+    log.info("  Persona:    http://%s:%d", getattr(args, "host", "127.0.0.1"), args.port)
     log.info("  Engine:     %s  (model-less: no key, no LLM — thinks through R over /v1/hands)",
              engine_path)
     log.info("  Roots:      %s", ", ".join(args.root) if args.root else "(none — add --root)")
@@ -520,6 +548,8 @@ Persona-as-LLM for browser-use (Persona IS the LLM that browser-use calls):
     # ── Local mode ────────────────────────────────────────────────────
     local = sub.add_parser("local", help="Run Persona locally with auto-spawned engines")
     local.add_argument("--port", type=int, default=8800)
+    local.add_argument("--host", default="127.0.0.1",
+                       help="Interface to listen on (default loopback; the deck can drive your computer)")
     local.add_argument("--root", action="append", default=[],
                        help="Folders the engine may access (repeat for more)")
     local.add_argument("--approve", choices=["ask", "writes", "auto"], default="ask")

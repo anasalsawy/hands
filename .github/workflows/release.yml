@@ -1,0 +1,37 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the UI
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run build
+      - name: Package (portable + Windows bundle)
+        run: |
+          python packaging/package.py portable
+          python packaging/package.py windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hands
+          path: dist-release/*.zip
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-release/*.zip
+          generate_release_notes: true

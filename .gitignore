@@ -19,3 +19,8 @@ native-audio/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# release build output
+dist-release/
+build-portable/
+build-windows/

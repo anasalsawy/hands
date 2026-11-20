@@ -2,6 +2,15 @@
 
 Desktop app that gives Persona hands on your computer. Persona is the mind; this repo is the body.
 
+## Run Hands (the app)
+
+Download `Hands-windows.zip` from the latest [release](https://github.com/anasalsawy/hands/releases/latest), unzip, run `Hands.bat`.
+First launch asks for your **Persona URL + key** (the deployed Persona that thinks for the cards) and the folders the hands may touch.
+Then type a goal on **Courts** and press **Run**: Persona splits it into parallel lines, each a live card driving your computer.
+
+From source: `pip install -r requirements.txt && (cd desktop && npm ci && npm run build) && python hands_app.py`.
+`python packaging/package.py portable|windows` builds the zips (CI does this on every `v*` tag).
+
 ## Architecture
 
 ```
