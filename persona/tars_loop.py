@@ -225,7 +225,7 @@ async def run_tars_loop(*, goal: str, instructions: str, tools: list[dict],
                     plan.fired = 0
                     result = await asyncio.wait_for(infer(plan.with_advice(message["messages"])), timeout)
                 if result.get("finish_reason", "stop") not in ("stop", "tool_calls", "function_call"):
-                    raise RuntimeError("Persona response was truncated or could not complete")
+                    raise RuntimeError(f"Persona response was truncated or could not complete (finish_reason={result.get('finish_reason')!r}, text_tail={str(result.get('text') or '')[-120:]!r})")
                 if not str(result.get("text") or "").strip() and not result.get("tool_calls"):
                     raise RuntimeError("Persona returned no completed answer or tool calls")
             elif kind == "observe":
