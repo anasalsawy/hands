@@ -5,6 +5,7 @@ import { useDeck } from "./hooks/useDeck";
 import { ConnectView } from "./components/ConnectView";
 import { PairScreen } from "./components/PairPanels";
 import { FilesView } from "./components/Workspace";
+import { Icon, type IconName } from "./components/Icon";
 import { DeckView } from "./components/DeckView";
 import { MotorView } from "./components/MotorView";
 import { ChatView } from "./components/ChatView";
@@ -15,15 +16,15 @@ import { BrainView, fetchBoot, type Boot } from "./components/BrainView";
 
 type Tab = "courts" | "files" | "motor" | "chat" | "voice" | "phone" | "browser" | "brain";
 
-const TABS: { id: Tab; label: string }[] = [
-  { id: "courts", label: "Courts" },
-  { id: "files", label: "Files" },
-  { id: "motor", label: "Motor" },
-  { id: "chat", label: "Chat" },
-  { id: "voice", label: "Voice" },
-  { id: "phone", label: "Phone" },
-  { id: "browser", label: "Browser" },
-  { id: "brain", label: "Persona" },
+const TABS: { id: Tab; label: string; title: string; icon: IconName; primary: boolean }[] = [
+  { id: "courts", label: "Tasks", title: "Tasks", icon: "tasks", primary: true },
+  { id: "files", label: "Files", title: "Files", icon: "files", primary: true },
+  { id: "voice", label: "Talk", title: "Talk", icon: "orb", primary: true },
+  { id: "chat", label: "Chat", title: "Chat", icon: "chat", primary: true },
+  { id: "brain", label: "Settings", title: "Persona & settings", icon: "settings", primary: true },
+  { id: "motor", label: "Motor", title: "Motor", icon: "cpu", primary: false },
+  { id: "phone", label: "Phone", title: "Phone", icon: "phone", primary: false },
+  { id: "browser", label: "Browser", title: "Browser", icon: "globe", primary: false },
 ];
 
 interface Health {
@@ -190,43 +191,52 @@ export default function App() {
     );
   }
 
+  const cloud = Boolean(boot?.cloud);
+  const current = TABS.find((t) => t.id === tab) ?? TABS[0];
+  const live = deck.link === "live";
   return (
-    <div className="app">
-      <div className="bar">
-        <span className="brand">
+    <div className="shell">
+      <aside className="rail">
+        <div className="rail-brand">
           <span className="mark" />
-          Hands
-        </span>
-        <nav className="tabs">
+          <span className="rail-word">Hands</span>
+        </div>
+        <nav className="rail-nav" aria-label="Sections">
           {TABS.map((t) => (
-            <button key={t.id} className="tab" data-on={tab === t.id ? "1" : "0"} onClick={() => setTab(t.id)}>
-              {t.label}
+            <button key={t.id} className="rail-item" data-on={tab === t.id ? "1" : "0"} data-sec={t.primary ? "1" : "0"} onClick={() => setTab(t.id)}>
+              <Icon name={t.icon} />
+              <span>{t.label}</span>
             </button>
           ))}
         </nav>
-        <span className="spacer" />
-        <span className="pill">
-          <span className="dot" data-s={deck.link === "live" ? "live" : deck.link === "down" ? "down" : "idle"} />
-          {deck.snapshot ? `${deck.snapshot.count} cards` : "no data"} · {runningCount} running
-        </span>
-        <span className="card-meta" title="backend">
-          {apiBase()}
-        </span>
-        {!embedded && (
-        <button
-          className="btn"
-          data-size="sm"
-          onClick={() => {
-            setDraftBase(apiBase());
-            setDraftKey(personaKey());
-            setEditing((v) => !v);
-          }}
-        >
-          {editing ? "Close" : "Settings"}
-        </button>
-        )}
-      </div>
+        <div className="rail-foot">
+          <span className="dot" data-s={live ? "live" : deck.link === "down" ? "down" : "idle"} />
+          <span>{cloud ? "Cloud workspace" : "This computer"}</span>
+        </div>
+      </aside>
 
+      <main className="stage">
+        <header className="topbar">
+          <h1>{current.title}</h1>
+          <span className="spacer" />
+          <span className="pill" title={`${apiBase()} · links ${health?.link ?? "—"} · ${health?.models ?? 0} models`}>
+            <span className="dot" data-s={live ? "live" : deck.link === "down" ? "down" : "idle"} />
+            {runningCount > 0 ? `${runningCount} working` : deck.snapshot ? `${deck.snapshot.count} cards` : "connecting"}
+          </span>
+          {!embedded && (
+            <button
+              className="btn"
+              data-size="sm"
+              onClick={() => {
+                setDraftBase(apiBase());
+                setDraftKey(personaKey());
+                setEditing((v) => !v);
+              }}
+            >
+              {editing ? "Close" : "Connection"}
+            </button>
+          )}
+        </header>
       <div className="body">
         {editing && (
           <div className="panel" style={{ marginBottom: 12 }}>
@@ -286,16 +296,20 @@ export default function App() {
         )}
       </div>
 
-      <div className="footer">
-        <span>{apiBase()}</span>
-        <span>deck {health?.deck ? "live" : "down"}</span>
-        <span>links {health?.link ?? "—"}</span>
-        <span>computer {health?.computer ?? "—"}</span>
-        <span>voice {health?.voice ?? "—"}</span>
-        <span>{health?.models ?? 0} models</span>
-        <span className="spacer" />
-        <span>{deck.error || ""}</span>
-      </div>
+      </main>
+
+      <nav className="dock" aria-label="Sections">
+        {TABS.filter((t) => t.primary).map((t) => (
+          <button key={t.id} className="dock-item" data-on={tab === t.id ? "1" : "0"} onClick={() => setTab(t.id)}>
+            <Icon name={t.icon} />
+            <span>{t.label}</span>
+          </button>
+        ))}
+        <button className="dock-item" data-on={TABS.find((t) => t.id === tab)?.primary ? "0" : "1"} onClick={() => setTab(TABS.find((t) => t.id === tab && !t.primary) ? tab : "motor")}>
+          <Icon name="more" />
+          <span>More</span>
+        </button>
+      </nav>
     </div>
   );
 }

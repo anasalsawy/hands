@@ -394,7 +394,8 @@ export function VoiceView() {
     <div className="split">
       <div className="panel">
         <VoiceOrb state={orb} levelRef={levelRef} caption={caption} onTap={() => (live ? stopLive() : startLive())} />
-        <h3>Voice line</h3>
+        <details className="adv">
+        <summary>Session controls</summary>
         <div className="row">
           <span className="pill">
             <span className="dot" data-s={conn === "open" ? "live" : conn === "idle" ? "idle" : "down"} />
@@ -429,6 +430,7 @@ export function VoiceView() {
             Discard
           </button>
         </div>
+        </details>
         {note && <div className="err">{note}</div>}
         <div className="row">
           <input
