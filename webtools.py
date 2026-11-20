@@ -89,12 +89,37 @@ def web_fetch(url: str, max_chars: int = 4000) -> str:
                        "text": text[:max_chars], "truncated": len(text) > max_chars})
 
 
-def web_search(query: str, max_results: int = 8) -> str:
-    n = max(1, min(int(max_results or 8), 15))
-    try:
-        data, _ = _get("https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query}))
-    except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"search failed: {type(exc).__name__}: {exc}"})
+def _bing_url(href: str) -> str:
+    href = htmllib.unescape(href)
+    u = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("u")
+    if u and u[0].startswith("a1"):
+        import base64
+        b = u[0][2:]
+        try:
+            return base64.urlsafe_b64decode(b + "=" * (-len(b) % 4)).decode("utf-8")
+        except Exception:  # noqa: BLE001
+            return href
+    return href
+
+
+def _search_bing(query: str, n: int) -> list[dict]:
+    data, _ = _get("https://www.bing.com/search?" + urllib.parse.urlencode({"q": query, "setlang": "en"}))
+    page = data.decode("utf-8", errors="replace")
+    out = []
+    for blk in re.findall(r'(?is)<li class="b_algo".*?</li>', page):
+        a = re.search(r'(?is)<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', blk)
+        if not a:
+            continue
+        snip = re.search(r'(?is)<p[^>]*>(.*?)</p>', blk)
+        out.append({"title": _text(a.group(2)), "url": _bing_url(a.group(1)),
+                    "snippet": _text(snip.group(1)) if snip else ""})
+        if len(out) >= n:
+            break
+    return out
+
+
+def _search_ddg(query: str, n: int) -> list[dict]:
+    data, _ = _get("https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query}))
     page = data.decode("utf-8", errors="replace")
     out = []
     for m in re.finditer(r'(?is)<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>(.*?)(?=<a[^>]+class="result__a"|$)', page):
@@ -107,6 +132,20 @@ def web_search(query: str, max_results: int = 8) -> str:
         out.append({"title": title, "url": url, "snippet": _text(snip.group(1)) if snip else ""})
         if len(out) >= n:
             break
+    return out
+
+
+def web_search(query: str, max_results: int = 6) -> str:
+    n = max(1, min(int(max_results or 6), 10))
+    errs, out = [], []
+    for fn in (_search_bing, _search_ddg):
+        try:
+            out = fn(query, n)
+        except Exception as exc:  # noqa: BLE001
+            errs.append(f"{fn.__name__}: {type(exc).__name__}: {exc}")
+            continue
+        if out:
+            break
     if not out:
-        return json.dumps({"error": "no results (the search page may have changed or blocked this request)"})
+        return json.dumps({"error": "search failed or returned nothing", "detail": errs})
     return json.dumps({"query": query, "results": out})
