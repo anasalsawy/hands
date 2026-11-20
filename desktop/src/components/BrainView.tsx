@@ -17,6 +17,7 @@ export interface Boot {
   brain: BrainInfo;
   roots: string[];
   approve: "ask" | "writes" | "auto";
+  cloud?: boolean;
   computer_use?: boolean;
   missing?: string[];
 }
@@ -31,7 +32,7 @@ interface CheckResult {
 
 export async function fetchBoot(): Promise<Boot | null> {
   try {
-    const res = await fetch(httpUrl("/hands/bootstrap"));
+    const res = await fetch(httpUrl("/hands/bootstrap"), { headers: authHeaders() });
     return res.ok ? ((await res.json()) as Boot) : null;
   } catch {
     return null;
@@ -179,7 +180,7 @@ export function BrainView({ boot, first, onSaved }: { boot: Boot; first: boolean
           )}
         </div>
       )}
-      {!first && <PhoneAccess />}
+      {!first && !boot.cloud && <PhoneAccess />}
     </div>
   );
 }

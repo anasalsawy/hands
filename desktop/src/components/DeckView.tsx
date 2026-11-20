@@ -1,4 +1,5 @@
 // The deck: one card per Court, plus the controls that act on the whole deck.
+import { isCloud } from "../lib/connection";
 import { useMemo, useState, useEffect } from "react";
 import { courtsApi, type Court, type CourtKind } from "../lib/client";
 import type { DeckState } from "../hooks/useDeck";
@@ -92,7 +93,7 @@ export function DeckView({ deck, missing = [] }: { deck: DeckState; missing?: st
             onChange={(e) => setTaskKind(e.target.value as CourtKind)}
             style={{ width: 130 }}
           >
-            <option value="desktop">Computer</option>
+            <option value="desktop">{isCloud() ? "Workspace" : "Computer"}</option>
             <option value="browser">Browser</option>
           </select>
           <button className="btn" data-kind="primary" disabled={sending || !task.trim()} onClick={() => void runTask()}>

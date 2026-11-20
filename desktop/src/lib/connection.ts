@@ -104,3 +104,11 @@ export function authHeaders(extra?: Record<string, string>): Record<string, stri
     ...(extra || {}),
   };
 }
+// Hosted mode: no computer behind this app, cards work in a cloud workspace.
+let cloudMode = false;
+export function setCloudMode(on: boolean): void {
+  cloudMode = on;
+}
+export function isCloud(): boolean {
+  return cloudMode;
+}

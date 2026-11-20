@@ -1,0 +1,9 @@
+.git
+desktop/node_modules
+desktop/dist
+engine/node_modules
+dist-release
+data
+__pycache__
+*.pyc
+.browser-use-sdk

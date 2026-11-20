@@ -70,7 +70,7 @@ TOOLS = [
 ]
 
 # GUI schemas are discovered from the installed Open Computer Use MCP server.
-READS = {"read_file", "list_files", "search_files", "ocu_list_apps", "ocu_get_app_state",
+READS = {"web_search", "web_fetch", "read_file", "list_files", "search_files", "ocu_list_apps", "ocu_get_app_state",
          "win_list", "win_screenshot", "win_wait", "win_release", "screen_text"}
 
 OCU_FILE = Path(__file__).with_name("ocu_mcp.py")
@@ -166,6 +166,12 @@ class Hands:
                 return json.dumps({"error": f"bad arguments: {exc}"})
             except Exception as exc:  # noqa: BLE001
                 return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
+        if name in ("web_search", "web_fetch"):
+            import webtools
+            try:
+                return getattr(webtools, name)(**a)
+            except TypeError as exc:
+                return json.dumps({"error": f"bad arguments: {exc}"})
         if name.startswith('ocu_'):
             if not self.computer_use:
                 return json.dumps({"error": "computer use is disabled (start with --computer-use)"})
@@ -193,10 +199,11 @@ class Hands:
         # A degraded computer-use start (ocu_mcp.py missing/broken, or the
         # open-computer-use server refusing to boot) advertises only the file
         # and shell tools rather than crashing the connection.
-        base = TOOLS
+        import webtools
+        base = TOOLS + webtools.WEB_TOOLS
         if self.win is not None:
             import winhand
-            base = TOOLS + winhand.WIN_TOOLS
+            base = base + winhand.WIN_TOOLS
         if not self.computer_use or self.ocu is None:
             return base
         try:
@@ -213,7 +220,12 @@ class Hands:
             return json.dumps({"error": "the person declined this command"})
         shell = ["powershell", "-NoProfile", "-Command", command] if os.name == "nt" else ["bash", "-lc", command]
         try:
-            p = subprocess.run(shell, cwd=where, capture_output=True, text=True,
+            env = None
+            if os.environ.get("HANDS_CLOUD") == "1":
+                # the hosted sandbox must not hand its own secrets to commands it runs
+                env = {k: v for k, v in os.environ.items()
+                       if not re.match(r"(HANDS_|SAWII_|RAILWAY_|PERSONA_|.*(KEY|TOKEN|SECRET|PASSWORD))", k, re.I)}
+            p = subprocess.run(shell, cwd=where, env=env, capture_output=True, text=True,
                                timeout=max(1, min(int(timeout_s or 120), 600)))
         except subprocess.TimeoutExpired:
             return json.dumps({"error": f"timed out after {timeout_s} s"})

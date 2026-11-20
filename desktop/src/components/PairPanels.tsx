@@ -91,13 +91,13 @@ export function PairScreen({ onPaired }: { onPaired: () => void }) {
       const res = await fetch(httpUrl("/hands/pair"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code: code.replace(/\s/g, "") }),
+        body: JSON.stringify({ code: code.trim() }),
       });
       const j = (await res.json()) as { persona_key?: string; error?: { message: string } };
       if (res.ok && j.persona_key) {
         setSessionKey(j.persona_key);
         try {
-          sessionStorage.setItem("hands.paired_key", j.persona_key);
+          localStorage.setItem("hands.paired_key", j.persona_key);
         } catch {
           /* private mode */
         }
@@ -111,20 +111,21 @@ export function PairScreen({ onPaired }: { onPaired: () => void }) {
 
   return (
     <div className="panel pair">
-      <h3>Connect this phone</h3>
-      <p className="card-meta">On your computer open Hands → Persona → Phone access, then type the 6-digit code.</p>
+      <h3>Sign in to Hands</h3>
+      <p className="card-meta">Type the access key for this Hands. On a phone paired with your own computer, type the 6-digit code shown under Persona → Phone access.</p>
       <input
         className="pair-input"
-        inputMode="numeric"
-        autoComplete="one-time-code"
-        maxLength={7}
-        placeholder="000 000"
+        type="password"
+        autoComplete="current-password"
+        autoCapitalize="off"
+        spellCheck={false}
+        placeholder="access key or code"
         value={code}
         onChange={(e) => setCode(e.target.value)}
         onKeyDown={(e) => e.key === "Enter" && void submit()}
       />
-      <button className="btn" onClick={() => void submit()} disabled={busy || code.replace(/\s/g, "").length < 6}>
-        {busy ? "Connecting…" : "Connect"}
+      <button className="btn" onClick={() => void submit()} disabled={busy || code.trim().length < 6}>
+        {busy ? "Signing in…" : "Sign in"}
       </button>
       {err && <div className="err">{err}</div>}
     </div>

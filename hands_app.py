@@ -33,6 +33,8 @@ sys.path.insert(0, str(ROOT))
 
 DEFAULT_BRAIN_URL = "https://anasalsawy--persona-crossing-personacrossing-web.us-east.modal.run/v1"
 DEFAULT_MODEL = "persona-l"
+CLOUD = os.environ.get("HANDS_CLOUD") == "1"   # hosted: no computer, a sandbox workspace
+ACCESS_KEY = ""                                   # cloud login secret (set in main)
 RESTART_CODE = 75  # supervised launchers (Hands.bat / hands.sh) restart on this
 
 
@@ -100,6 +102,10 @@ def computer_use_ready() -> bool:
 def missing_parts() -> list[str]:
     """What the cards need that this machine does not have yet (shown in the UI)."""
     out = []
+    if CLOUD:
+        if not (shutil.which("node") or shutil.which("node.exe")) or not (ROOT / "engine" / "node_modules").exists():
+            out.append("Omni-TARS loop (Node 22 + engine dependencies)")
+        return out
     if not (shutil.which("node") or shutil.which("node.exe")):
         out.append("Node.js 22+ (runs the Omni-TARS loop)")
     elif not (ROOT / "engine" / "node_modules").exists():
@@ -138,11 +144,20 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
     from starlette.routing import Mount, Route
     from starlette.staticfiles import StaticFiles
 
+    def bearer_ok(request) -> bool:
+        import secrets
+        tok = (request.headers.get("authorization") or "")[7:].strip() or request.query_params.get("key", "")
+        return bool(persona_key) and bool(tok) and secrets.compare_digest(tok, persona_key)
+
+    def owner(request) -> bool:
+        """The person this runs for: the machine itself, or (hosted) a signed-in client."""
+        return _loopback(request) or (CLOUD and bearer_ok(request))
+
     def deny():
         return JSONResponse({"error": {"message": "local app only"}}, status_code=403)
 
     async def bootstrap(request):
-        if not _loopback(request):
+        if not owner(request):
             return deny()
         cfg = load_config()
         return JSONResponse({
@@ -159,6 +174,7 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
             "approve": approve,
             "port": port,
             "lan": bool(cfg.get("lan")),
+            "cloud": CLOUD,
             "computer_use": computer_use_ready(),
             "missing": missing_parts(),
         })
@@ -189,7 +205,7 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
 
     async def pair_info(request):
         """Loopback only: the code a phone types, and the addresses it can reach."""
-        if not _loopback(request):
+        if not owner(request):
             return deny()
         import secrets
         if request.query_params.get("new") or time.time() > pair["until"]:
@@ -217,16 +233,20 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
         except ValueError:
             body = {}
         code = str(body.get("code", "")).strip()
-        ok = bool(pair["code"]) and now <= pair["until"] and secrets.compare_digest(code, pair["code"])
+        if CLOUD:
+            ok = bool(ACCESS_KEY) and secrets.compare_digest(code, ACCESS_KEY)
+        else:
+            ok = bool(pair["code"]) and now <= pair["until"] and secrets.compare_digest(code, pair["code"])
         if not ok:
             recent.append(now)
             fails[client] = recent
-            return JSONResponse({"error": {"message": "wrong or expired code"}}, status_code=403)
-        pair["code"] = ""  # one use
+            return JSONResponse({"error": {"message": "wrong code or key"}}, status_code=403)
+        if not CLOUD:
+            pair["code"] = ""  # one use
         return JSONResponse({"persona_key": persona_key, "persona_id": persona_id})
 
     async def put_config(request):
-        if not _loopback(request):
+        if not owner(request):
             return deny()
         try:
             body = await request.json()
@@ -250,7 +270,7 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
 
     async def brain_check(request):
         """A real call through the mind's lobe: plain reply, then a tool-calling probe."""
-        if not _loopback(request):
+        if not owner(request):
             return deny()
         lobe = getattr(rt.mind, "a", None)
         out: dict = {"ok": False, "url": getattr(getattr(lobe, "endpoint", None), "base_url", "")}
@@ -286,10 +306,57 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
     async def lane_windows(request):
         """Which window each lane owns, so a card can show exactly that window."""
         auth = (request.headers.get("authorization") or "")[7:].strip()
-        if auth != persona_key and not _loopback(request):
+        if auth != persona_key and not owner(request):
             return deny()
         import winhand
         return JSONResponse({"lanes": winhand.LaneWindows().all()})
+
+    ws_root = Path(roots[0]).expanduser().resolve() if roots else Path.cwd()
+    SKIP = {".git", "node_modules", "__pycache__", ".cache", ".venv"}
+
+    def _inside(rel: str) -> Path | None:
+        p = (ws_root / rel.lstrip("/\\")).resolve()
+        return p if p == ws_root or ws_root in p.parents else None
+
+    async def ws_tree(request):
+        """Every file the cards have made, newest first."""
+        if not owner(request):
+            return deny()
+        files = []
+        for dirpath, dirs, names in os.walk(ws_root):
+            dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith(".")]
+            for n in names:
+                fp = Path(dirpath) / n
+                try:
+                    st = fp.stat()
+                except OSError:
+                    continue
+                files.append({"path": fp.relative_to(ws_root).as_posix(), "size": st.st_size, "mtime": st.st_mtime})
+            if len(files) > 3000:
+                break
+        files.sort(key=lambda f: -f["mtime"])
+        return JSONResponse({"root": ws_root.name, "files": files[:500], "now": time.time()})
+
+    async def ws_file(request):
+        """One file, to read or show. HTML is sandboxed; nothing here can run scripts on the app's origin."""
+        if not owner(request):
+            return deny()
+        fp = _inside(request.query_params.get("path", ""))
+        if fp is None or not fp.is_file():
+            return JSONResponse({"error": {"message": "no such file"}}, status_code=404)
+        import mimetypes
+        ctype = mimetypes.guess_type(fp.name)[0] or "text/plain"
+        if fp.stat().st_size > 8_000_000:
+            return JSONResponse({"error": {"message": "file too large to show"}}, status_code=413)
+        headers = {"Content-Security-Policy": "sandbox allow-scripts; default-src 'none'; img-src data: blob: https:; "
+                   "style-src 'unsafe-inline' https:; script-src 'unsafe-inline' https:; font-src data: https:",
+                   "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"}
+        if request.query_params.get("download"):
+            headers["Content-Disposition"] = f'attachment; filename="{fp.name}"'
+            return FileResponse(fp, media_type="application/octet-stream", headers=headers)
+        if ctype.startswith("text/") or ctype in ("application/json", "application/javascript", "application/xml") or not Path(fp).suffix:
+            ctype = ctype if ctype == "text/html" else (ctype if ctype.startswith("image/") else "text/plain; charset=utf-8")
+        return FileResponse(fp, media_type=ctype, headers=headers)
 
     async def index(request):
         return RedirectResponse("/ui/")
@@ -304,6 +371,8 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
         Route("/hands/pair", pair_claim, methods=["POST"]),
         Route("/hands/brain-check", brain_check, methods=["POST"]),
         Route("/hands/lane-windows", lane_windows, methods=["GET"]),
+        Route("/hands/workspace", ws_tree, methods=["GET"]),
+        Route("/hands/workspace/file", ws_file, methods=["GET"]),
         Route("/", index, methods=["GET"]),
     ]
     if Path(ui_dir, "index.html").exists():
@@ -358,6 +427,7 @@ def _open_window(url: str) -> None:
 
 
 def main() -> None:
+    global CLOUD, ACCESS_KEY
     ap = argparse.ArgumentParser(description="Hands: the Persona computer-use app")
     ap.add_argument("--port", type=int, default=int(os.environ.get("HANDS_PORT", "8800")))
     ap.add_argument("--root", action="append", default=[], help="folder the engine may touch (repeatable)")
@@ -366,12 +436,42 @@ def main() -> None:
     ap.add_argument("--no-open", action="store_true", help="do not open the app window")
     ap.add_argument("--no-voice", action="store_true", default=True)
     ap.add_argument("--ui-dir", default=None)
+    ap.add_argument("--cloud", action="store_true", default=CLOUD,
+                    help="hosted mode: no computer, work happens in a sandbox workspace; login with HANDS_ACCESS_KEY")
     a = ap.parse_args()
 
+    if a.cloud:
+        CLOUD = True
+        os.environ["HANDS_CLOUD"] = "1"
+        a.no_open = True
+        a.port = int(os.environ.get("PORT") or a.port)
     if a.data_dir:
         os.environ["HANDS_DATA_DIR"] = a.data_dir
     cfg = load_config()
-    roots = a.root or cfg.get("roots") or [str(Path.home() / "Hands")]
+    if CLOUD:
+        # a hosted app is configured from its environment; the UI can still change it
+        for env_k, cfg_k in (("HANDS_BRAIN_URL", "brain_url"), ("HANDS_BRAIN_KEY", "brain_key"),
+                             ("HANDS_BRAIN_MODEL", "brain_model")):
+            if os.environ.get(env_k, "").strip() and not cfg.get(cfg_k):
+                cfg[cfg_k] = os.environ[env_k].strip()
+        ACCESS_KEY = os.environ.get("HANDS_ACCESS_KEY", "").strip()
+        if not ACCESS_KEY:
+            kf = data_dir() / "access_key"
+            try:
+                ACCESS_KEY = kf.read_text().strip()
+            except OSError:
+                import secrets as _s
+                ACCESS_KEY = _s.token_urlsafe(18)
+                data_dir().mkdir(parents=True, exist_ok=True)
+                kf.write_text(ACCESS_KEY)
+                try:
+                    kf.chmod(0o600)
+                except OSError:
+                    pass
+        cfg.setdefault("approve", "auto")
+        save_config(cfg)  # so /hands/bootstrap and the restart path see the same setup
+    default_root = (data_dir() / "workspace") if CLOUD else (Path.home() / "Hands")
+    roots = a.root or ([] if CLOUD else cfg.get("roots")) or [str(default_root)]
     for r in roots:
         try:
             Path(r).expanduser().mkdir(parents=True, exist_ok=True)
@@ -380,7 +480,7 @@ def main() -> None:
     roots = [str(Path(r).expanduser()) for r in roots]
     approve = a.approve or cfg.get("approve") or "auto"
     has_brain = apply_brain_env(cfg)
-    if computer_use_ready():
+    if computer_use_ready() and not CLOUD:
         os.environ.setdefault("SAWII_HANDS_COMPUTER_USE", "1")
 
     ui_dir = a.ui_dir or next((str(p) for p in (ROOT / "ui", ROOT / "desktop" / "dist") if (p / "index.html").exists()),
@@ -396,7 +496,7 @@ def main() -> None:
         return build_routes(**kw, port=a.port, roots=roots, approve=approve, ui_dir=ui_dir)
 
     ns = SimpleNamespace(
-        port=a.port, host=("0.0.0.0" if cfg.get("lan") else "127.0.0.1"), root=roots, approve=approve, deepinfra_key="",
+        port=a.port, host=("0.0.0.0" if (cfg.get("lan") or CLOUD) else "127.0.0.1"), place=("cloud" if CLOUD else "computer"), root=roots, approve=approve, deepinfra_key="",
         persona_key="", data_dir=str(data_dir()), agent=[], no_voice=a.no_voice,
         extra_routes=extra_routes,
     )

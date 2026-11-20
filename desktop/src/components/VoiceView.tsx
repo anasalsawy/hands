@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { systemApi, type VoiceStatus } from "../lib/client";
 import { keyedWsUrl, personaKey } from "../lib/connection";
+import { VoiceOrb, type OrbState } from "./VoiceOrb";
 
 type Line = { id: number; who: "you" | "persona" | "note"; text: string };
 
@@ -29,6 +30,12 @@ export function VoiceView() {
   const srcsRef = useRef<AudioBufferSourceNode[]>([]);
   const liveRef = useRef<{ stop: () => void } | null>(null);
   const [live, setLive] = useState(false);
+  const [orb, setOrb] = useState<OrbState>("idle");
+  const [caption, setCaption] = useState("");
+  const levelRef = useRef(0);
+  const outAnalyser = useRef<AnalyserNode | null>(null);
+  const micAnalyser = useRef<{ node: AnalyserNode; stop: () => void } | null>(null);
+  const thinkingRef = useRef(false);
   const linesRef = useRef<HTMLDivElement | null>(null);
 
   const add = useCallback((who: Line["who"], text: string) => {
@@ -68,7 +75,13 @@ export function VoiceView() {
     for (let i = 0; i < pcm.length; i += 1) chan[i] = pcm[i] / 32768;
     const src = ctx.createBufferSource();
     src.buffer = out;
-    src.connect(ctx.destination);
+    if (!outAnalyser.current) {
+      const an = ctx.createAnalyser();
+      an.fftSize = 512;
+      an.connect(ctx.destination);
+      outAnalyser.current = an;
+    }
+    src.connect(outAnalyser.current);
     const startAt = Math.max(ctx.currentTime, playRef.current);
     src.start(startAt);
     playRef.current = startAt + out.duration;
@@ -116,15 +129,30 @@ export function VoiceView() {
           add("note", `voice session open · tts=${String(frame.tts)} asr=${String(frame.asr)}`);
           break;
         case "transcript":
+          thinkingRef.current = true;
+          setCaption("");
           add("you", String(frame.text || ""));
           break;
+        case "say":
+          // client-side voice: the browser speaks each sentence as it arrives
+          if ("speechSynthesis" in window && frame.text) {
+            thinkingRef.current = false;
+            const u = new SpeechSynthesisUtterance(String(frame.text));
+            u.rate = 1.05;
+            window.speechSynthesis.speak(u);
+          }
+          break;
         case "delta":
+          thinkingRef.current = false;
+          setCaption((c) => (c.length > 240 ? "" : c) + String(frame.text || ""));
           add("persona", String(frame.text || ""));
           break;
         case "done":
+          thinkingRef.current = false;
           add("note", `turn done${frame.first_audio_ms ? ` · first audio ${Math.round(Number(frame.first_audio_ms))} ms` : ""}`);
           break;
         case "error":
+          thinkingRef.current = false;
           add("note", `error: ${String(frame.detail || "unknown")}`);
           break;
         default:
@@ -154,6 +182,7 @@ export function VoiceView() {
     }
     srcsRef.current = [];
     playRef.current = 0;
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     const sock = sockRef.current;
     if (sock?.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "interrupt" }));
   }, []);
@@ -163,6 +192,8 @@ export function VoiceView() {
   const stopLive = useCallback(() => {
     liveRef.current?.stop();
     liveRef.current = null;
+    micAnalyser.current?.stop();
+    micAnalyser.current = null;
     setLive(false);
   }, []);
 
@@ -200,6 +231,8 @@ export function VoiceView() {
         const speaking = srcsRef.current.length > 0;
         if (r.isFinal) {
           sock.send(JSON.stringify({ type: "text", text }));
+          thinkingRef.current = true;
+          setCaption("");
           add("you", text);
           lastPartial = "";
         } else if (text !== lastPartial) {
@@ -240,7 +273,52 @@ export function VoiceView() {
       },
     };
     setLive(true);
+    void (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+        const Ctor2 = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        const c2 = new Ctor2();
+        const an = c2.createAnalyser();
+        an.fftSize = 512;
+        c2.createMediaStreamSource(stream).connect(an);
+        micAnalyser.current = {
+          node: an,
+          stop: () => {
+            stream.getTracks().forEach((t) => t.stop());
+            void c2.close().catch(() => undefined);
+          },
+        };
+      } catch {
+        /* the orb still works from state alone */
+      }
+    })();
   }, [add, connect, hush]);
+
+  // The orb: state from what is actually happening, level from the audio on either side.
+  useEffect(() => {
+    const buf = new Uint8Array(256);
+    const t = window.setInterval(() => {
+      const speaking = srcsRef.current.length > 0 || ("speechSynthesis" in window && window.speechSynthesis.speaking);
+      let state: OrbState = "idle";
+      if (speaking) state = "speaking";
+      else if (thinkingRef.current) state = "thinking";
+      else if (live || recording) state = "listening";
+      setOrb((prev) => (prev === state ? prev : state));
+      const pcm = srcsRef.current.length > 0;
+      const an = pcm ? outAnalyser.current : speaking ? null : micAnalyser.current?.node;
+      if (speaking && !pcm) levelRef.current = 0.35 + 0.25 * Math.abs(Math.sin(Date.now() / 140));
+      else if (an && (speaking || live)) {
+        an.getByteTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i += 1) {
+          const v = (buf[i] - 128) / 128;
+          sum += v * v;
+        }
+        levelRef.current = Math.min(1, Math.sqrt(sum / buf.length) * 4);
+      } else levelRef.current = state === "thinking" ? 0.25 : 0;
+    }, 50);
+    return () => window.clearInterval(t);
+  }, [live, recording]);
 
   const stopRecording = useCallback(async () => {
     const rec = recorderRef.current;
@@ -315,6 +393,7 @@ export function VoiceView() {
   return (
     <div className="split">
       <div className="panel">
+        <VoiceOrb state={orb} levelRef={levelRef} caption={caption} onTap={() => (live ? stopLive() : startLive())} />
         <h3>Voice line</h3>
         <div className="row">
           <span className="pill">

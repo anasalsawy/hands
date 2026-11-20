@@ -222,7 +222,7 @@ async def run_local(args) -> None:
         "persona_key": persona_key,
         "roots": args.root or [],
         "approve": args.approve,
-        "place": "computer",
+        "place": getattr(args, "place", "computer"),
     })
 
     # ── Register any external agents from --agent flags ───────────────

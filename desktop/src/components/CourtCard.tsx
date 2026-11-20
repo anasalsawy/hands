@@ -8,6 +8,8 @@ import { useEffect, useState } from "react";
 import { courtsApi, type Court, type CourtKind, type CourtTarget } from "../lib/client";
 import { LiveSurface } from "./LiveSurface";
 import { TaskDiagram } from "./TaskDiagram";
+import { WorkspacePeek } from "./Workspace";
+import { isCloud } from "../lib/connection";
 
 const LIVE: Court["status"][] = ["spawning", "running", "waiting"];
 
@@ -77,6 +79,7 @@ export function CourtCard({
       ) : (
         <TaskDiagram court={court} />
       )}
+      {court.kind !== "browser" && isCloud() && <WorkspacePeek court={court} />}
 
       <div className="card-body">
         {showTarget && (

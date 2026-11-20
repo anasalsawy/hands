@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { apiBase, hasConnection, isServedByBackend, personaKey, setApiBase, setPersonaKey, setSessionKey } from "./lib/connection";
+import { apiBase, hasConnection, isServedByBackend, personaKey, setApiBase, setCloudMode, setPersonaKey, setSessionKey } from "./lib/connection";
 import { probe, systemApi, type ComputerStatus, type LinkInfo, type VoiceStatus } from "./lib/client";
 import { useDeck } from "./hooks/useDeck";
 import { ConnectView } from "./components/ConnectView";
 import { PairScreen } from "./components/PairPanels";
+import { FilesView } from "./components/Workspace";
 import { DeckView } from "./components/DeckView";
 import { MotorView } from "./components/MotorView";
 import { ChatView } from "./components/ChatView";
@@ -12,10 +13,11 @@ import { PhoneView } from "./components/PhoneView";
 import { BrowserView } from "./components/BrowserView";
 import { BrainView, fetchBoot, type Boot } from "./components/BrainView";
 
-type Tab = "courts" | "motor" | "chat" | "voice" | "phone" | "browser" | "brain";
+type Tab = "courts" | "files" | "motor" | "chat" | "voice" | "phone" | "browser" | "brain";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "courts", label: "Courts" },
+  { id: "files", label: "Files" },
   { id: "motor", label: "Motor" },
   { id: "chat", label: "Chat" },
   { id: "voice", label: "Voice" },
@@ -50,6 +52,7 @@ export default function App() {
     const b = await fetchBoot();
     if (b) {
       setSessionKey(b.persona_key);
+      setCloudMode(Boolean(b.cloud));
       setBoot(b);
       setConnected(true);
       void deck.refresh();
@@ -58,12 +61,17 @@ export default function App() {
       // Not the computer itself (e.g. a phone): use a key from an earlier pairing.
       let k = "";
       try {
-        k = sessionStorage.getItem("hands.paired_key") || "";
+        k = localStorage.getItem("hands.paired_key") || "";
       } catch {
         /* private mode */
       }
       if (k) {
         setSessionKey(k);
+        const again = await fetchBoot();  // hosted: a signed-in client may read the setup too
+        if (again) {
+          setCloudMode(Boolean(again.cloud));
+          setBoot(again);
+        }
         setConnected(true);
         void deck.refresh();
       }
@@ -131,7 +139,7 @@ export default function App() {
           <PairScreen
             onPaired={() => {
               setConnected(true);
-              void deck.refresh();
+              void loadBoot();
             }}
           />
         </div>
@@ -264,6 +272,7 @@ export default function App() {
           </div>
         )}
         {tab === "courts" && <DeckView deck={deck} missing={boot?.missing ?? []} />}
+        {tab === "files" && <FilesView />}
         {tab === "motor" && <MotorView deck={deck} />}
         {tab === "chat" && <ChatView />}
         {tab === "voice" && <VoiceView />}

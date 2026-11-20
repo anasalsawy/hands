@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "dist-release"
 PY_EMBED = "3.12.8"
-APP_FILES = ["hands_app.py", "stitch.py", "sawii_hands.py", "winhand.py", "ocu_mcp.py", "voice_sidecar.py", "requirements.txt"]
+APP_FILES = ["hands_app.py", "stitch.py", "sawii_hands.py", "winhand.py", "webtools.py", "ocu_mcp.py", "voice_sidecar.py", "requirements.txt"]
 SKIP_DIRS = {"__pycache__", ".git"}
 
 
