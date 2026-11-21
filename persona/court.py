@@ -120,14 +120,14 @@ def _lat(c, kind: str, ms: float, **extra) -> None:
 
 def _l_vision_enabled() -> bool:
     """Reading each frame with a vision call costs a full model round trip per turn.
-    Persona's brain is text-only, so by default it is skipped there (R still gets the
-    page text / screenshot frame). HANDS_L_VISION=1 forces it on, 0 forces it off."""
+    On by default (Persona has a vision lobe). HANDS_L_VISION=0 turns it off for a
+    text-only brain; 1 forces it on."""
     v = os.environ.get("HANDS_L_VISION", "auto").strip().lower()
     if v in ("1", "true", "on", "yes"):
         return True
     if v in ("0", "false", "off", "no"):
         return False
-    return not os.environ.get("HANDS_BRAIN_MODEL", "").lower().startswith("persona")
+    return True
 
 def _trace(c, name: str, args, out: str) -> None:
     """One step of what this card did, for the card's task diagram (last 40 kept)."""
