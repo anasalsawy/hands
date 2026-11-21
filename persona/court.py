@@ -108,6 +108,27 @@ def _split_by_shape(goal: str) -> list[tuple[str, str]]:
 def _now() -> float:
     return time.time()
 
+
+def _lat(c, kind: str, ms: float, **extra) -> None:
+    """Record one timed phase of a card's loop (think / tool / observe) for latency reports."""
+    rows = c.meta.setdefault("lat", [])
+    rows.append({"k": kind, "ms": int(ms), "t": round(time.time(), 3), **extra})
+    del rows[:-120]
+    tot = c.meta.setdefault("lat_total", {})
+    tot[kind] = int(tot.get(kind, 0) + ms)
+
+
+def _l_vision_enabled() -> bool:
+    """Reading each frame with a vision call costs a full model round trip per turn.
+    Persona's brain is text-only, so by default it is skipped there (R still gets the
+    page text / screenshot frame). HANDS_L_VISION=1 forces it on, 0 forces it off."""
+    v = os.environ.get("HANDS_L_VISION", "auto").strip().lower()
+    if v in ("1", "true", "on", "yes"):
+        return True
+    if v in ("0", "false", "off", "no"):
+        return False
+    return not os.environ.get("HANDS_BRAIN_MODEL", "").lower().startswith("persona")
+
 def _trace(c, name: str, args, out: str) -> None:
     """One step of what this card did, for the card's task diagram (last 40 kept)."""
     try:
@@ -961,7 +982,7 @@ class HandsDeck:
             from .gateway.browser.session import read_page
             from .gateway.browser.tools import _render_snapshot
             one = await browser._get((persona_id, lane))
-            snap = await read_page(one.session, screenshot=True, ground=False)
+            snap = await read_page(one.session, screenshot=_l_vision_enabled(), ground=False)
             frame = {"source": "browser", "lane": lane, "text": _render_snapshot(snap)[:4000]}
             if snap.screenshot_png:
                 frame["image_url"] = "data:image/png;base64," + base64.b64encode(snap.screenshot_png).decode()
@@ -1003,9 +1024,11 @@ class HandsDeck:
             if c.goal and c.goal != initial_goal:
                 messages = [*messages, {"role": "user", "content":
                             "Updated user guidance for this lane: " + c.goal[:4000]}]
+            _t0 = time.monotonic()
             reply = await asyncio.wait_for(
                 lobe.chat(messages, tools=schemas or None, max_tokens=4096, temperature=0.2),
                 timeout=GOAL_STEP_TIMEOUT)
+            _lat(c, "think", (time.monotonic() - _t0) * 1000, out=getattr(reply, "out_tokens", 0))
             calls = []
             for tc in getattr(reply, "tool_calls", None) or []:
                 args = _json.loads(tc.arguments or "{}")
@@ -1025,10 +1048,12 @@ class HandsDeck:
                                       kind="tool_call", task_id=lane,
                                       payload={"tool": name, "args": str(args)[:1500],
                                                "call_id": call_id, "part": goal[:500]})
+            _t0 = time.monotonic()
             out = await asyncio.wait_for(
                 browser.run(persona_id, name, args, lane=lane) if browser is not None
                 else hub.call(persona_id, name, args, lane=lane),
                                          timeout=GOAL_TOOL_TIMEOUT)
+            _lat(c, "tool", (time.monotonic() - _t0) * 1000, tool=name)
             text = str(out)
             receipts.append(f"{name}: {text[:200]}")
             last_action[0] = f"{name} {_json.dumps(args)[:300]} -> {text[:200]}"
@@ -1061,7 +1086,7 @@ class HandsDeck:
                 browser_frame() if browser is not None else hub.observe(persona_id, place, lane=lane),
                 timeout=8 if browser is not None else 3)
             image = frame.get("image_url") if isinstance(frame, dict) else None
-            if not image:
+            if not image or not _l_vision_enabled():
                 return frame
             key = hashlib.sha1(str(image).encode()).hexdigest()
             read = v_reads.get(key, "")
@@ -1104,10 +1129,12 @@ class HandsDeck:
 
         async def observe() -> dict | None:
             nonlocal v_next
+            _t0 = time.monotonic()
             task, v_next = v_next, None
-            if task is not None:
-                return await task
-            return await v_look()
+            try:
+                return await (task if task is not None else v_look())
+            finally:
+                _lat(active(), "observe", (time.monotonic() - _t0) * 1000)
 
         c.meta["agent_loop"] = "omni-tars"
         try:
