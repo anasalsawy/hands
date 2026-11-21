@@ -367,6 +367,15 @@ class HandsDeck:
         )
         self._courts[cid] = court
         self.emit(court, "court.created")
+        # A cold brain container takes tens of seconds to wake: start waking it the moment
+        # a card exists, before the first goal arrives.
+        lobe = getattr(self.mind, "a", None)
+        if lobe is not None and hasattr(lobe, "warm") and not getattr(self, "_brain_warm_at", 0) > time.time() - 120:
+            self._brain_warm_at = time.time()
+            try:
+                asyncio.get_running_loop().create_task(lobe.warm())
+            except RuntimeError:
+                pass
         return court
 
     def remove(self, persona_id: int, court_id: str) -> bool:
@@ -971,6 +980,12 @@ class HandsDeck:
         from .tars_loop import PLAN_NAME, PLAN_TOOL, run_tars_loop
 
         if browser is not None:
+            # Start the lane browser now, in parallel with the first model turn, so its
+            # launch time overlaps the thinking instead of adding to it.
+            _w = asyncio.create_task(browser._get((persona_id, lane)), name=f"court-warm-{c.id}")
+            _w.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+        if browser is not None:
             # A browser card drives its own lane browser (the one its surface
             # streams), not a shell or a separate headless Chrome.
             from .gateway.browser.tools import BrowserTools
@@ -1078,9 +1093,12 @@ class HandsDeck:
         last_action = [""]
         v_next: asyncio.Task | None = None
 
+        screen_feed = [None]   # None = unknown, True = the brain has a V feed, False = it does not
+
         async def v_look() -> dict | None:
-            # V: pull the lane's screen and have L read it (same Persona model,
-            # read-only, no tools). An unchanged screen reuses L's last read.
+            # V holds the screen state: hand it the new frame without waiting, and give R
+            # the frame's own text right away. R does not fetch a reading; V's live state
+            # reaches it through the shared mind on its next step.
             c = active()
             frame = await asyncio.wait_for(
                 browser_frame() if browser is not None else hub.observe(persona_id, place, lane=lane),
@@ -1089,11 +1107,21 @@ class HandsDeck:
             if not image or not _l_vision_enabled():
                 return frame
             key = hashlib.sha1(str(image).encode()).hexdigest()
+            if screen_feed[0] is not False and key != getattr(v_look, "_last", None):
+                v_look._last = key
+
+                async def _feed():
+                    ok = await lobe.push_screen(image, str(frame.get("text") or ""), goal, last_action[0])
+                    screen_feed[0] = ok if screen_feed[0] is None else (screen_feed[0] or ok)
+                    c.meta["v_feed"] = "live" if ok else "unavailable"
+
+                t = asyncio.create_task(_feed(), name=f"court-vfeed-{c.id}")
+                t.add_done_callback(lambda t: t.cancelled() or t.exception())
+            if screen_feed[0] is not False:
+                return {k: v for k, v in frame.items() if k != "image_url"}
+            # No V feed on this brain: fall back to one blocking reading, as before.
             read = v_reads.get(key, "")
-            started = time.monotonic()
-            if read:
-                c.meta["l_vision_reused"] = int(c.meta.get("l_vision_reused", 0)) + 1
-            else:
+            if not read:
                 try:
                     seen = await asyncio.wait_for(lobe.chat([
                         {"role": "system", "content": L_VISION_PROMPT},
@@ -1106,17 +1134,13 @@ class HandsDeck:
                     read = str(getattr(seen, "text", "") or "").strip()
                 except asyncio.CancelledError:
                     raise
-                except Exception as exc:  # noqa: BLE001 - R still gets the raw frame
+                except Exception as exc:  # noqa: BLE001
                     c.meta["l_vision_error"] = f"{type(exc).__name__}: {exc}"[:200]
-                c.meta["l_vision_ms"] = int((time.monotonic() - started) * 1000)
-                if not read:
-                    return frame
-                v_reads.clear()
-                v_reads[key] = read
-                timeline = getattr(self.mind, "shared_timeline", None)
-                if timeline is not None:
-                    await timeline.append(persona_id, producer="L", kind="l_vision", task_id=lane,
-                                          payload={"text": read[:1500], "lane": lane})
+                if read:
+                    v_reads.clear()
+                    v_reads[key] = read
+            if not read:
+                return frame
             c.meta["l_vision"] = read[:500]
             return {**frame, "text": f"L sees: {read[:1500]}\n{str(frame.get('text') or '')}".strip()}
 

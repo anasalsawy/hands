@@ -246,9 +246,30 @@ class OpenAICompatLLM(LLM):
             body["chat_template_kwargs"] = {"enable_thinking": False}
         if str(getattr(self.endpoint, "model", "")).lower().startswith("persona"):
             # Persona's OpenAI endpoint: this client only reads L's text, so ask for
-            # the one-hand path (frees GPU hand slots and skips memory recall).
-            body["persona_mode"] = "solo"
+            # L+V only: V holds the live screen state and shares attention with L, no B/C.
+            body["persona_mode"] = "lv"
         return body
+
+    async def push_screen(self, image_url: str = "", text: str = "", goal: str = "",
+                          last_action: str = "") -> bool:
+        """Hand V a new frame (Persona endpoint /v1/screen). Returns at once on the
+        server side; V reads it in the background and holds it as live state."""
+        base = self.endpoint.base_url.rstrip("/")
+        url = (base[:-3] if base.endswith("/v1") else base) + "/v1/screen"
+        try:
+            r = await self._http().post(url, headers=self._headers(), timeout=10, json={
+                "image_url": image_url, "text": text[:1500], "goal": goal[:500], "last_action": last_action[:300]})
+            return r.status_code == 200
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def warm(self) -> None:
+        """Wake the brain (a cold GPU container takes tens of seconds) before it is needed."""
+        base = self.endpoint.base_url.rstrip("/")
+        try:
+            await self._http().get((base[:-3] if base.endswith("/v1") else base) + "/health", timeout=120)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def chat(self, messages, *, tools=None, temperature=0.7, max_tokens=None, json_mode=False,
                    model: str | None = None, _kv_slot: int | None = None) -> ChatResult:
