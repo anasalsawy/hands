@@ -244,6 +244,10 @@ class OpenAICompatLLM(LLM):
             # Providers that do not understand the field ignore it; ones that
             # reject it are handled by the 400-fallback in chat()/stream().
             body["chat_template_kwargs"] = {"enable_thinking": False}
+        if str(getattr(self.endpoint, "model", "")).lower().startswith("persona"):
+            # Persona's OpenAI endpoint: this client only reads L's text, so ask for
+            # the one-hand path (frees GPU hand slots and skips memory recall).
+            body["persona_mode"] = "solo"
         return body
 
     async def chat(self, messages, *, tools=None, temperature=0.7, max_tokens=None, json_mode=False,
