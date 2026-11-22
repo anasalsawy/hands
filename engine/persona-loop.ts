@@ -30,6 +30,8 @@ const toSchema = (schema: any) => {
   return out && out._def ? zodSchema(schema) : out;
 };
 
+import { desktopAvailable, desktopTools } from './desktop-tools.ts';
+
 // stdout is exclusively the private JSON-lines transport, never model logs.
 const realWrite = process.stdout.write.bind(process.stdout);
 process.stdout.write = ((chunk: any, ...rest: any[]) => process.stderr.write(chunk, ...rest)) as any;
@@ -56,7 +58,7 @@ const MUTATING = new Set([
   'run_command', 'run_script', 'write_file', 'edit_file', 'move_file', 'create_directory',
   'browser_click', 'browser_form_input_fill', 'browser_select', 'browser_press_key',
   'browser_navigate', 'browser_evaluate', 'browser_vision_control', 'browser_new_tab',
-  'browser_close_tab', 'browser_switch_tab', 'browser_scroll', 'browser_go_back', 'browser_go_forward',
+  'desktop_vision_control', 'browser_close_tab', 'browser_switch_tab', 'browser_scroll', 'browser_go_back', 'browser_go_forward',
 ]);
 
 let personaOnly = new Set<string>();
@@ -167,6 +169,10 @@ async function boot(config: any) {
   } as any);
   registerPersonaTools(agent, config.tools || []);
   await agent.initialize();
+  // Desktop GUI (UI-TARS nut-js operator) as native TARS tools, when a screen is available.
+  if (config.tars?.desktop !== false && desktopAvailable()) {
+    for (const tool of desktopTools(Tool)) agent.registerTool(tool);
+  }
   engineAgent = agent;
   // TARS's own event stream, forwarded to Persona for the live cards.
   agent.getEventStream().subscribe((event: any) => {

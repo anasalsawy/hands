@@ -492,5 +492,70 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snap["title"], "Hello Loop", receipts)
 
 
+class DesktopTests(unittest.IsolatedAsyncioTestCase):
+    """The desktop GUI operator (UI-TARS nut-js) as native TARS tools, on a real X display."""
+
+    async def asyncSetUp(self):
+        import shutil, subprocess
+        if not shutil.which("Xvfb"):
+            self.skipTest("Xvfb not installed")
+        try:
+            import Xlib  # noqa: F401
+        except ImportError:
+            self.skipTest("python-xlib not installed")
+        self.display = ":71"
+        self.xvfb = subprocess.Popen(["Xvfb", self.display, "-screen", "0", "1280x800x24"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await asyncio.sleep(1.5)
+        env = {**os.environ, "DISPLAY": self.display}
+        self.app = subprocess.Popen([sys.executable, str(Path(__file__).parent / "x11_testapp.py"), "Counter"],
+                                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await asyncio.sleep(1.0)
+        self._old = os.environ.get("DISPLAY")
+        os.environ["DISPLAY"] = self.display
+        from persona.tars_engine import TarsEngine
+        self.engine = await TarsEngine(workspace=tempfile.mkdtemp()).start()
+
+    async def asyncTearDown(self):
+        if getattr(self, "engine", None):
+            await self.engine.close()
+        for p in (getattr(self, "app", None), getattr(self, "xvfb", None)):
+            if p:
+                p.kill()
+        if getattr(self, "_old", None) is None:
+            os.environ.pop("DISPLAY", None)
+        else:
+            os.environ["DISPLAY"] = self._old
+
+    async def _frame(self) -> bytes:
+        info = json.loads(await self.engine.call("desktop_screenshot", {}))
+        with open(info["filepath"], "rb") as fh:
+            data = fh.read()
+        os.unlink(info["filepath"])
+        return data
+
+    async def test_desktop_tools_are_native_tars_tools(self):
+        self.assertIn("desktop_vision_control", self.engine.tools)
+        self.assertIn("browser_vision_control", self.engine.tools)
+
+    async def test_click_and_type_in_a_real_x11_app(self):
+        before = await self._frame()
+        # Control: a click on the empty desktop changes nothing, so a changed frame below is the app's doing.
+        await self.engine.call("desktop_vision_control", {"action": "click(start_box='(900,900)')"})
+        await asyncio.sleep(0.4)
+        self.assertEqual(before, await self._frame())
+        # Window sits at (20,20) 420x260 on a 1280x800 screen: click its middle on the 0-1000 grid.
+        out = await self.engine.call("desktop_vision_control", {
+            "thought": "click the counter", "action": "click(start_box='(164,162)')"})
+        self.assertIn('"status":"success"', out)
+        await asyncio.sleep(0.5)
+        after_click = await self._frame()
+        self.assertNotEqual(before, after_click, "the click must change the app's pixels (clicks=1)")
+        out = await self.engine.call("desktop_vision_control", {"thought": "type", "action": "type(content='hi')"})
+        self.assertIn('"status":"success"', out)
+        await asyncio.sleep(0.5)
+        self.assertNotEqual(after_click, await self._frame(), "typing must change the app's pixels")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

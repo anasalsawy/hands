@@ -234,6 +234,7 @@ async def run_tars_loop(*, goal: str, instructions: str, tools: list[dict],
             raise RuntimeError(SETUP)
         # Do not pass Persona/provider keys, NODE_OPTIONS or loader injection to a motor.
         env = {k: v for k, v in os.environ.items() if k.upper() in {
+            "DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
             "PATH", "HOME", "SYSTEMROOT", "WINDIR", "USERPROFILE", "APPDATA",
             "LOCALAPPDATA", "TEMP", "TMP", "TMPDIR",
         }}
