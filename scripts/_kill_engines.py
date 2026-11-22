@@ -1,7 +1,7 @@
-"""List or kill leftover sawii_hands.py engine processes (orphans of a dead backend).
+"""List or kill leftover persona-loop.ts engine processes (orphans of a dead backend).
 
 Usage: python scripts/_kill_engines.py [--dry]
-Only ever touches processes whose command line runs sawii_hands.py. Never
+Only ever touches processes whose command line runs persona-loop.ts. Never
 stitch.py, never the mind, never anything else.
 """
 import sys
@@ -14,7 +14,7 @@ for p in psutil.process_iter(["pid", "name", "cmdline"]):
         cmd = " ".join(p.info.get("cmdline") or [])
     except Exception:  # noqa: BLE001 - process vanished mid-scan
         continue
-    if "sawii_hands.py" not in cmd:
+    if "persona-loop.ts" not in cmd:
         continue
     print(f"engine pid {p.pid}: {cmd[:200]}")
     if "--dry" in sys.argv:

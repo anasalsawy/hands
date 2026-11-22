@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from persona.court import HandsDeck
 from persona.llm import ChatResult, ToolCall
-from persona.link import AgentProfile, Link, LinkedLane
 from persona.tars_loop import LanePlan, PLAN_NAME, PLAN_TOOL, run_tars_loop
 
 TOOL = {"type": "function", "function": {
@@ -288,79 +287,6 @@ class PlanningTests(unittest.IsolatedAsyncioTestCase):
                 LanePlan([TOOL]).prepare(arguments)
 
 
-class MotorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_stop_kills_descendants_before_delayed_mutation_without_stopping_other_lane(self):
-        profile = AgentProfile(name="test", strategy="spawn")
-        link = Link(profile)
-        with tempfile.TemporaryDirectory() as directory:
-            sentinel = Path(directory) / "must-not-exist"
-            child = ("import signal,time; from pathlib import Path; "
-                     "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                     "print('ready',flush=True); time.sleep(5); "
-                     f"Path({str(sentinel)!r}).write_text('SURVIVED')")
-            parent = ("import subprocess,sys,time; "
-                      f"p=subprocess.Popen([sys.executable,'-c',{child!r}],stdout=subprocess.PIPE); "
-                      "print(p.stdout.readline().decode().strip(),flush=True); time.sleep(60)")
-            async def motor(lane, code):
-                proc = await asyncio.create_subprocess_exec(
-                    sys.executable, "-c", code, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE, start_new_session=os.name != "nt")
-                linked = LinkedLane(lane_id=lane, agent=profile, process=proc, status="active",
-                                    _process_group=os.name != "nt")
-                link._lanes[lane] = linked
-                return proc
-            a = await motor("a", parent)
-            b = await motor("b", "import time; time.sleep(60)")
-            try:
-                ready = await asyncio.wait_for(a.stdout.readline(), 10)
-                self.assertEqual(ready.strip(), b"ready")
-                await link.stop("a")
-                self.assertIsNotNone(a.returncode)
-                self.assertIsNone(b.returncode)
-                await asyncio.sleep(5.2)
-                self.assertFalse(sentinel.exists(), "a stopped lane's child performed a later write")
-                self.assertEqual(link._lanes["a"].status, "stopped")
-            finally:
-                if a.returncode is None:
-                    await link.stop("a")
-                await link.stop("b")
-
-    async def test_intentional_sigterm_remains_stopped_not_failed(self):
-        profile = AgentProfile(name="test", strategy="spawn")
-        link = Link(profile)
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, "-c", "import time; time.sleep(60)",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        linked = LinkedLane(lane_id="test", agent=profile, process=process,
-                            status="active", connected=True)
-        exits = []
-        linked.on_exit = lambda rc, error: exits.append((rc, error))
-        link._lanes[linked.lane_id] = linked
-        monitor = asyncio.create_task(link._monitor_process(linked))
-        try:
-            self.assertTrue(await link.stop(linked.lane_id))
-            await monitor
-            self.assertIsNotNone(process.returncode)
-            self.assertEqual(linked.status, "stopped")
-            self.assertEqual(linked.error, "")
-            self.assertEqual(len(exits), 1)
-            self.assertEqual(exits[0][1], "")
-        finally:
-            if process.returncode is None:
-                process.kill()
-                await process.wait()
-
-    async def test_unexpected_exit_still_reports_failure(self):
-        profile = AgentProfile(name="test", strategy="spawn")
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, "-c", "raise SystemExit(3)",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        linked = LinkedLane(lane_id="test", agent=profile, process=process, status="active")
-        await Link(profile)._monitor_process(linked)
-        self.assertEqual(linked.status, "failed")
-        self.assertIn("code 3", linked.error)
-
-
 class CourtTests(unittest.IsolatedAsyncioTestCase):
     """Court tests run the REAL Agent TARS engine: its own filesystem, terminal and
     browser tools execute; only Persona's inference (the lobe) is scripted."""
@@ -526,28 +452,44 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tars_loop_runs_on_the_hubs_engine(self):
         from persona.gateway.browser.tasks import BrowserTasks
-        script = [
-            {"text": "", "tool_calls": [{"id": "1", "name": "browser_navigate", "arguments": {"url": PAGE}}]},
-            {"text": "", "tool_calls": [{"id": "2", "name": "browser_get_clickable_elements", "arguments": {}}]},
-            {"text": "", "tool_calls": [{"id": "3", "name": "browser_form_input_fill", "arguments": {"index": 0, "value": "Loop"}}]},
-            {"text": "", "tool_calls": [{"id": "4", "name": "browser_click", "arguments": {"index": 1}}]},
-            {"text": "opened the form and said hello", "tool_calls": []},
+        steps = [
+            ("browser_navigate", {"url": PAGE}),
+            ("browser_get_markdown", {}),  # let the page settle, as a model reading the page would
+            ("browser_get_clickable_elements", {}),
+            ("browser_form_input_fill", {"index": 0, "value": "Loop"}),
+            ("browser_click", {"index": 1}),
         ]
-        seen_tools = []
+        seen_tools, position, attempts = [], [0], [0]
 
         async def infer(messages, tools):
-            seen_tools.append({t["function"]["name"] for t in tools})
-            return {**script[len(seen_tools) - 1], "finish_reason": "stop"}
+            # A model reads the last receipt and retries a failed step: so does this one.
+            seen_tools.append({t["function"]["name"] for t in tools}); tool_msgs = [m for m in messages if m.get("role") == "tool"]
+            last = str(tool_msgs[-1].get("content", "")) if tool_msgs else ""
+            if "Failed" in last[:80] and attempts[0] < 5:
+                attempts[0] += 1
+                await asyncio.sleep(0.5)
+            elif seen_tools[1:]:
+                position[0] += 1
+            if position[0] >= len(steps):
+                return {"text": "opened the form and said hello", "tool_calls": [], "finish_reason": "stop"}
+            name, args = steps[position[0]]
+            return {"text": "", "tool_calls": [{"id": f"c{len(seen_tools)}", "name": name, "arguments": args}],
+                    "finish_reason": "stop"}
         published = []
         mind = SimpleNamespace(bus=SimpleNamespace(publish=lambda pid, ev: published.append(ev)), a=None)
         tasks = self.hub.tasks = BrowserTasks(self.hub, mind, infer_factory=infer)
+        receipts = []
+
+        async def on_receipt(name, args, result):
+            receipts.append((name, str(result)[:100]))
+        tasks.on_receipt = on_receipt
         tasks.start(1, "open the form and say hello")
         await asyncio.wait_for(tasks.jobs[1]["task"], 120)
         self.assertEqual(tasks.status(1)["state"], "finished", tasks.status(1))
         self.assertIn("browser_vision_control", seen_tools[0])  # the full TARS tool set, vision included
         # The loop and the hub share ONE browser: the hub sees what the TARS loop did.
         snap = json.loads(await self.hub.run(1, "browser_snapshot", {}))
-        self.assertEqual(snap["title"], "Hello Loop")
+        self.assertEqual(snap["title"], "Hello Loop", receipts)
 
 
 if __name__ == "__main__":

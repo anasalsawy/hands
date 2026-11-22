@@ -6,4 +6,3 @@ dist-release
 data
 __pycache__
 *.pyc
-.browser-use-sdk

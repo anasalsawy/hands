@@ -88,6 +88,7 @@ class BrowserTasks:
                 'Do the task with real tool calls, then say in one short line what you actually did.',
                 tools=[], infer=infer, execute=execute, observe=observe, engine=engine,
                 on_tools=lambda specs: tools.__setitem__('schemas', specs),
+                on_receipt=getattr(self, 'on_receipt', None),
                 max_steps=100, timeout=180.0)
             job['state'] = 'finished'
         except asyncio.CancelledError:

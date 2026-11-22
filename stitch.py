@@ -88,14 +88,13 @@ async def run_local(args) -> None:
     sys.path.insert(0, str(HANDS_ROOT))
     from persona.config import load_settings
     from persona.api.app import Runtime, create_app
-    from persona.link import LinkRegistry
     from persona.identity import create_persona, new_key
     from voice_sidecar import VoiceSidecar, voice_status
 
     # Override settings from CLI flags.
     os.environ.setdefault("SAWII_STORE_PATH", str(Path(args.data_dir) / "sawii.db"))
     # PERSONA's key, for the mind. This is the L/R lobe credential (persona/llm.py
-    # reads DEEPINFRA_API_KEY). It is NOT an engine credential: sawii_hands.py has
+    # reads DEEPINFRA_API_KEY). It is NOT an engine credential: persona-loop.ts has
     # no provider key and no LLM of its own — it thinks through R over /v1/hands.
     if args.deepinfra_key:
         os.environ.setdefault("DEEPINFRA_API_KEY", args.deepinfra_key)

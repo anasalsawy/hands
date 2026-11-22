@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from persona.hands import HandsHub
-from persona.link import PossibilitySpeculator, SpeculativeEngine
+from persona.speculation import PossibilitySpeculator, SpeculativeEngine
 from persona.perception import screen_frame
 
 

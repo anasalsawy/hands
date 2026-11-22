@@ -175,6 +175,10 @@ class TarsSession:
     async def navigate(self, url: str) -> str:
         self._mapped = False
         await self._tool("browser_navigate", {"url": url})
+        for _ in range(40):  # TARS maps the DOM only on a settled page
+            if "complete" in _text_of(await self.engine.call("browser_evaluate", {"script": "document.readyState"})):
+                break
+            await asyncio.sleep(0.25)
         return f"navigated to {url}"
 
     async def _map(self) -> list[dict]:
@@ -238,10 +242,13 @@ class TarsSession:
 
     async def snapshot(self, *, screenshot: bool = True, ground: bool = True) -> Snapshot:
         tabs = _text_of(await self.engine.call("browser_tab_list", {}))
+        log.debug("tab_list %r", tabs)
         title = (re.search(r"Current Tab: \[\d+\] (.*)", tabs) or [None, ""])[1].strip()
         url = (re.search(r"\(([^)\n]*)\)?\s*$", tabs.splitlines()[-1]) or [None, ""])[1] if tabs else ""
         md = json.loads(await self.engine.call("browser_get_markdown", {}) or "{}")
-        elements = await self._map() if ground or not self._mapped else []
+        # Only a grounding read may rebuild TARS's element map: the pane must never move the
+        # indices the mind is about to click.
+        elements = await self._map() if ground else []
         png = await self.frame() if screenshot else None
         return Snapshot(url=url, title=title, visible_text=str(md.get("content", "")) if isinstance(md, dict) else "",
                         elements=elements, screenshot_png=png)

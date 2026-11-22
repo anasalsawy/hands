@@ -1,4 +1,4 @@
-// UI-TARS motor panel. The engine (`sawii_hands.py`) has no LLM of its own and
+// Agent TARS motor panel. The engine (`engine/persona-loop.ts`, the real Agent TARS core) has no LLM of its own and
 // is started per work line, so "start a motor" means "spawn an instance" —
 // the same deck route a card uses. This panel reports what is actually wired:
 //   GET /v1/hands      engines connected to the hands socket, with their tools
@@ -69,7 +69,7 @@ export function MotorView({ deck }: { deck: DeckState }) {
         <div className="panel">
           <h3>Engine instances</h3>
           <p className="hint">
-            Each running card owns one <code>sawii_hands.py</code> process, started by its own work line. Starting or
+            Each running card owns one <code>Agent TARS</code> process, started by its own work line. Starting or
             stopping here uses the same deck routes as the cards.
           </p>
           {running.length === 0 ? (

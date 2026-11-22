@@ -16,7 +16,7 @@ import shutil
 import sys
 from typing import Awaitable, Callable
 
-from .link import SpeculativeEngine
+from .speculation import SpeculativeEngine
 
 ENGINE = Path(__file__).resolve().parent.parent / "engine"
 SETUP = "Agent TARS engine unavailable: install Node.js 22+ and run npm run build:tars --prefix engine"

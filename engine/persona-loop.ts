@@ -61,6 +61,15 @@ const MUTATING = new Set([
 
 let personaOnly = new Set<string>();
 let chain: Promise<unknown> = Promise.resolve();
+// One browser surface, one tool at a time: TARS's DOM mapping is global state, so a screenshot
+// for the live pane must never run in the middle of the loop's own click or element read.
+let browserChain: Promise<unknown> = Promise.resolve();
+function onBrowser<T>(name: string, run: () => Promise<T>): Promise<T> {
+  if (!name.startsWith('browser_')) return run();
+  const mine = browserChain.then(run, run);
+  browserChain = mine.catch(() => undefined);
+  return mine;
+}
 const wrapped = new WeakSet<object>();
 const originals = new Map<string, (args: any) => any>();
 
@@ -77,7 +86,7 @@ function wrapNative(tool: any): any {
     if (!gate || gate.allow === false) {
       return JSON.stringify({ error: `denied: ${gate?.reason || 'not approved'}` });
     }
-    const exec = async () => asText(await Promise.resolve(original(args)).catch((e: any) => ({ error: String(e?.message || e) })));
+    const exec = () => onBrowser(tool.name, async () => asText(await Promise.resolve(original(args)).catch((e: any) => ({ error: String(e?.message || e) }))));
     let result: string;
     if (mutating) {
       const mine = chain.then(exec, exec);
@@ -97,6 +106,16 @@ class PersonaTARS extends AgentTARS {
   // Every tool TARS registers, at any time (including lazily), passes the gate.
   registerTool(tool: any): void {
     super.registerTool(wrapNative(tool));
+  }
+
+  // TARS's pre/post tool hooks (lazy launch, liveness probe, recovery) touch the page too, so
+  // they queue on the same browser lock as every tool.
+  async onBeforeToolCall(id: string, toolCall: any, args: any): Promise<any> {
+    return onBrowser(toolCall.name, () => super.onBeforeToolCall(id, toolCall, args));
+  }
+
+  async onAfterToolCall(id: string, toolCall: any, result: any): Promise<any> {
+    return onBrowser(toolCall.name, () => super.onAfterToolCall(id, toolCall, result));
   }
 
   async onEachAgentLoopStart(sessionId: string): Promise<void> {
@@ -264,7 +283,7 @@ input.on('line', (line) => {
       const nativeCall = async () => {
         const call = { toolCallId: `persona-${message.id}`, name: message.name };
         const args = (await engineAgent.onBeforeToolCall(call.toolCallId, call, message.args || {})) ?? message.args ?? {};
-        const result = await fn!(args);
+        const result = await onBrowser(message.name, async () => fn!(args));
         return (await engineAgent.onAfterToolCall(call.toolCallId, call, result)) ?? result;
       };
       Promise.resolve(fn && engineAgent ? nativeCall() : { error: `unknown tool ${message.name}` })
