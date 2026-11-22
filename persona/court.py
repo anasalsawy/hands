@@ -430,87 +430,23 @@ class HandsDeck:
 
     # ─────────────────────────────────────────────── spawn a desktop instance
 
-    async def spawn(self, persona_id: int, court_id: str, *, link_name: str = "hands-engine",
+    async def spawn(self, persona_id: int, court_id: str, *, link_name: str = "",
                     goal: str = "", lane: str = "") -> Court:
-        """Give this court a real desktop instance: a lane plus its engine.
-
-        This is the *concurrency* mechanism the product needs. Each call starts
-        its own R-lane (via ``persona/link.py``) so several courts run at once,
-        each driving a separate ``sawii_hands.py``. If no Link is registered
-        (a deck used in a test, or Link disabled) the court still becomes a
-        live *surface* card — it just has no motor behind it yet.
-        """
+        """Give this court a lane. Agent TARS is the engine: it starts with the lane's
+        work (see ``_drive``), so a card needs no separate runner process. Several
+        courts run at once because each lane owns its own engine."""
         c = self.get(persona_id, court_id)
         if c is None:
             raise KeyError("unknown court")
-        self._touch(c, status="spawning", error="")
-
-        links = getattr(self.mind, "links", None)
-        link = links.get(link_name) if links and hasattr(links, "get") else None
-        if link is None:
-            # No motor at all. The card is still a live surface, but it must
-            # never claim to be running: nothing could possibly run.
-            self._touch(c, status="failed",
-                        error=f"no Link registered under {link_name!r}: nothing to run this goal")
-            c.meta["motor"] = "none"
-            if goal:
-                c.goal = goal
-            self.emit(c, "court.spawned", motor="none", status=c.status, error=c.error)
-            return c
-
         # A lane the mind already opened keeps its own id: the lane registry, the
-        # card and the engine must all speak the same name or the R line and the
-        # motor never meet. Otherwise mint a fresh one.
-        lane_id = str(lane or "") or "ct" + uuid.uuid4().hex[:10]
-        c.lane = lane_id
-        c.link = link_name
-        c.meta["motor"] = link.agent.strategy if getattr(link, "agent", None) else "link"
+        # card and the engine must all speak the same name.
+        c.lane = str(lane or "") or "ct" + uuid.uuid4().hex[:10]
+        c.link = ""
+        c.meta["motor"] = "agent-tars"
         if goal:
             c.goal = goal
-
-        # Spawn the engine AS THIS PERSONA. The hub keys runners by
-        # (persona, place, lane); a hand that checks in under another persona is
-        # unreachable by this lane's tool calls, and the card would run forever
-        # with no motor on the other end.
-        persona_key = ""
-        if hasattr(links, "persona_key"):
-            persona_key = links.persona_key(persona_id)
-        try:
-            linked = await asyncio.wait_for(
-                link.delegate(lane_id, goal or f"court {court_id}: {c.title}",
-                              persona_id=persona_id, persona_key=persona_key),
-                timeout=SPAWN_ACK_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001
-            c.lane = ""
-            self._touch(c, status="failed", error=f"{type(exc).__name__}: {exc}"[:300])
-            self.emit(c, "court.status", status=c.status, error=c.error)
-            return c
-        c.worker = linked
-
-        # ``delegate`` for the spawn strategy only returns once the engine is
-        # registered on /v1/hands (or it failed). Verify rather than trust: a
-        # lane the hub cannot see is a failure, not a running card.
-        try:
-            lane_status = await link.status(lane_id)
-        except Exception:  # noqa: BLE001
-            lane_status = "failed"
-        if lane_status == "failed":
-            err = getattr(linked, "error", "") or "engine failed to start"
-            self._touch(c, status="failed", error=err[:300])
-            self.emit(c, "court.status", status=c.status, error=c.error, lane=lane_id)
-            return c
-
-        # Watch the motor: if it dies mid-goal, the card says so instead of
-        # hanging at "running" with nothing driving it.
-        linked.on_exit = self._motor_died(persona_id, c.id)
-        if not self._motor_live(c):
-            self._touch(c, status="waiting")
-            log.info("court %s: lane %s engine started, not yet on /v1/hands", c.id, lane_id)
-        else:
-            c.meta["connected"] = True
-            self._touch(c, status="running")
-        self.emit(c, "court.spawned", motor=c.meta.get("motor", "link"), lane=lane_id,
-                  connected=self._motor_live(c))
+        self._touch(c, status="running", error="")
+        self.emit(c, "court.spawned", motor="agent-tars", lane=c.lane, connected=True)
         return c
 
     async def divide(self, persona_id: int, c: Court) -> list[str]:
@@ -555,25 +491,8 @@ class HandsDeck:
                 continue
             opened.append(line.id)
             card = self.create(persona_id, title=topic[:60], kind=c.kind)
-            # Opening the line already put an engine behind it: ``stitch.py``
-            # hooks ``mind.lanes.start`` and spawns there. Spawning a second one
-            # for the same lane id leaves two processes on one lane, and stopping
-            # the lane frees only the one the Link holds — the other sits on
-            # /v1/hands forever. So wait for the motor that is already coming,
-            # and start one only if it genuinely never arrives.
-            await self._await_hub_lane(persona_id, line.id, self._place(c))
-            await self.attach_lane(persona_id, card.id, line.id,
-                                   link_name=c.link or DEFAULT_LINK, goal=instruction)
-            if card.status == "failed":
-                await self.spawn(persona_id, card.id,
-                                 link_name=c.link or DEFAULT_LINK,
-                                 goal=instruction, lane=line.id)
-            if card.status == "failed":
-                # The mind opened the lane but no engine came up. Say so on the
-                # parent card rather than leaving a card that lies about work.
-                self.emit(c, "court.status", status=c.status, error=card.error,
-                          split=line.id, part=topic[:60])
-                continue
+            # The line is a lane on the mind; its engine (Agent TARS) starts with its work.
+            await self.spawn(persona_id, card.id, goal=instruction, lane=line.id)
             self._work(persona_id, card.id, line.id, instruction)
             # The deck shows the human label the mind gave this line (R2, R3...);
             # the raw lane id means nothing on a card.
@@ -827,51 +746,26 @@ class HandsDeck:
             await self._shared.steer(tid, goal)
             self.emit(c, "court.goal", goal=goal, lane=c.lane, motor="steer")
             return c
-        link, link_name = self._link_for(c)
-
-        if link is not None and c.lane and self._motor_live(c):
-            working = any(task.get_name() == f"court-work-{c.id}" and not task.done()
-                          for task in self._work_tasks)
-            if working:
-                try:
-                    await link.steer(c.lane, goal)
-                except Exception:  # noqa: BLE001
-                    log.debug("court %s steer failed", c.id, exc_info=True)
-                self.emit(c, "court.goal", goal=goal, lane=c.lane, motor="steer")
-            else:
-                # A connected motor can just be listening (Start with no goal).
-                c.meta.pop("my_part", None)
-                self._touch(c, status="running", error="")
-                await self.divide(persona_id, c)
-                if c.status in ("running", "waiting"):
-                    own = str(c.meta.get("my_part") or "").strip() or goal
-                    self._work(persona_id, c.id, c.lane, own)
-                self.emit(c, "court.goal", goal=goal, lane=c.lane, motor="reuse")
+        working = any(task.get_name() == f"court-work-{c.id}" and not task.done()
+                      for task in self._work_tasks)
+        if working:
+            # The running lane reads the updated goal at its next decision.
+            self.emit(c, "court.goal", goal=goal, lane=c.lane, motor="steer")
             return c
-
-        if link is not None:
-            # No lane, or the motor is gone: a goal means "put hands on this".
-            # The mind allocates the concurrency here; the client never asks.
-            self.emit(c, "court.goal", goal=goal, motor="spawn")
-            c = await self.spawn(persona_id, court_id, link_name=link_name, goal=goal)
-            # Then let the mind fan the rest of the goal out on its own. This is
-            # the whole product rule: the person states an intent, the mind
-            # splits it into R-lines, and every R-line gets its own engine.
-            await self.divide(persona_id, c)
-            if c.lane and c.status in ("running", "waiting"):
-                # After a split the parent owes only its own part; driving the
-                # whole goal here would duplicate every child lane's work.
-                own = str(c.meta.get("my_part") or "").strip() or c.goal
-                self._work(persona_id, c.id, c.lane, own)
-            return c
-
-        # No Link registry at all (a bare deck in a test): record the goal, but
-        # never claim a motor we do not have. "running" with nothing behind it
-        # is a lie, and a lie is worse than an honest failure.
-        c.meta["motor"] = "none"
-        self._touch(c, status="failed",
-                    error="no Link registered: this deck has no engine to run the goal")
-        self.emit(c, "court.goal", goal=goal, motor="none", status=c.status)
+        # A goal means "put hands on this". The person states the intent; the mind
+        # allocates the concurrency by splitting it into lanes, each with its own engine.
+        self.emit(c, "court.goal", goal=goal, motor="spawn" if not c.lane else "reuse")
+        if not c.lane:
+            c = await self.spawn(persona_id, court_id, goal=goal)
+        else:
+            c.meta.pop("my_part", None)
+            self._touch(c, status="running", error="")
+        await self.divide(persona_id, c)
+        if c.lane and c.status in ("running", "waiting"):
+            # After a split the parent owes only its own part; driving the whole goal
+            # here would duplicate every child lane's work.
+            own = str(c.meta.get("my_part") or "").strip() or c.goal
+            self._work(persona_id, c.id, c.lane, own)
         return c
 
     async def cancel(self, persona_id: int, court_id: str, *, forget: bool = False) -> Court | None:
