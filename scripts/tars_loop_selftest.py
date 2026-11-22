@@ -557,5 +557,67 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(after_click, await self._frame(), "typing must change the app's pixels")
 
 
+BIG = ("data:text/html,<title>v0</title><button style='position:absolute;left:100px;top:100px;"
+       "width:200px;height:100px' onclick=\"document.title='clicked'\">Big</button>"
+       "<input id=t style='position:absolute;left:100px;top:300px' placeholder=x>")
+
+
+class ModeTests(unittest.IsolatedAsyncioTestCase):
+    """Every TARS execution mode, each on its own and then together, through the real engine."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.loop = asyncio.new_event_loop()
+        from persona.tars_engine import TarsEngine
+        cls.work = tempfile.mkdtemp()
+        cls.engine = cls.loop.run_until_complete(TarsEngine(workspace=cls.work, tars={"mcp_servers": {
+            "fixture": {"command": sys.executable, "args": [str(Path(__file__).parent / "mcp_fixture_server.py")]}}}).start())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.loop.run_until_complete(cls.engine.close())
+        cls.loop.close()
+
+    def run_(self, name, args=None):
+        return self.loop.run_until_complete(self.engine.call(name, args or {}))
+
+    def title(self):
+        return json.loads(self.run_("browser_tab_list"))[0]["text"].split("Current Tab: [0] ")[1].split("\n")[0]
+
+    def test_dom(self):
+        self.run_("browser_navigate", {"url": BIG})
+        self.run_("browser_get_clickable_elements")
+        self.run_("browser_click", {"index": 0})
+        self.assertEqual(self.title(), "clicked")
+
+    def test_visual(self):
+        self.run_("browser_navigate", {"url": BIG})
+        out = self.run_("browser_vision_control", {"thought": "t", "step": "s",
+                                                   "action": "click(point='<point>200 150</point>')"})
+        self.assertIn('"success":true', out)
+        self.assertEqual(self.title(), "clicked")
+
+    def test_hybrid_visual_then_dom_on_one_page(self):
+        self.run_("browser_navigate", {"url": BIG})
+        self.run_("browser_vision_control", {"thought": "t", "step": "s", "action": "click(point='<point>200 150</point>')"})
+        self.assertEqual(self.title(), "clicked")
+        self.run_("browser_get_clickable_elements")
+        self.run_("browser_form_input_fill", {"index": 1, "value": "dom"})
+        value = self.run_("browser_evaluate", {"script": "document.getElementById('t').value"})
+        self.assertIn("dom", value)
+
+    def test_terminal_and_filesystem(self):
+        self.run_("write_file", {"path": os.path.join(self.work, "n.txt"), "content": "tars"})
+        self.assertIn("tars", self.run_("read_file", {"path": os.path.join(self.work, "n.txt")}))
+        out = self.run_("run_command", {"command": "cat n.txt", "cwd": self.work})
+        self.assertIn("tars", out)
+        denied = self.run_("read_file", {"path": "/etc/hostname"})
+        self.assertIn("outside allowed", denied)
+
+    def test_mcp_server_tool(self):
+        self.assertIn("shout", self.engine.tools)
+        self.assertIn("HELLO", self.run_("shout", {"text": "hello"}))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
