@@ -48,3 +48,36 @@ Splitter, collaborative Hands, shared reasoning, Verifier, Persona mind, Court U
 5. Then: end-to-end tests for DOM, visual, hybrid, MCP, terminal, filesystem; multi-Hand test on the TARS foundation; mapping table and deviations log.
 
 Not done and not claimed: any runtime evidence, any test, the research extensions (OpenAPI/GraphQL, WebMCP, UCP).
+
+## 8. Architectural boundary (owner ruling, final)
+
+Persona is the mind; TARS is the execution engine. Two layers, not competing architectures.
+- **Persona owns:** reasoning, planning, task decomposition, collaborative Hands, verification, memory, decisions, plus the planning tool, approvals, lanes, shared state and live cards (all kept).
+- **TARS owns:** computer interaction, browser (DOM, visual, hybrid), visual grounding, terminal, filesystem, MCP execution.
+- **Removed from the Hands execution path:** Open Computer Use, browser-use, and any alternative agent loop. Hermes, Cursor, Claude Code and Cline drivers must not substitute for Persona's intelligence or TARS's engine.
+- Missing platform capabilities are added as native TARS operators, never as a separate engine. No third architecture between Persona and TARS. No reduced TARS: the complete relevant execution stack, active in runtime.
+
+## 9. Capability table: upstream vs new (static, from `engine/ui-tars-desktop`)
+
+Columns still to fill per capability: where in Hands, Persona connection, runtime evidence, benchmark. All "Hands today" cells below are NOT yet TARS-backed unless stated.
+
+| Capability | Upstream in TARS? (location) | Hands today | Status |
+|---|---|---|---|
+| Visual perception and grounding | yes: `packages/ui-tars/action-parser`, `multimodal/gui-agent/action-parser`, `omni-tars/gui-agent` | `ocu_mcp.py`/`winhand.py` | to integrate |
+| Unified cross-platform action space | yes: `multimodal/gui-agent/*`, `packages/ui-tars/operators` (nut-js, adb, browserbase) | none | to integrate |
+| DOM browser execution | yes: `packages/agent-infra/browser-use`, `mcp-servers/browser`, `operators/browser-operator` | patched browser-use (Python) | replace |
+| Visual browser / hybrid DOM+visual | yes: `gui-agent/operator-aio` (`AIOHybridOperator`, `AIOBrowser`, `AIOComputer`) | two separate stacks | to integrate |
+| Observation/feedback, reflective recovery | yes: `GUIAgent` loop, `ComposableAgent`, action-parser reflection | partial (loop only) | to integrate |
+| MCP-native tools | yes: `omni-tars/mcp-agent`, agent-infra `mcp-servers/*` | none | to integrate |
+| Terminal and filesystem | yes: agent-infra `mcp-servers/{commands,filesystem}`, `omni-tars/code-agent`, agent-tars `environments/local` | `sawii_hands.py` | replace |
+| Local and remote operators | yes: nut-js (local), `operator-aio` (remote sandbox), adb | none/winhand | to integrate |
+| Event stream and context engineering | yes: `@tarko/agent` (in use via `persona-loop.ts`) | active, but tools bypass it | extend |
+| UI-TARS-2 hybrid GUI+terminal+FS | yes: `omni-tars/omni-agent` composition (architecture only; model weights not public) | only reasoning loop | to integrate |
+| Accessibility-tree interaction | partial upstream: DOM tree in `agent-infra/browser-use`, browserbase | none | extend |
+| API-first web execution (Beyond Browsing) | NOT upstream | none | NEW research extension |
+| WebMCP discovery and execution | NOT upstream (no matches) | none | NEW |
+| Authorized REST/OpenAPI/GraphQL | NOT upstream as an executor (mentions only) | none | NEW |
+| Universal Commerce Protocol | NOT upstream (one stray mention) | none | NEW |
+| Dynamic API/DOM/visual selection | NOT upstream | none | NEW (as a TARS operator/plugin, not a separate engine) |
+
+Benchmarks: none exist yet for Hands. Upstream ships `multimodal/benchmark`; Stage 4 will run real task suites and report actual results, not simulated ones.
