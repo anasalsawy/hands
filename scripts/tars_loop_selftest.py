@@ -501,5 +501,54 @@ class CourtTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(rec["task_id"] == lane for rec in r[3] if rec["kind"] in ("tool_call", "tool_result")))
 
 
+PAGE = ("data:text/html,<title>Form</title><h1>Sign</h1><input id=n placeholder=name>"
+        "<button onclick=\"document.title='Hello '+document.getElementById('n').value\">Go</button>")
+
+
+class HubTests(unittest.IsolatedAsyncioTestCase):
+    """Persona's browser hub is Agent TARS: real Chrome, real TARS tools, no other browser stack."""
+
+    async def asyncSetUp(self):
+        from persona.gateway.browser.routes import BrowserHub
+        self.hub = BrowserHub()
+
+    async def asyncTearDown(self):
+        await self.hub.shutdown()
+
+    async def test_hub_drives_real_browser_through_tars_tools(self):
+        await self.hub.run(1, "browser_navigate", {"url": PAGE})
+        snap = json.loads(await self.hub.run(1, "browser_snapshot", {}))
+        self.assertEqual(snap["title"], "Form")
+        self.assertEqual([e["tag"] for e in snap["elements"]], ["input", "button"])
+        await self.hub.run(1, "browser_type", {"index": 0, "text": "Anas"})
+        await self.hub.run(1, "browser_click", {"index": 1})
+        self.assertEqual(json.loads(await self.hub.run(1, "browser_snapshot", {}))["title"], "Hello Anas")
+
+    async def test_tars_loop_runs_on_the_hubs_engine(self):
+        from persona.gateway.browser.tasks import BrowserTasks
+        script = [
+            {"text": "", "tool_calls": [{"id": "1", "name": "browser_navigate", "arguments": {"url": PAGE}}]},
+            {"text": "", "tool_calls": [{"id": "2", "name": "browser_get_clickable_elements", "arguments": {}}]},
+            {"text": "", "tool_calls": [{"id": "3", "name": "browser_form_input_fill", "arguments": {"index": 0, "value": "Loop"}}]},
+            {"text": "", "tool_calls": [{"id": "4", "name": "browser_click", "arguments": {"index": 1}}]},
+            {"text": "opened the form and said hello", "tool_calls": []},
+        ]
+        seen_tools = []
+
+        async def infer(messages, tools):
+            seen_tools.append({t["function"]["name"] for t in tools})
+            return {**script[len(seen_tools) - 1], "finish_reason": "stop"}
+        published = []
+        mind = SimpleNamespace(bus=SimpleNamespace(publish=lambda pid, ev: published.append(ev)), a=None)
+        tasks = self.hub.tasks = BrowserTasks(self.hub, mind, infer_factory=infer)
+        tasks.start(1, "open the form and say hello")
+        await asyncio.wait_for(tasks.jobs[1]["task"], 120)
+        self.assertEqual(tasks.status(1)["state"], "finished", tasks.status(1))
+        self.assertIn("browser_vision_control", seen_tools[0])  # the full TARS tool set, vision included
+        # The loop and the hub share ONE browser: the hub sees what the TARS loop did.
+        snap = json.loads(await self.hub.run(1, "browser_snapshot", {}))
+        self.assertEqual(snap["title"], "Hello Loop")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

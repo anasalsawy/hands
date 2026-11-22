@@ -21,7 +21,14 @@ const require = createRequire(import.meta.url);
 const coreDir = resolve(here, 'ui-tars-desktop/multimodal/agent-tars/core');
 const { AgentTARS } = require(resolve(coreDir, 'dist/index.js'));
 // Tool class from the SAME @tarko/agent copy the TARS core runs on.
-const { Tool } = createRequire(resolve(coreDir, 'package.json'))('@tarko/agent');
+const coreRequire = createRequire(resolve(coreDir, 'package.json'));
+const { Tool, zodToJsonSchema: tarkoSchema } = coreRequire('@tarko/agent');
+const { zodToJsonSchema: zodSchema } = coreRequire('zod-to-json-schema');
+// Tools from other zod copies are not recognized by tarko's converter; fall back to the zod one.
+const toSchema = (schema: any) => {
+  const out: any = tarkoSchema(schema);
+  return out && out._def ? zodSchema(schema) : out;
+};
 
 // stdout is exclusively the private JSON-lines transport, never model logs.
 const realWrite = process.stdout.write.bind(process.stdout);
@@ -31,6 +38,9 @@ const send = (message: unknown) => realWrite(JSON.stringify(message) + '\n');
 const pending = new Map<string, { resolve: (value: any) => void; reject: (e: Error) => void }>();
 let sequence = 0;
 let started = false;
+let toolsMode = false;
+let engineAgent: any;
+let onClose: () => void = () => {};
 
 function request(type: string, payload: Record<string, unknown> = {}): Promise<any> {
   const id = String(++sequence);
@@ -108,82 +118,110 @@ function asText(value: unknown): string {
   return typeof value === 'string' ? value : JSON.stringify(value ?? null);
 }
 
+let driving: Promise<void> | null = null;
+
+// Boot the real Agent TARS core. In loop mode `drive` follows immediately; in tools mode the
+// engine stays up and serves `call` / `run` requests for Persona.
+async function boot(config: any) {
+  personaOnly = new Set((config.tools || []).map((t: any) => (t.function || t).name));
+  const agent: any = new PersonaTARS({
+    name: 'Persona R / Agent TARS',
+    // Routing label only: all inference uses the injected Persona client below. 'volcengine'
+    // is the label Agent TARS requires to enable its vision (visual/hybrid) browser control,
+    // which is keyed to the provider name, not to a real endpoint (documented deviation D1).
+    model: { provider: config.tars?.provider_label || 'volcengine', id: 'persona-r', baseURL: 'http://127.0.0.1:1', apiKey: 'unused' },
+    instructions: config.instructions,
+    workspace: config.tars?.workspace,
+    browser: {
+      control: config.tars?.browser_control || 'hybrid',
+      headless: config.tars?.headless ?? true,
+      cdpEndpoint: config.tars?.cdp_endpoint,
+      executablePath: config.tars?.chrome_path,
+    },
+    search: config.tars?.search,
+    mcpServers: config.tars?.mcp_servers,
+    // Persona emits structured tool calls; never TARS's text-parsing engines.
+    toolCallEngine: 'native',
+    maxIterations: (config.max_steps || 20) + 1,
+    logLevel: 'silent',
+    context: { maxImagesCount: 1 },
+  } as any);
+  registerPersonaTools(agent, config.tools || []);
+  await agent.initialize();
+  engineAgent = agent;
+  // TARS's own event stream, forwarded to Persona for the live cards.
+  agent.getEventStream().subscribe((event: any) => {
+    try {
+      send({ type: 'event', kind: event.type, name: event.name, id: event.toolCallId, ts: event.timestamp });
+    } catch { /* a card must never break a lane */ }
+  });
+  agent.setCustomLLMClient({
+    chat: { completions: { create: async (options: any) => {
+      await agent.onLLMRequest('', { provider: 'persona', request: options });
+      const result = await request('think', { messages: options.messages, tools: options.tools });
+      const toolCalls = (result.tool_calls || []).map((tool: any, index: number) => ({
+        index, id: tool.id, type: 'function',
+        function: { name: tool.name, arguments: JSON.stringify(tool.arguments || {}) },
+      }));
+      return (async function* () {
+        yield {
+          id: 'persona-r', object: 'chat.completion.chunk', model: 'persona-r',
+          created: Math.floor(Date.now() / 1000),
+          choices: [{ index: 0, delta: { role: 'assistant', content: result.text || '',
+            ...(toolCalls.length ? { tool_calls: toolCalls } : {}) },
+            finish_reason: toolCalls.length ? 'tool_calls' : 'stop' }],
+        };
+      })();
+    } } },
+  } as any);
+  return agent;
+}
+
+function registerPersonaTools(agent: any, tools: any[]) {
+  // Persona-only tools (e.g. the planning tool) run on Persona's side.
+  for (const definition of tools) {
+    const spec = definition.function || definition;
+    personaOnly.add(spec.name);
+    agent.registerTool(new Tool({
+      id: spec.name,
+      description: spec.description || '',
+      parameters: spec.parameters || { type: 'object', properties: {} },
+      function: (args: unknown) => request('tool', { name: spec.name, args }),
+    }));
+  }
+}
+
+function nativeNames(agent: any) {
+  return (agent.getTools() as any[]).filter((t) => !personaOnly.has(t.name));
+}
+
+// One run of the real TARS agent loop with Persona as its mind.
+async function drive(agent: any, config: any) {
+  const result = await agent.run({ input: config.goal, stream: false });
+  if (result.finishReason === 'max_iterations') throw new Error('lane step limit reached');
+  if (['error', 'abort'].includes(result.finishReason) || !result.content?.trim()) {
+    throw new Error('agent ended without a completed answer');
+  }
+  send({ type: 'done', text: result.content });
+}
+
 async function run(config: any) {
   let agent: any;
   try {
-    personaOnly = new Set((config.tools || []).map((t: any) => (t.function || t).name));
-    agent = new PersonaTARS({
-      name: 'Persona R / Agent TARS',
-      // Routing label only: all inference uses the injected Persona client below. 'volcengine'
-      // is the label Agent TARS requires to enable its vision (visual/hybrid) browser control,
-      // which is keyed to the provider name, not to a real endpoint (documented deviation D1).
-      model: { provider: config.tars?.provider_label || 'volcengine', id: 'persona-r', baseURL: 'http://127.0.0.1:1', apiKey: 'unused' },
-      instructions: config.instructions,
-      workspace: config.tars?.workspace,
-      browser: {
-        control: config.tars?.browser_control || 'hybrid',
-        headless: config.tars?.headless ?? true,
-        cdpEndpoint: config.tars?.cdp_endpoint,
-        executablePath: config.tars?.chrome_path,
-      },
-      search: config.tars?.search,
-      mcpServers: config.tars?.mcp_servers,
-      // Persona emits structured tool calls; never TARS's text-parsing engines.
-      toolCallEngine: 'native',
-      maxIterations: config.max_steps + 1,
-      logLevel: 'silent',
-      context: { maxImagesCount: 1 },
-    } as any);
-
-    // Persona-only tools (e.g. the planning tool) run on Persona's side.
-    for (const definition of config.tools || []) {
-      const spec = definition.function || definition;
-      agent.registerTool(new Tool({
-        id: spec.name,
-        description: spec.description || '',
-        parameters: spec.parameters || { type: 'object', properties: {} },
-        function: (args: unknown) => request('tool', { name: spec.name, args }),
-      }));
+    agent = await boot(config);
+    const natives = nativeNames(agent);
+    if (config.mode === 'tools') {
+      // Tools mode: TARS is booted (browser, filesystem, commands, MCP, search) and serves
+      // Persona's `call` requests with its native tools; `run` starts the TARS loop on demand.
+      send({ type: 'catalog', tools: natives.map((t) => t.name), specs: natives.map((t) => ({
+        name: t.name, description: t.description || '', parameters: toSchema(t.schema),
+      })) });
+      toolsMode = true;
+      await new Promise<void>((done) => { onClose = done; });
+      return;
     }
-
-    await agent.initialize();
-
-    const native = (agent.getTools() as any[]).map((t) => t.name).filter((n) => !personaOnly.has(n));
-    send({ type: 'catalog', tools: native });
-
-    // TARS's own event stream, forwarded to Persona for the live cards.
-    agent.getEventStream().subscribe((event: any) => {
-      try {
-        send({ type: 'event', kind: event.type, name: event.name, id: event.toolCallId, ts: event.timestamp });
-      } catch { /* a card must never break a lane */ }
-    });
-
-    agent.setCustomLLMClient({
-      chat: { completions: { create: async (options: any) => {
-        await agent.onLLMRequest('', { provider: 'persona', request: options });
-        const result = await request('think', { messages: options.messages, tools: options.tools });
-        const toolCalls = (result.tool_calls || []).map((tool: any, index: number) => ({
-          index, id: tool.id, type: 'function',
-          function: { name: tool.name, arguments: JSON.stringify(tool.arguments || {}) },
-        }));
-        return (async function* () {
-          yield {
-            id: 'persona-r', object: 'chat.completion.chunk', model: 'persona-r',
-            created: Math.floor(Date.now() / 1000),
-            choices: [{ index: 0, delta: { role: 'assistant', content: result.text || '',
-              ...(toolCalls.length ? { tool_calls: toolCalls } : {}) },
-              finish_reason: toolCalls.length ? 'tool_calls' : 'stop' }],
-          };
-        })();
-      } } },
-    } as any);
-
-    const result = await agent.run({ input: config.goal, stream: false });
-    if (result.finishReason === 'max_iterations') throw new Error('lane step limit reached');
-    if (['error', 'abort'].includes(result.finishReason) || !result.content?.trim()) {
-      throw new Error('agent ended without a completed answer');
-    }
-    send({ type: 'done', text: result.content });
+    send({ type: 'catalog', tools: natives.map((t) => t.name) });
+    await drive(agent, config);
     process.exitCode = 0;
   } catch (error) {
     send({ type: 'error', error: error instanceof Error ? error.message : String(error) });
@@ -205,11 +243,31 @@ input.on('line', (line) => {
       void run(message);
       return;
     }
+    if (message.type === 'abort') {
+      try { engineAgent?.abort?.(); } catch { /* nothing running */ }
+      return;
+    }
+    if (message.type === 'run' && toolsMode && engineAgent && !driving) {
+      // A TARS loop on the persistent engine: same browser, same session, Persona as the mind.
+      registerPersonaTools(engineAgent, message.tools || []);
+      driving = drive(engineAgent, message)
+        .catch((e: any) => send({ type: 'error', error: e instanceof Error ? e.message : String(e) }))
+        .finally(() => { driving = null; });
+      return;
+    }
     if (message.type === 'call') {
       // Persona asks the engine to run one of TARS's own read-only tools (e.g. a
       // screenshot for the live card). TARS executes it; Persona only reads the result.
       const fn = originals.get(message.name);
-      Promise.resolve(fn ? fn(message.args || {}) : { error: `unknown tool ${message.name}` })
+      // Same path TARS takes for its own calls: pre-hook (lazy browser launch, workspace paths),
+      // the native tool, post-hook (browser state).
+      const nativeCall = async () => {
+        const call = { toolCallId: `persona-${message.id}`, name: message.name };
+        const args = (await engineAgent.onBeforeToolCall(call.toolCallId, call, message.args || {})) ?? message.args ?? {};
+        const result = await fn!(args);
+        return (await engineAgent.onAfterToolCall(call.toolCallId, call, result)) ?? result;
+      };
+      Promise.resolve(fn && engineAgent ? nativeCall() : { error: `unknown tool ${message.name}` })
         .then((r) => send({ type: 'result', id: message.id, result: asText(r) }))
         .catch((e) => send({ type: 'result', id: message.id, result: asText({ error: String(e?.message || e) }) }));
       return;
@@ -225,6 +283,7 @@ input.on('line', (line) => {
   }
 });
 input.on('close', () => {
+  onClose();
   for (const callback of pending.values()) callback.reject(new Error('Persona disconnected'));
   pending.clear();
 });

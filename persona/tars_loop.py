@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import sys
 from typing import Awaitable, Callable
 
 from .link import SpeculativeEngine
@@ -219,33 +220,44 @@ async def run_tars_loop(*, goal: str, instructions: str, tools: list[dict],
                         on_tools: Callable[[list[dict]], None] | None = None,
                         handle: dict | None = None,
                         on_receipt: Callable[[str, dict, str], Awaitable[None]] | None = None,
-                        tars: dict | None = None,
+                        tars: dict | None = None, engine=None,
                         max_steps: int = 20, timeout: float = 120.0,
                         autofire: bool = False, stats: dict | None = None) -> str:
     """``tools`` are Persona-only tools (e.g. the planning tool); ``execute`` runs
     those. Every other tool is Agent TARS's own and runs inside the engine."""
-    node = os.getenv("SAWII_NODE") or shutil.which("node")
-    if not node or not (ENGINE / "node_modules/tsx").exists() or not TARS_DIST.exists():
-        raise RuntimeError(SETUP)
     names = {tool["function"]["name"] for tool in tools}
     plan = LanePlan(tools, autofire=autofire, stats=stats)
-    # Do not pass Persona/provider keys, NODE_OPTIONS or loader injection to a motor.
-    env = {k: v for k, v in os.environ.items() if k.upper() in {
-        "PATH", "HOME", "SYSTEMROOT", "WINDIR", "USERPROFILE", "APPDATA",
-        "LOCALAPPDATA", "TEMP", "TMP", "TMPDIR",
-    }}
-    try:
-        process = await asyncio.create_subprocess_exec(
-            node, "--import", "tsx", str(ENGINE / "persona-loop.ts"),
-            cwd=ENGINE, env=env, stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            limit=16 * 1024 * 1024)
-    except OSError as exc:
-        raise RuntimeError(SETUP) from exc
+    process = None
+    if engine is None:
+        node = os.getenv("SAWII_NODE") or shutil.which("node")
+        if not node or not (ENGINE / "node_modules/tsx").exists() or not TARS_DIST.exists():
+            raise RuntimeError(SETUP)
+        # Do not pass Persona/provider keys, NODE_OPTIONS or loader injection to a motor.
+        env = {k: v for k, v in os.environ.items() if k.upper() in {
+            "PATH", "HOME", "SYSTEMROOT", "WINDIR", "USERPROFILE", "APPDATA",
+            "LOCALAPPDATA", "TEMP", "TMP", "TMPDIR",
+        }}
+        try:
+            process = await asyncio.create_subprocess_exec(
+                node, "--import", "tsx", str(ENGINE / "persona-loop.ts"),
+                cwd=ENGINE, env=env, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                limit=16 * 1024 * 1024)
+        except OSError as exc:
+            raise RuntimeError(SETUP) from exc
+    else:
+        # A persistent engine (the hub's): same TARS, same browser; this call is one loop on it.
+        process = engine.process
+        engine.looping = True
+        while not engine.inbox.empty():
+            engine.inbox.get_nowait()
 
     async def send(message: dict) -> None:
         process.stdin.write((json.dumps(message, ensure_ascii=False) + "\n").encode())
         await process.stdin.drain()
+
+    async def readline() -> bytes:
+        return await (engine.inbox.get() if engine is not None else process.stdout.readline())
 
     calls: dict[str, asyncio.Future] = {}
 
@@ -262,15 +274,19 @@ async def run_tars_loop(*, goal: str, instructions: str, tools: list[dict],
             calls.pop(cid, None)
 
     if handle is not None:
-        handle["call"] = call
+        handle["call"] = engine.call if engine is not None else call
 
     try:
-        ready = await asyncio.wait_for(process.stdout.readline(), timeout=15)
-        if not ready or json.loads(ready).get("type") != "ready":
-            raise RuntimeError(SETUP)
-        await send({"type": "start", "goal": goal, "instructions": instructions,
-                    "tools": tools, "max_steps": max_steps, "tars": tars or {}})
-        booted = False  # Agent TARS boots its browser/filesystem/commands MCP servers first
+        if engine is None:
+            ready = await asyncio.wait_for(process.stdout.readline(), timeout=15)
+            if not ready or json.loads(ready).get("type") != "ready":
+                raise RuntimeError(SETUP)
+            await send({"type": "start", "goal": goal, "instructions": instructions,
+                        "tools": tools, "max_steps": max_steps, "tars": tars or {}})
+        else:
+            plan.names |= set(engine.tools)
+            await send({"type": "run", "goal": goal, "instructions": instructions, "tools": tools})
+        booted = engine is not None  # Agent TARS boots its browser/filesystem/commands MCP servers first
         loop = asyncio.get_running_loop()
         failure: asyncio.Future = loop.create_future()
         serving: set[asyncio.Task] = set()
@@ -327,7 +343,7 @@ async def run_tars_loop(*, goal: str, instructions: str, tools: list[dict],
 
         try:
             while True:
-                reader = asyncio.ensure_future(process.stdout.readline())
+                reader = asyncio.ensure_future(readline())
                 done, _ = await asyncio.wait(
                     {reader, failure}, return_when=asyncio.FIRST_COMPLETED,
                     timeout=timeout if booted else max(timeout, STARTUP_TIMEOUT))
@@ -369,13 +385,21 @@ async def run_tars_loop(*, goal: str, instructions: str, tools: list[dict],
                 task.cancel()
             await asyncio.gather(*serving, return_exceptions=True)
     finally:
-        if process.returncode is None:
+        if engine is not None:
+            if sys.exc_info()[0] is not None and engine.process is not None:
+                try:  # cancelled or failed: stop the TARS loop so the browser is free again
+                    await send({"type": "abort"})
+                except Exception:  # noqa: BLE001
+                    pass
+            engine.looping = False  # the persistent engine stays up for the next call
+        else:
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
             try:
-                process.terminate()
-            except ProcessLookupError:
-                pass
-        try:
-            await asyncio.wait_for(process.wait(), timeout=3)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+                await asyncio.wait_for(process.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()

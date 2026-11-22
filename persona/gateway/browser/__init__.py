@@ -16,7 +16,7 @@ environment.
 """
 from .insight import BrowserPaneInsight
 from .routes import BrowserHub, register_browser_routes
-from .session import BrowserSessionProto, DryRunSession, RealSession, Snapshot, create_browser_session
+from .session import BrowserSessionProto, DryRunSession, TarsSession, Snapshot, create_browser_session
 from .stream import BrowserBroadcast
 from .tools import BrowserTools
 
@@ -27,7 +27,7 @@ __all__ = [
     "BrowserSessionProto",
     "BrowserTools",
     "DryRunSession",
-    "RealSession",
+    "TarsSession",
     "Snapshot",
     "create_browser_session",
     "register_browser_routes",

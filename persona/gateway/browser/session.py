@@ -1,8 +1,8 @@
 """Browser session contract and explicit test doubles.
 
-Production sessions use the pinned edited Browser-Use SDK through edited.py.
-The legacy session classes remain importable for compatibility with old callers;
-create_browser_session never selects them for a real Companion browser.
+Production sessions are Agent TARS: ``TarsSession`` runs the real TARS browser tools
+(DOM, markdown, screenshot, vision control) inside a persistent TARS engine. The dry-run
+session is an explicit offline test double only.
 """
 from __future__ import annotations
 
@@ -115,281 +115,136 @@ class DryRunSession:
 
 
 # --------------------------------------------------------------------------
-# Real session — wraps browser_use.BrowserSession (Playwright-backed).
-#
-# Imported lazily. If browser-use isn't installed, create_browser_session()
-# falls back to DryRunSession transparently.
+# Agent TARS session: Persona's browser is TARS's browser.
 # --------------------------------------------------------------------------
-class RealSession:
-    """Shape B wrap of browser_use's browser primitives.
+import asyncio
+import base64
+import json
+import os
+import re
 
-    We intentionally do not use browser_use.Agent (that's their agent loop —
-    Shape A). We use their BrowserSession / Browser primitives directly, so
-    Sawii's kernel owns the outer loop and gets the kernel-wins (tool-wait
-    prefetch, narrate-while-driving, silent error recovery).
-    """
+_ELEMENT = re.compile(r"^\[(\d+)\]<(\w+)([^>]*)>(.*?)(?:</\w+>)?$")
 
-    def __init__(self, headless: bool = True, cdp_url: str | None = None):
-        self.headless = headless
-        self.cdp_url = cdp_url
-        self._bu_session: Any = None  # browser_use.BrowserSession
-        self._page: Any = None        # Playwright Page
+
+def _text_of(raw) -> str:
+    """TARS MCP tools return either JSON or a list of {type:text,text} parts."""
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return str(raw)
+    if isinstance(data, list):
+        return "\n".join(str(p.get("text", "")) for p in data if isinstance(p, dict) and p.get("type") == "text")
+    if isinstance(data, dict):
+        return json.dumps(data)
+    return str(data)
+
+
+def _failed(raw) -> bool:
+    text = _text_of(raw).lstrip().lower()
+    return text.startswith(("failed", "error", "browser not", "unknown tool", "denied")) or '"status":"error"' in text
+
+
+class TarsSession:
+    """One browser, owned by one TARS engine. Every method is a native TARS tool call."""
+
+    def __init__(self, *, headless: bool = True, tars: dict | None = None, workspace: str | None = None,
+                 engine=None):
+        from ...tars_engine import TarsEngine
+        cfg = {"headless": headless, "browser_control": "hybrid", **(tars or {})}
+        chrome = os.getenv("SAWII_CHROME") or next((c for c in (
+            "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser") if os.path.exists(c)), None)
+        if chrome:
+            cfg.setdefault("chrome_path", chrome)
+        self.engine = engine or TarsEngine(workspace=workspace, tars=cfg)
+        self.action_lock = asyncio.Lock()
+        self._mapped = False  # TARS element indices exist only after browser_get_clickable_elements
 
     async def start(self) -> None:
-        # Lazy import — don't require browser-use at module load time.
-        try:
-            from browser_use import BrowserSession  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError(
-                "browser-use is not installed; "
-                "install it with `pip install browser-use` or use DryRunSession for dev"
-            ) from exc
-        self._bu_session = BrowserSession(
-            headless=self.headless,
-            cdp_url=self.cdp_url,
-        )
-        await self._bu_session.start()
-        self._page = await self._bu_session.get_current_page()
+        if self.engine.process is None:
+            await self.engine.start()
 
     async def close(self) -> None:
-        if self._bu_session:
-            try:
-                await self._bu_session.close()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("browser session close failed: %s", exc)
-            self._bu_session = None
-            self._page = None
+        await self.engine.close()
+
+    async def _tool(self, name: str, args: dict | None = None) -> str:
+        raw = await self.engine.call(name, args or {})
+        if _failed(raw):
+            raise RuntimeError(_text_of(raw)[:300])
+        return raw
 
     async def navigate(self, url: str) -> str:
-        if not self._page:
-            raise RuntimeError("session not started")
-        await self._page.goto(url)
+        self._mapped = False
+        await self._tool("browser_navigate", {"url": url})
         return f"navigated to {url}"
 
+    async def _map(self) -> list[dict]:
+        text = _text_of(await self.engine.call("browser_get_clickable_elements", {}))
+        self._mapped = True
+        elements: list[dict] = []
+        for line in text.splitlines():
+            m = _ELEMENT.match(line.strip())
+            if m:
+                elements.append({"index": int(m.group(1)), "tag": m.group(2),
+                                 "text": re.sub(r"<[^>]+>", "", m.group(4)).strip()[:120],
+                                 "attrs": m.group(3).strip()[:200]})
+        return elements
+
     async def click(self, index: int) -> str:
-        if not self._bu_session:
-            raise RuntimeError("session not started")
-        # browser-use indexes visible interactive elements; it exposes a
-        # click_element_by_index helper on the session controller.
-        await self._bu_session.click_element_by_index(index)
+        if not self._mapped:
+            await self._map()
+        await self._tool("browser_click", {"index": index})
+        self._mapped = False
         return f"clicked element {index}"
 
     async def type_text(self, index: int, text: str) -> str:
-        if not self._bu_session:
-            raise RuntimeError("session not started")
-        await self._bu_session.input_text(index, text)
-        return f"typed into element {index}"
+        if not self._mapped:
+            await self._map()
+        await self._tool("browser_form_input_fill", {"index": index, "value": text})
+        return f"typed into element {index}: {text!r}"
 
     async def scroll(self, direction: str) -> str:
-        if not self._page:
-            raise RuntimeError("session not started")
-        delta = -500 if direction == "up" else 500
-        await self._page.evaluate(f"window.scrollBy(0, {delta})")
+        amount = {"down": 600, "up": -600, "top": -100000, "bottom": None}.get(direction, 600)
+        await self._tool("browser_scroll", {} if amount is None else {"amount": amount})
         return f"scrolled {direction}"
 
     async def go_back(self) -> str:
-        if not self._page:
-            raise RuntimeError("session not started")
-        await self._page.go_back()
+        self._mapped = False
+        await self._tool("browser_go_back")
         return "went back"
 
     async def wait_for_selector(self, selector: str, timeout_ms: int = 5000) -> str:
-        if not self._page:
-            raise RuntimeError("session not started")
+        probe = f"!!document.querySelector({json.dumps(selector)})"
+        deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+        while True:
+            if "true" in _text_of(await self._tool("browser_evaluate", {"script": probe})):
+                return f"found {selector}"
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError(f"timed out waiting for {selector}")
+            await asyncio.sleep(0.25)
+
+    async def frame(self) -> bytes | None:
+        """The current viewport as PNG, taken by TARS's own screenshot tool."""
         try:
-            await self._page.wait_for_selector(selector, timeout=timeout_ms)
-            return f"found {selector}"
-        except Exception as exc:  # noqa: BLE001
-            # Tool capability turns this into a structured {error}; returning
-            # a prose "timed out" string falsely looks like a successful wait.
-            raise TimeoutError(f"timed out waiting for {selector}: {exc}") from exc
-
-    async def snapshot(self, *, screenshot: bool = True, ground: bool = True) -> Snapshot:
-        if not self._bu_session or not self._page:
-            raise RuntimeError("session not started")
-        if not ground:
-            # Observation must not refresh Browser Use's action selector cache.
-            data = await self._page.evaluate("""() => ({title: document.title,
-                text: (document.body?.innerText || '').slice(0, 14000),
-                elements: Array.from(document.querySelectorAll('a,button,input,textarea,select,[role=dialog],[role=alert]'))
-                  .filter(e => e.getClientRects().length).slice(0,80).map((e,i) => ({
-                    index:i,tag:e.tagName,text:(e.getAttribute('aria-label') || e.innerText || e.placeholder || '').slice(0,120)
-                  }))})""")
-            png = await self._page.screenshot(type="png") if screenshot else None
-            return Snapshot(url=self._page.url, title=data.get("title", ""),
-                            visible_text=data.get("text", ""), elements=data.get("elements", []),
-                            screenshot_png=png)
-        state = await self._bu_session.get_browser_state()
-        shot = screenshot
-        screenshot = None
-        try:
-            if shot:
-                screenshot = await self._page.screenshot(type="png")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("screenshot failed: %s", exc)
-        elements = []
-        try:
-            # browser-use's state exposes an interactive-elements list
-            for i, el in enumerate(getattr(state, "interactive_elements", []) or []):
-                elements.append({
-                    "index": i,
-                    "tag": getattr(el, "tag_name", "?"),
-                    "text": (getattr(el, "text", "") or "")[:120],
-                    "attrs": {k: v for k, v in (getattr(el, "attributes", {}) or {}).items()
-                              if k in ("href", "aria-label", "name", "placeholder")},
-                })
-        except Exception as exc:  # noqa: BLE001
-            log.warning("element enumeration failed: %s", exc)
-        return Snapshot(
-            url=getattr(state, "url", "") or self._page.url,
-            title=getattr(state, "title", "") or await self._page.title(),
-            visible_text=(getattr(state, "visible_text", "") or "")[:4000],
-            elements=elements,
-            screenshot_png=screenshot,
-        )
-
-
-def _chrome_path() -> str | None:
-    import os
-    for path in ("/usr/local/bin/google-chrome", "/usr/bin/google-chrome",
-                 "/usr/bin/chromium", "/usr/bin/chromium-browser"):
-        if os.path.exists(path):
-            return path
-    return None
-
-
-class PlaywrightSession:
-    """The app's own Chrome with Skyvern-style live element identities."""
-
-    def __init__(self):
-        self._pw = None
-        self._browser = None
-        self._page = None
-        self._element_ids: dict[int, str] = {}
-        self._id_serial = 0
-
-    async def start(self) -> None:
-        from playwright.async_api import async_playwright
-        self._pw = await async_playwright().start()
-        kwargs = {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
-        # System Chrome when the machine has it. Otherwise Playwright's own
-        # Chromium (what the image installs with WITH_CHROMIUM=1).
-        chrome = _chrome_path()
-        if chrome:
-            kwargs["executable_path"] = chrome
-        self._browser = await self._pw.chromium.launch(**kwargs)
-        self._page = await self._browser.new_page(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        )
-
-    async def close(self) -> None:
-        if self._browser is not None:
-            await self._browser.close()
-        if self._pw is not None:
-            await self._pw.stop()
-        self._browser = self._page = self._pw = None
-        self._element_ids = {}
-
-    def _interactive(self):
-        if self._page is None:
-            raise RuntimeError("session not started")
-        return self._page.locator("a, button, input, textarea, select, [role='button'], [role='link']")
-
-    async def navigate(self, url: str) -> str:
-        if self._page is None:
-            raise RuntimeError("session not started")
-        await self._page.goto(url, wait_until="domcontentloaded", timeout=20000)
-        self._element_ids = {}
-        try:
-            # A short settle for script-drawn pages; never a wait for every ad.
-            await self._page.wait_for_load_state("load", timeout=1500)
-        except Exception:  # noqa: BLE001
+            info = json.loads(await self.engine.call("browser_screenshot", {}))
+            path = info.get("filepath")
+            if path and os.path.exists(path):
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                os.unlink(path)
+                return data
+        except (ValueError, OSError, RuntimeError):
             pass
-        return f"navigated to {self._page.url}"
-
-    async def _live_element(self, index: int):
-        """Resolve a snapshot index through its stamped live DOM identity."""
-        if self._page is None:
-            raise RuntimeError("session not started")
-        element_id = self._element_ids.get(int(index))
-        if not element_id:
-            raise RuntimeError("no live element for that index; take a fresh browser snapshot")
-        return self._page.locator(f'[data-sawii-element-id="{element_id}"]')
-
-    async def click(self, index: int) -> str:
-        await (await self._live_element(index)).click(timeout=8000)
-        return f"clicked element {index}"
-
-    async def type_text(self, index: int, text: str) -> str:
-        await (await self._live_element(index)).fill(text, timeout=8000)
-        return f"typed into element {index}"
-
-    async def scroll(self, direction: str) -> str:
-        if self._page is None:
-            raise RuntimeError("session not started")
-        await self._page.mouse.wheel(0, -500 if direction == "up" else 500)
-        return f"scrolled {direction}"
-
-    async def go_back(self) -> str:
-        if self._page is None:
-            raise RuntimeError("session not started")
-        await self._page.go_back(timeout=8000)
-        return "went back"
-
-    async def wait_for_selector(self, selector: str, timeout_ms: int = 5000) -> str:
-        if self._page is None:
-            raise RuntimeError("session not started")
-        try:
-            await self._page.wait_for_selector(selector, timeout=timeout_ms)
-            return f"found {selector}"
-        except Exception as exc:  # noqa: BLE001
-            # A timeout is failure; BrowserTools converts exceptions to
-            # structured JSON error receipts that the dual loop recognizes.
-            raise TimeoutError(f"timed out waiting for {selector}: {exc}") from exc
+        return None
 
     async def snapshot(self, *, screenshot: bool = True, ground: bool = True) -> Snapshot:
-        if self._page is None:
-            raise RuntimeError("session not started")
-        # One round trip for the whole read. Per-element locator calls cost a
-        # selector pass over the page each (160+ of them): 10-38 s live.
-        data = await self._page.evaluate(_READ_PAGE, [_INTERACTIVE, 40, self._id_serial])
-        self._id_serial = max(self._id_serial, int(data.get("serial") or 0))
-        elements = []
-        ids: dict[int, str] = {}
-        for i, el in enumerate(data.get("elements") or []):
-            ids[i] = str(el.get("id") or "")
-            item = {"index": i, "id": ids[i], "tag": el.get("tag") or "?", "text": el.get("text") or ""}
-            if el.get("href"):
-                item["attrs"] = {"href": el["href"]}
-            elements.append(item)
-        if ground:
-            self._element_ids = ids
-        png = None
-        if screenshot:
-            try:
-                png = await self._page.screenshot(type="png")
-            except Exception as exc:  # noqa: BLE001
-                log.warning("screenshot failed: %s", exc)
-        return Snapshot(url=self._page.url, title=str(data.get("title") or ""),
-                        visible_text=str(data.get("text") or ""), elements=elements, screenshot_png=png)
-
-
-_INTERACTIVE = "a, button, input, textarea, select, [role='button'], [role='link']"
-_READ_PAGE = """([selector, limit, serial]) => {
-  const elements = [];
-  for (const n of document.querySelectorAll(selector)) {
-    if (elements.length >= limit) break;
-    let id = n.getAttribute('data-sawii-element-id');
-    if (!id) { serial += 1; id = 'sawii-' + serial; n.setAttribute('data-sawii-element-id', id); }
-    const text = ((n.innerText || n.value || n.getAttribute('aria-label') || '') + '').trim().slice(0, 120);
-    const href = n.tagName === 'A' && n.href && !n.href.startsWith('javascript:') ? n.href.slice(0, 200) : '';
-    elements.push({id, tag: n.tagName.toLowerCase(), text, href});
-  }
-  const body = document.body ? document.body.innerText : '';
-  return {elements, serial, title: document.title, text: (body || '').slice(0, 4000)};
-}"""
+        tabs = _text_of(await self.engine.call("browser_tab_list", {}))
+        title = (re.search(r"Current Tab: \[\d+\] (.*)", tabs) or [None, ""])[1].strip()
+        url = (re.search(r"\(([^)\n]*)\)?\s*$", tabs.splitlines()[-1]) or [None, ""])[1] if tabs else ""
+        md = json.loads(await self.engine.call("browser_get_markdown", {}) or "{}")
+        elements = await self._map() if ground or not self._mapped else []
+        png = await self.frame() if screenshot else None
+        return Snapshot(url=url, title=title, visible_text=str(md.get("content", "")) if isinstance(md, dict) else "",
+                        elements=elements, screenshot_png=png)
 
 
 def create_browser_session(
@@ -397,13 +252,10 @@ def create_browser_session(
     dry_run: bool = False,
     headless: bool = True,
     cdp_url: str | None = None,
+    workspace: str | None = None,
 ) -> BrowserSessionProto:
-    """The app's Chrome, unless a test asked for the dry-run stub.
-
-    ``headless`` is accepted for callers that still pass it. The app's Chrome
-    is headless and the pane shows the screenshots.
-    """
+    """Agent TARS's browser, unless a test asked for the dry-run stub."""
     if dry_run:
         return DryRunSession()
-    from .edited import EditedBrowserSession
-    return EditedBrowserSession(headless=headless, cdp_url=cdp_url)
+    return TarsSession(headless=headless, workspace=workspace,
+                       tars={"cdp_endpoint": cdp_url} if cdp_url else None)
