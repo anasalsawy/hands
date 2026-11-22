@@ -81,3 +81,38 @@ Columns still to fill per capability: where in Hands, Persona connection, runtim
 | Dynamic API/DOM/visual selection | NOT upstream | none | NEW (as a TARS operator/plugin, not a separate engine) |
 
 Benchmarks: none exist yet for Hands. Upstream ships `multimodal/benchmark`; Stage 4 will run real task suites and report actual results, not simulated ones.
+
+## 10. Outcome (implemented, tested, measured)
+
+Persona is the mind; Agent TARS is the execution engine. Every execution path below runs through `engine/persona-loop.ts`, which boots the real Agent TARS core (`AgentTARS`, vendored in `engine/ui-tars-desktop`). Python talks to it through `persona/tars_engine.py` (persistent tool server + loop) and `persona/tars_loop.py` (Persona as the model of the TARS loop).
+
+| Capability | Upstream implementation | Where in Hands | Connected to Persona by | Runtime evidence (test) | Benchmark (median) |
+|---|---|---|---|---|---|
+| DOM browser | agent-tars core browser MCP tools | `TarsSession` (`persona/gateway/browser/session.py`), Court lanes | hub `run()` / TARS loop with Persona `think` | `ModeTests.test_dom`, `HubTests` | 134 ms |
+| Visual | `browser_vision_control` | same engine | same | `ModeTests.test_visual` | 1833 ms |
+| Hybrid | visual + DOM on one page | same engine | same | `ModeTests.test_hybrid_*` | 1870 ms |
+| Terminal / filesystem | agent-tars commands + filesystem MCP | `Computer.call` now forwards to TARS | `persona/computer.py` | `ModeTests.test_terminal_and_filesystem` | 4 ms / 2 ms |
+| MCP | agent-tars `mcpServers` | `tars.mcp_servers` config | engine catalog | `ModeTests.test_mcp_server_tool` | <1 ms |
+| Desktop GUI | `@ui-tars/operator-nut-js` + action-parser | `engine/desktop-tools.ts` (native TARS tools) | engine catalog | `DesktopTests` on real X11 (click + type change the app's pixels; empty-desktop click is a control) | 287 ms |
+| Persona loop on TARS | `AgentTARS.run` with injected LLM client | `persona-loop.ts` `drive`, `run_tars_loop` | `think/approve/receipt/observe` messages | `LoopTests`, `PlanningTests`, `CourtTests`, `HubTests.test_tars_loop_runs_on_the_hubs_engine` | n/a |
+| Multi-Hand collaboration | n/a (Persona) executed by TARS | `TabHands` + `tars_page_tools`, per-lane engines | shared mind | `CollaborationTests` (3 hands on one tab; 2 lanes concurrently) | n/a |
+| API-first / REST | **new** (not upstream) | `engine/research-tools.ts` `api_request` | approval gate treats non-GET as mutating | `ResearchTests` | 2 ms |
+| OpenAPI, GraphQL | **new** | `openapi_discover/call`, `graphql_query` | same | `ResearchTests` | 2 ms |
+| UCP | **new** (spec: ucp.dev, `/.well-known/ucp`, REST transport, `UCP-Agent`) | `ucp_discover/call` | same | `ResearchTests.test_ucp_profile_and_checkout` | 2 ms |
+| WebMCP | **new** (W3C WebML CG draft; `document.modelContext`, legacy `navigator.modelContext`) | shim in `research-tools.ts`; wraps Chrome's native API when present | same | `ResearchTests.test_webmcp_tools_run_in_the_page` | 121 ms |
+| Accessibility tree | partial upstream; role/name interaction is **new** | `browser_accessibility_*` | same | `ResearchTests` | 238 ms |
+| Surface selection | **new** | `web_plan` (ucp > webmcp > openapi > graphql > dom > visual) | model reads the ranking | `ResearchTests.test_web_plan_*` | 4 ms |
+
+Full measurements: `docs/BENCHMARKS.md` (`python3 scripts/tars_bench.py`). Full test suite: `python3 -m pytest -q scripts/tars_loop_selftest.py`.
+
+### Removed (competing executors)
+`sawii_hands.py`, `ocu_mcp.py` (Open Computer Use), `webtools.py`, `winhand.py`, the Link drivers (Hermes / Cursor / Claude Code / Cline / generic / OpenAI bridge / browser-use) and `persona/link.py` (Persona's speculation classes moved verbatim to `persona/speculation.py`), the browser-use session and its patched SDK (`vendor/`), `/v1/hands` runner path, Python file/shell tools in `computer.py`.
+
+### Deviations (documented, with reasons)
+- **D1** provider label `volcengine`: TARS only enables visual/hybrid browser control for that provider name. It is a routing label; all inference goes to Persona's model.
+- **D2** `@ui-tars/operator-nut-js` and `action-parser` are installed from the npm registry at the same upstream version (1.2.3) as the vendored tree, because the monorepo install needs a git tarball (electron/node-gyp) that this build environment cannot fetch. Same code, upstream's own published artifact.
+- **D3** Desktop tools take UI-TARS actions on a 0-1000 grid, the same convention `browser_vision_control` uses.
+- **D4** The browser tasks of a persona run on the persona's own hub engine (one browser shared by pane, tools and task), serialized by a per-engine browser lock, because TARS's DOM element map is global state and a concurrent pane screenshot broke it (found by test).
+- **D5** Windows window targeting (winhand's PrintWindow capture/hwnd targeting) is not reproduced: desktop control is whole-screen via the nut-js operator. A per-window operator is the natural native extension; not built.
+- **D6** Visual-mode benchmark is dominated by TARS's own settle wait, not model time (no model in these benchmarks).
+- **D7** Not verified here: the Docker image build, the Windows bundle build, and remote (AIO sandbox) operators. The Dockerfile and packaging were changed to build the real TARS core; run them before release.
