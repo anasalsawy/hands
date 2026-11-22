@@ -704,5 +704,56 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(names[:5], ["ucp", "webmcp", "openapi", "graphql", "dom"])
 
 
+class CollaborationTests(unittest.IsolatedAsyncioTestCase):
+    """Collaborative Hands, executed by Agent TARS: several hands share one tab and one mind
+    (their page actions stay ordered, their reads overlap), and separate lanes browse at once."""
+
+    async def asyncSetUp(self):
+        from persona.gateway.browser.routes import BrowserHub
+        sys.path.insert(0, str(Path(__file__).parent))
+        from web_fixture_server import serve
+        self.server, self.site = serve()
+        self.hub = BrowserHub()
+
+    async def asyncTearDown(self):
+        await self.hub.shutdown()
+        self.server.shutdown()
+
+    async def test_two_hands_share_one_tab_on_tars(self):
+        from persona import shared_mind
+        from persona.court import tars_page_tools
+        from persona.gateway.browser.session import read_page
+        one = await self.hub._get((1, "R1"))
+        evaluate, find, press_enter = tars_page_tools(one.session.engine)
+
+        async def run_tool(name, args):
+            return str(await self.hub.run(1, name, args, lane="R1"))
+
+        async def read():
+            return await read_page(one.session, screenshot=False)
+        tab = shared_mind.TabHands(run_tool, read, find, press_enter, evaluate)
+        await tab.act("goto", {"url": self.site + "/shared"})
+        # Hand 1 reads while hand 2 and hand 3 act; the tab's lock orders the page changes.
+        hits, a, b = await asyncio.gather(
+            tab.act("find", {"text": "1889"}),
+            tab.act("click", {"id": 0}),
+            tab.act("click", {"id": 1}))
+        self.assertIn("1889", hits)
+        self.assertNotIn("error", a.lower()[:20])
+        self.assertNotIn("error", b.lower()[:20])
+        texts = await evaluate("[...document.querySelectorAll('button')].map(b => b.textContent)")
+        self.assertEqual(texts, ["A done", "B done"])
+
+    async def test_separate_lanes_browse_at_the_same_time(self):
+        pages = {"R1": self.site + "/one", "R2": self.site + "/two"}
+
+        async def hand(lane):
+            await self.hub.run(1, "browser_navigate", {"url": pages[lane]}, lane=lane)
+            return json.loads(await self.hub.run(1, "browser_snapshot", {}, lane=lane))["title"]
+        self.assertEqual(await asyncio.gather(hand("R1"), hand("R2")), ["one", "two"])
+        await self.hub.close_lane(1, "R1")
+        await self.hub.close_lane(1, "R2")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

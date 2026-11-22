@@ -198,6 +198,35 @@ class Court:
         }
 
 
+def tars_page_tools(engine):
+    """The in-page tools a shared-mind tab needs, each one a native Agent TARS tool call:
+    ``evaluate`` (browser_evaluate), ``find`` (page text search) and ``press_enter`` (browser_press_key)."""
+    from . import shared_mind
+
+    async def evaluate(expr: str):
+        out = await engine.call("browser_evaluate", {
+            "script": f"Promise.resolve({expr}).then(v => JSON.stringify(v === undefined ? null : v))"})
+        text = out
+        try:
+            parts = _json.loads(out)
+            text = "\n".join(str(p.get("text", "")) for p in parts if isinstance(p, dict))
+        except ValueError:
+            pass
+        if text.lstrip().startswith(("Failed", "Error", "Execution failed")):
+            raise RuntimeError(text[:200])
+        value = _json.loads(text.split("Execution result:", 1)[-1].strip())
+        return _json.loads(value) if isinstance(value, str) else value
+
+    async def find(needle: str) -> list[str]:
+        return list(await evaluate(f"({shared_mind.FIND_JS})({_json.dumps(needle)})") or [])
+
+    async def press_enter() -> None:
+        await engine.call("browser_press_key", {"key": "Enter"})
+        await asyncio.sleep(0.8)
+
+    return evaluate, find, press_enter
+
+
 class HandsDeck:
     """The deck of courts for every persona. One instance lives on the mind.
 
@@ -1163,42 +1192,10 @@ class HandsDeck:
         async def read():
             return await read_page(one.session, screenshot=False)
 
-        page = getattr(one.session, "_page", None)
-        native = getattr(one.session, "native", None)
+        engine = getattr(one.session, "engine", None)  # Agent TARS runs this tab
 
-        async def cdp(method: str, params: dict) -> dict:
-            session = await native.get_or_create_cdp_session(focus=False)
-            domain, name = method.split(".")
-            send = getattr(getattr(session.cdp_client.send, domain), name)
-            return await send(params=params, session_id=session.session_id)
-
-        async def find(needle: str) -> list[str]:
-            if page is not None:
-                return await page.evaluate(shared_mind.FIND_JS, needle)
-            r = await cdp("Runtime.evaluate", {"expression": f"({shared_mind.FIND_JS})({_json.dumps(needle)})",
-                                               "returnByValue": True})
-            return list(r.get("result", {}).get("value") or [])
-
-        async def press_enter() -> None:
-            if page is not None:
-                await page.keyboard.press("Enter")
-                with contextlib.suppress(Exception):
-                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                return
-            key = {"key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13}
-            await cdp("Input.dispatchKeyEvent", {"type": "keyDown", "text": "\r", **key})
-            await cdp("Input.dispatchKeyEvent", {"type": "keyUp", **key})
-            await asyncio.sleep(0.8)
-
-        async def evaluate(expr: str):
-            if page is not None:
-                return await page.evaluate(expr)
-            r = await cdp("Runtime.evaluate", {"expression": expr, "returnByValue": True, "awaitPromise": True})
-            if r.get("exceptionDetails"):
-                raise RuntimeError(str(r["exceptionDetails"].get("text") or "evaluate failed")[:200])
-            return r.get("result", {}).get("value")
-
-        can = page is not None or native is not None
+        evaluate, find, press_enter = tars_page_tools(engine) if engine is not None else (None, None, None)
+        can = engine is not None
         tab = shared_mind.TabHands(run_tool, read, find if can else None, press_enter if can else None,
                                    evaluate if can else None)
 

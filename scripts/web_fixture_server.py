@@ -21,6 +21,9 @@ A11Y_PAGE = """<!doctype html><title>a11y</title>
 <label for=n>Full name</label><input id=n>
 <button onclick="document.title='Saved '+document.getElementById('n').value">Save profile</button>"""
 
+SHARED_PAGE = """<!doctype html><title>shared</title><p id=fact>The tower opened in 1889.</p>
+<button id=a onclick="this.textContent='A done'">A</button><button id=b onclick="this.textContent='B done'">B</button>"""
+
 PLAIN_PAGE = "<!doctype html><title>plain</title><button>Only DOM here</button>"
 
 
@@ -64,7 +67,8 @@ def make_handler(port: int):
             if p == "/secure":
                 ok = self.headers.get("authorization") == TOKEN
                 return self._send(200 if ok else 401, {"secret": 42} if ok else {"error": "unauthorized"})
-            page = {"/webmcp": WEBMCP_PAGE, "/a11y": A11Y_PAGE, "/plain": PLAIN_PAGE}.get(p)
+            page = {"/webmcp": WEBMCP_PAGE, "/a11y": A11Y_PAGE, "/plain": PLAIN_PAGE, "/shared": SHARED_PAGE,
+                    "/one": "<title>one</title><h1>one</h1>", "/two": "<title>two</title><h1>two</h1>"}.get(p)
             if page:
                 return self._send(200, page, "text/html")
             return self._send(404, {"error": "not found"})
