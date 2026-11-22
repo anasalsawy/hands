@@ -251,14 +251,15 @@ class OpenAICompatLLM(LLM):
         return body
 
     async def push_screen(self, image_url: str = "", text: str = "", goal: str = "",
-                          last_action: str = "") -> bool:
+                          last_action: str = "", lane: str = "") -> bool:
         """Hand V a new frame (Persona endpoint /v1/screen). Returns at once on the
         server side; V reads it in the background and holds it as live state."""
         base = self.endpoint.base_url.rstrip("/")
         url = (base[:-3] if base.endswith("/v1") else base) + "/v1/screen"
         try:
             r = await self._http().post(url, headers=self._headers(), timeout=10, json={
-                "image_url": image_url, "text": text[:1500], "goal": goal[:500], "last_action": last_action[:300]})
+                "image_url": image_url, "text": text[:1500], "goal": goal[:500], "last_action": last_action[:300],
+                "lane": str(lane or "main")})
             return r.status_code == 200
         except Exception:  # noqa: BLE001
             return False

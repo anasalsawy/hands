@@ -9,6 +9,7 @@ native call parser, history and lifecycle are the production implementation.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 import sys
@@ -165,7 +166,7 @@ class LoopTests(unittest.IsolatedAsyncioTestCase):
             self.fail("inference must not run without the loop")
 
         with patch.dict(os.environ, {"SAWII_NODE": "/not-installed/node"}):
-            with self.assertRaisesRegex(RuntimeError, "npm ci --prefix engine"):
+            with self.assertRaisesRegex(RuntimeError, "npm run build:tars --prefix engine"):
                 await self.run_loop(infer)
 
     async def test_inference_failure_propagates(self):
@@ -361,94 +362,42 @@ class MotorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CourtTests(unittest.IsolatedAsyncioTestCase):
-    async def test_first_goal_on_listening_motor_starts_r_and_steering_reuses_loop(self):
-        entered, release = asyncio.Event(), asyncio.Event()
-        seen, calls, steered = [], [], []
+    """Court tests run the REAL Agent TARS engine: its own filesystem, terminal and
+    browser tools execute; only Persona's inference (the lobe) is scripted."""
 
-        async def chat(messages, **kwargs):
-            seen.append(messages)
-            if len(seen) == 1:
-                entered.set()
-                await release.wait()
-                return ChatResult("", [ToolCall("c1", "computer_click", '{"x":1}')])
-            return ChatResult("clicked with guidance")
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+        import threading
 
-        async def call(pid, name, args, **kwargs):
-            calls.append((name, args))
-            return "receipt"
+        class Page(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"<html><body><h1>COURT-PAGE-OK</h1><a href='/x'>Learn more</a></body></html>"
+                self.send_response(200)
+                self.send_header("content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(body)
 
-        async def steer(lane, goal):
-            steered.append((lane, goal))
+            def log_message(self, *a):
+                pass
 
-        hub = SimpleNamespace(_key=lambda pid, place, lane: (pid, place, lane),
-                              runners={(7, "computer", "ready"): SimpleNamespace(tools=[TOOL])},
-                              call=call, observe=lambda *args, **kw: asyncio.sleep(0))
-        link = SimpleNamespace(agent=SimpleNamespace(place="computer"), steer=steer)
-        mind = SimpleNamespace(a=SimpleNamespace(chat=chat), hands=hub,
-                               links=SimpleNamespace(get=lambda name: link), bus=None)
-        deck = HandsDeck(mind)
-        court = deck.create(7, title="already started")
-        court.lane, court.link, court.status = "ready", "hands-engine", "running"
-        self.assertEqual(court.goal, "")
-        await deck.send(7, court.id, "click once")
-        self.assertEqual(len(deck._work_tasks), 1)
-        await asyncio.wait_for(entered.wait(), 10)
-        original = next(iter(deck._work_tasks))
-        await deck.send(7, court.id, "then report briefly")
-        self.assertEqual(list(deck._work_tasks), [original], "steering must not start a second loop")
-        self.assertEqual(steered, [("ready", "then report briefly")])
-        release.set()
-        await asyncio.wait_for(original, 10)
-        self.assertEqual(court.status, "done", court.error)
-        self.assertEqual(calls, [("computer_click", {"x": 1})])
-        self.assertIn("Updated user guidance for this lane: then report briefly", str(seen[1]))
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Page)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.url = f"http://127.0.0.1:{cls.server.server_address[1]}/"
+        cls.work = tempfile.mkdtemp(prefix="hands-court-")
+        cls.env = mock.patch.dict(os.environ, {
+            "HANDS_ROOT": cls.work, "HANDS_HEADLESS": "1", "SAWII_CHROME": os.getenv("SAWII_CHROME", "/usr/bin/google-chrome"),
+            "SAWII_HANDS_APPROVE": "auto"})
+        cls.env.start()
 
-    async def test_stop_cancels_only_own_r_task_and_never_emits_failure(self):
-        stopped = asyncio.Event()
-        link = SimpleNamespace()
-        mind = SimpleNamespace(bus=None, links=SimpleNamespace(get=lambda name: link))
-        deck = HandsDeck(mind)
-        court = deck.create(7, title="cancel")
-        court.status, court.lane, court.link = "running", "r-cancel", "hands-engine"
-        court.error = "old error"
-        events = deck.subscribe(7)
+    @classmethod
+    def tearDownClass(cls):
+        cls.env.stop()
+        cls.server.shutdown()
 
-        async def wait_for_cancel():
-            try:
-                await asyncio.Future()
-            finally:
-                stopped.set()
-
-        async def stop(lane):
-            self.assertEqual(lane, "r-cancel")
-            self.assertEqual(court.status, "stopped")
-            self.assertTrue(stopped.is_set(), "R must stop before killing its motor")
-            deck._motor_died(7, court.id)(-15, "intentional SIGTERM")
-
-        link.stop = stop
-        own = asyncio.create_task(wait_for_cancel(), name=f"court-work-{court.id}")
-        other = asyncio.create_task(asyncio.sleep(10), name="court-work-other")
-        deck._work_tasks.update([own, other])
-        await asyncio.sleep(0)
-        try:
-            await deck.cancel(7, court.id)
-            self.assertTrue(own.cancelled())
-            self.assertFalse(other.done())
-            self.assertEqual(court.status, "stopped")
-            self.assertEqual(court.error, "")
-            recorded = []
-            while not events.empty():
-                recorded.append(events.get_nowait())
-            self.assertFalse(any(ev.get('status') == 'failed' for ev in recorded))
-        finally:
-            other.cancel()
-            await asyncio.gather(other, return_exceptions=True)
-
-    async def drive(self, replies, outputs=("receipt",), *, lane="r-one", image=None, l_read="",
-                    l_seen=None):
-        seen, calls, frames, records = [], [], [], []
+    async def drive(self, replies, *, kind="browser", lane="r-one", l_read="", l_seen=None, goal="work", deck_out=None):
+        seen, advertised, records = [], [], []
         scripted = iter(replies)
-        results = iter(outputs)
 
         async def chat(messages, **kwargs):
             if kwargs["tools"] is None:
@@ -458,168 +407,98 @@ class CourtTests(unittest.IsolatedAsyncioTestCase):
                 if isinstance(l_read, Exception):
                     raise l_read
                 return ChatResult(l_read)
+            advertised.append({t["function"]["name"] for t in kwargs["tools"]})
             seen.append(messages)
-            self.assertEqual(kwargs["tools"], [TOOL, PLAN_TOOL])
             return next(scripted)
 
-        async def call(pid, name, args, **kwargs):
-            self.assertEqual(kwargs["lane"], lane)
-            calls.append((pid, name, args, kwargs["lane"]))
-            return next(results)
-
-        async def observe(pid, place, **kwargs):
-            self.assertEqual(kwargs["lane"], lane)
-            frames.append(kwargs["lane"])
-            frame = {"text": f"only-{lane}"}
-            shot = image.pop(0) if isinstance(image, list) else image
-            return {**frame, "image_url": shot} if shot else frame
-
         async def append(pid, **kwargs):
-            self.assertEqual(pid, 7)
-            self.assertEqual(kwargs['task_id'], lane)
             records.append(kwargs)
 
-        hub = SimpleNamespace(_key=lambda pid, place, lane: (pid, place, lane),
-                              runners={(7, "computer", lane): SimpleNamespace(tools=[TOOL])},
-                              call=call, observe=observe)
-        mind = SimpleNamespace(a=SimpleNamespace(chat=chat), hands=hub, links=None, bus=None,
-                               shared_timeline=SimpleNamespace(append=append))
+        async def push_screen(*args, **kwargs):
+            return False   # this brain has no V feed: L reads the frame itself
+
+        mind = SimpleNamespace(a=SimpleNamespace(chat=chat, push_screen=push_screen), hands=None, links=None,
+                               bus=None, shared_timeline=SimpleNamespace(append=append))
         deck = HandsDeck(mind)
-        court = deck.create(7, title="test")
+        if deck_out is not None:
+            deck_out.append(deck)
+        court = deck.create(7, title="test", kind=kind)
         court.lane, court.status = lane, "running"
-        await deck._drive(7, court.id, lane, "click")
-        self.assertEqual([record['kind'] for record in records if record['kind'] != 'l_vision'],
-                         ['tool_call', 'tool_result'] * len(calls),
-                         "L and R must share the real call/result receipts")
-        return court, calls, seen, frames
+        await deck._drive(7, court.id, lane, goal)
+        return court, seen, advertised, records
 
-    async def test_court_executes_on_explicit_lane_and_returns_real_receipt(self):
-        court, calls, seen, frames = await self.drive([
-            ChatResult("", [ToolCall("c1", "computer_click", '{"x":1}')]), ChatResult("clicked")])
-        self.assertEqual(court.status, "done")
-        self.assertEqual(court.meta["agent_loop"], "omni-tars")
-        self.assertEqual(court.meta["result"], "clicked")
-        self.assertEqual(calls, [(7, "computer_click", {"x": 1}, "r-one")])
-        self.assertIn("only-r-one", str(seen[0]))
-        self.assertIn("receipt", str(seen[1]))
-        self.assertEqual(frames, ["r-one", "r-one"])
-
-    async def test_screen_goes_through_l_and_r_gets_ls_words_with_pixels(self):
-        l_seen, img = [], "data:image/png;base64,AAAA"
-        court, calls, seen, _ = await self.drive([
-            ChatResult("", [ToolCall("c1", "computer_click", '{"x":1}')]), ChatResult("clicked")],
-            image=img, l_read="Login form; Submit button bottom right", l_seen=l_seen)
-        self.assertEqual(court.status, "done")
-        self.assertEqual(len(l_seen), 1, "an unchanged screen reuses L's read")
-        self.assertEqual(court.meta["l_vision_reused"], 1)
-        self.assertIn(img, str(l_seen[0]))
-        self.assertIn("only-r-one", str(l_seen[0]), "L reads only its own lane")
-        for messages in seen:
-            self.assertIn("L sees: Login form; Submit button bottom right", str(messages))
-            self.assertIn(img, str(messages), "R still gets the raw pixels")
-        self.assertEqual(len(calls), 1, "L never dispatches tools")
-        self.assertIn("l_vision_ms", court.meta)
-
-    async def test_v_rereads_changed_screen_and_never_lets_l_act(self):
-        l_seen, shots = [], ["data:image/png;base64,ONE", "data:image/png;base64,TWO"]
-        court, calls, seen, _ = await self.drive([
-            ChatResult("", [ToolCall("c1", "computer_click", '{"x":1}')]), ChatResult("clicked")],
-            image=shots, l_read="screen", l_seen=l_seen)
-        self.assertEqual(court.status, "done")
-        self.assertEqual(len(l_seen), 2)
-        self.assertIn("ONE", str(l_seen[0]))
-        self.assertIn("TWO", str(l_seen[1]))
-        self.assertIn("TWO", str(seen[1]), "R gets the frame captured after its action")
-        self.assertEqual(len(calls), 1)
-
-    async def test_browser_card_drives_its_own_lane_browser_and_l_reads_it(self):
-        import dataclasses
-        from persona.gateway.browser.routes import BrowserHub
-        from persona.gateway.browser.session import DryRunSession
-        original = DryRunSession.snapshot
-
-        async def snapshot(self, **kwargs):
-            return dataclasses.replace(await original(self, **kwargs), screenshot_png=b"PNG-" + self.current_url.encode())
-
-        r_seen, l_seen, advertised = [], [], []
-        replies = iter([ChatResult("", [ToolCall("b1", "browser_navigate", '{"url":"https://example.com"}')]),
-                        ChatResult("Learn more")])
-
-        async def chat(messages, **kwargs):
-            if kwargs["tools"] is None:
-                l_seen.append(messages)
-                return ChatResult("Example Domain page with a Learn more link")
-            advertised.append([t["function"]["name"] for t in kwargs["tools"]])
-            r_seen.append(messages)
-            return next(replies)
-
-        async def append(pid, **kwargs):
-            pass
-
-        browser = BrowserHub(dry_run=True)
-        hub = SimpleNamespace(_key=lambda pid, place, lane: (pid, place, lane), runners={})
-        mind = SimpleNamespace(a=SimpleNamespace(chat=chat), hands=hub, links=None, bus=None,
-                               browser_hub=browser, shared_timeline=SimpleNamespace(append=append))
-        deck = HandsDeck(mind)
-        court = deck.create(7, title="web", kind="browser")
-        court.lane, court.status = "r-web", "running"
-        with patch.object(DryRunSession, "snapshot", snapshot):
-            await deck._drive(7, court.id, "r-web", "open example.com")
+    async def test_agent_tars_executes_real_tools_and_persona_sees_real_receipts(self):
+        target = os.path.join(self.work, "court.txt")
+        court, seen, advertised, records = await self.drive([
+            ChatResult("", [ToolCall("c1", "write_file", json.dumps({"path": target, "content": "from-tars"}))]),
+            ChatResult("", [ToolCall("c2", "run_command", json.dumps({"command": f"cat {target}"}))]),
+            ChatResult("wrote and read the file")])
         self.assertEqual(court.status, "done", court.error)
-        self.assertIn("browser_navigate", advertised[0])
-        self.assertNotIn("computer_shell", advertised[0])
-        lane_browser = browser._ones[(7, "r-web")].session
-        self.assertEqual(lane_browser.current_url, "https://example.com")
-        self.assertNotIn(7, browser._ones, "the persona's own pane browser is untouched")
-        self.assertIn("example.com", str(l_seen[0]))
-        self.assertIn("L sees: Example Domain page", str(r_seen[1]))
-        self.assertIn("persona_prepare_next_actions", str(r_seen[0]), "R is told to plan ahead")
-        deck.remove(7, court.id)
-        for _ in range(20):
-            if (7, "r-web") not in browser._ones:
-                break
-            await asyncio.sleep(0.01)
-        self.assertNotIn((7, "r-web"), browser._ones, "removing the card closes its lane browser")
-        await browser.shutdown()
+        self.assertEqual(court.meta["agent_loop"], "agent-tars")
+        self.assertEqual(open(target).read(), "from-tars", "Agent TARS itself wrote the file")
+        self.assertIn("from-tars", str(seen[2]), "the terminal receipt reached Persona's next decision")
+        # TARS's own tool catalog is what the lobe is offered (browser, files, terminal, search).
+        self.assertTrue({"write_file", "run_command", "browser_navigate", "browser_get_markdown",
+                         "persona_prepare_next_actions"} <= advertised[0])
+        self.assertEqual([r["kind"] for r in records if r["kind"] in ("tool_call", "tool_result")],
+                         ["tool_call", "tool_result"] * 2, "L and R share the real call/result receipts")
 
-    async def test_l_vision_failure_falls_back_to_raw_frame(self):
-        l_seen, img = [], "data:image/png;base64,BBBB"
-        court, _, seen, _ = await self.drive([ChatResult("nothing to do")], image=img,
-                                             l_read=RuntimeError("L down"), l_seen=l_seen)
-        self.assertEqual(court.status, "done")
-        self.assertIn(img, str(seen[0]))
-        self.assertNotIn("L sees:", str(seen[0]))
-        self.assertIn("L down", court.meta["l_vision_error"])
+    async def test_dom_browser_runs_inside_agent_tars_and_card_frame_comes_from_it(self):
+        l_seen = []
+        court, seen, _, _ = await self.drive([
+            ChatResult("", [ToolCall("b1", "browser_navigate", json.dumps({"url": self.url}))]),
+            ChatResult("", [ToolCall("b2", "browser_get_markdown", "{}")]),
+            ChatResult("saw the page")], l_read="Page titled COURT-PAGE-OK", l_seen=l_seen)
+        self.assertEqual(court.status, "done", court.error)
+        self.assertIn("COURT-PAGE-OK", str(seen[2]), "DOM markdown extraction by TARS reached Persona")
+        self.assertTrue(l_seen, "the card's frame (a TARS screenshot) was read by L/V")
+        self.assertIn("data:image/png;base64,", str(l_seen[0]))
 
-    async def test_dead_hand_cannot_be_hidden_by_final_answer(self):
+    async def test_tool_error_receipt_fails_the_card_and_recovery_clears_it(self):
+        missing = os.path.join(self.work, "nope", "missing.txt")
         court, _, _, _ = await self.drive([
-            ChatResult("", [ToolCall("c1", "computer_click", "{}")]), ChatResult("could not click")],
-            outputs=('{"error":"hand disconnected"}',))
-        self.assertEqual(court.status, "failed")
-        self.assertIn("hand disconnected", court.error)
-
-    async def test_successful_recovery_clears_tool_error(self):
-        court, calls, _, _ = await self.drive([
-            ChatResult("", [ToolCall("c1", "computer_click", "{}")]),
-            ChatResult("", [ToolCall("c2", "computer_click", "{}")]), ChatResult("recovered")],
-            outputs=('{"error":"temporary"}', "receipt"))
-        self.assertEqual(court.status, "done")
-        self.assertEqual(len(calls), 2)
+            ChatResult("", [ToolCall("c1", "read_file", json.dumps({"path": missing}))]),
+            ChatResult("could not read it")])
+        self.assertEqual(court.status, "failed", "a failed tool cannot be hidden by a polite final answer")
+        good = os.path.join(self.work, "ok.txt")
+        court, _, _, _ = await self.drive([
+            ChatResult("", [ToolCall("c1", "read_file", json.dumps({"path": missing}))]),
+            ChatResult("", [ToolCall("c2", "write_file", json.dumps({"path": good, "content": "x"}))]),
+            ChatResult("recovered")])
+        self.assertEqual(court.status, "done", court.error)
 
     async def test_unknown_tool_and_malformed_arguments_fail_before_dispatch(self):
-        for name, args in [("unadvertised", "{}"), ("computer_click", "[]"), ("computer_click", "bad")]:
+        for name, args in [("unadvertised", "{}"), ("write_file", "[]"), ("write_file", "bad")]:
             with self.subTest(name=name, args=args):
-                court, calls, _, _ = await self.drive([ChatResult("", [ToolCall("c1", name, args)])])
+                court, _, _, _ = await self.drive([ChatResult("", [ToolCall("c1", name, args)])])
                 self.assertEqual(court.status, "failed")
-                self.assertEqual(calls, [])
+
+    async def test_person_can_decline_an_action_and_agent_tars_does_not_run_it(self):
+        target = os.path.join(self.work, "declined.txt")
+        decks = []
+        with mock.patch.dict(os.environ, {"SAWII_HANDS_APPROVE": "ask"}):
+            task = asyncio.create_task(self.drive([
+                ChatResult("", [ToolCall("c1", "write_file", json.dumps({"path": target, "content": "no"}))]),
+                ChatResult("it was declined")], deck_out=decks))
+            for _ in range(1200):
+                await asyncio.sleep(0.05)
+                if decks and decks[0]._approvals:
+                    break
+            self.assertTrue(decks and decks[0]._approvals, "the card must be waiting for the person")
+            cid = next(iter(decks[0]._approvals))
+            self.assertEqual(decks[0].get(7, cid).status, "waiting")
+            self.assertTrue(decks[0].resolve_approval(7, cid, False, "not now"))
+            await task
+        self.assertFalse(os.path.exists(target), "a declined action must never execute")
 
     async def test_two_courts_never_cross_lanes(self):
         results = await asyncio.gather(*[
-            self.drive([ChatResult("", [ToolCall("c1", "computer_click", "{}")]),
+            self.drive([ChatResult("", [ToolCall("c1", "list_directory", json.dumps({"path": self.work}))]),
                         ChatResult("done")], lane=lane)
             for lane in ["r-one", "r-two"]])
-        self.assertEqual([result[0].status for result in results], ["done", "done"])
-        self.assertEqual([result[1][0][-1] for result in results], ["r-one", "r-two"])
+        self.assertEqual([r[0].status for r in results], ["done", "done"])
+        for r, lane in zip(results, ["r-one", "r-two"]):
+            self.assertTrue(all(rec["task_id"] == lane for rec in r[3] if rec["kind"] in ("tool_call", "tool_result")))
 
 
 if __name__ == "__main__":

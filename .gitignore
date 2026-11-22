@@ -24,3 +24,4 @@ Thumbs.db
 dist-release/
 build-portable/
 build-windows/
+engine/images/

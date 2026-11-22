@@ -35,6 +35,7 @@ Wire surface (mounted by persona/api/app.py and stitch.py):
     POST   /v1/courts/{court_id}/spawn      spawn desktop instance (engine lane)
     POST   /v1/courts/{court_id}/goal       send a goal to the court's lane
     POST   /v1/courts/{court_id}/cancel     stop the work, keep the card
+    POST   /v1/courts/{court_id}/approve    {allow: bool} answer a waiting approval
     POST   /v1/courts/{court_id}/voice      voice hook (speak / listen toggle)
     GET    /v1/courts/{court_id}/events     SSE of this deck's typed events
     WS     /v1/court-events                 one socket, every card's events
@@ -216,6 +217,7 @@ class HandsDeck:
         self._work_tasks: set[asyncio.Task] = set()
         self._send_locks: dict[str, asyncio.Lock] = {}
         self._shared = None   # shared-mind client, when SAWII_SHARED_MIND_URL is set
+        self._approvals: dict[str, asyncio.Future] = {}  # court id -> person's pending decision
         # Per-persona live event fan-out (each subscriber gets its own queue).
         self._subs: dict[int, list[asyncio.Queue]] = {}
 
@@ -950,6 +952,48 @@ class HandsDeck:
                               f"({type(exc).__name__}: {exc})"[:300])
             self.emit(c, "court.status", status=c.status, error=c.error, lane=c.lane)
 
+    def _tars_config(self, c: Court, persona_id: int, lane: str) -> dict:
+        """How Agent TARS is set up for one lane: where it may work, which Chrome it
+        drives, and how it controls the browser (DOM / visual / hybrid)."""
+        roots = [r for r in os.environ.get("HANDS_ROOT", "").split(os.pathsep) if r]
+        workspace = roots[0] if roots else os.path.join(
+            os.environ.get("HANDS_DATA_DIR") or os.path.expanduser("~"), "hands-work", str(c.id))
+        os.makedirs(workspace, exist_ok=True)
+        cfg: dict = {
+            "workspace": workspace,
+            "headless": os.environ.get("HANDS_HEADLESS", "1" if os.environ.get("HANDS_CLOUD") else "0") != "0",
+            "browser_control": os.environ.get("HANDS_BROWSER_CONTROL", "hybrid"),
+        }
+        chrome = os.environ.get("SAWII_CHROME")
+        if chrome:
+            cfg["chrome_path"] = chrome
+        if os.environ.get("HANDS_MCP_SERVERS"):
+            cfg["mcp_servers"] = _json.loads(os.environ["HANDS_MCP_SERVERS"])
+        return cfg
+
+    async def _ask_person(self, persona_id: int, c: Court, lane: str, name: str, args: dict) -> dict:
+        """The person decides whether this action runs. The card shows what is waiting."""
+        fut = asyncio.get_running_loop().create_future()
+        self._approvals[c.id] = fut
+        c.meta["approval"] = {"tool": name, "args": str(args)[:500]}
+        self._touch(c, status="waiting")
+        self.emit(c, "court.status", status=c.status, lane=lane, approval=c.meta["approval"])
+        try:
+            return await fut
+        finally:
+            self._approvals.pop(c.id, None)
+            c.meta.pop("approval", None)
+            if c.status == "waiting":
+                self._touch(c, status="running")
+                self.emit(c, "court.status", status=c.status, lane=lane)
+
+    def resolve_approval(self, persona_id: int, court_id: str, allow: bool, reason: str = "") -> bool:
+        fut = self._approvals.get(court_id)
+        if self.get(persona_id, court_id) is None or fut is None or fut.done():
+            return False
+        fut.set_result({"allow": bool(allow), "reason": reason or ("approved" if allow else "declined by the person")})
+        return True
+
     async def _drive(self, persona_id: int, court_id: str, lane: str, goal: str) -> None:
         """The R loop for one lane: think, call this lane's hand, read, repeat."""
         c = self.get(persona_id, court_id)
@@ -962,45 +1006,41 @@ class HandsDeck:
         c = self.get(persona_id, court_id)
         if c is None:
             return
-        if hub is None or lobe is None or not hasattr(lobe, "chat"):
+        if lobe is None or not hasattr(lobe, "chat"):
             self._touch(c, status="failed",
                         error="no inference lobe available: the engine has nobody to think for it")
             self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
             return
         place = self._place(c)
-        try:
-            runner = hub.runners.get(hub._key(persona_id, place, lane))
-        except Exception:  # noqa: BLE001
-            runner = None
-        browser = getattr(self.mind, "browser_hub", None) if c.kind == "browser" else None
-        if runner is None and browser is None:
-            self._touch(c, status="failed", error="the engine for this lane never connected")
-            self.emit(c, "court.status", status=c.status, error=c.error, lane=lane)
-            return
         from .tars_loop import PLAN_NAME, PLAN_TOOL, run_tars_loop
 
-        if browser is not None:
-            # Start the lane browser now, in parallel with the first model turn, so its
-            # launch time overlaps the thinking instead of adding to it.
-            _w = asyncio.create_task(browser._get((persona_id, lane)), name=f"court-warm-{c.id}")
-            _w.add_done_callback(lambda t: t.cancelled() or t.exception())
+        # Persona-only tools. Everything that touches the computer (browser, files,
+        # terminal, search, MCP) is Agent TARS's own tool and runs inside the engine.
+        schemas = [PLAN_TOOL]
+        engine: dict = {}          # filled by the loop: engine["call"](name, args) runs a TARS tool
+        tool_specs: list[dict] = []  # TARS's own tool schemas, as the engine advertises them
 
-        if browser is not None:
-            # A browser card drives its own lane browser (the one its surface
-            # streams), not a shell or a separate headless Chrome.
-            from .gateway.browser.tools import BrowserTools
-            schemas = [*BrowserTools(None).schemas(), PLAN_TOOL]
-        else:
-            schemas = [*list(getattr(runner, "tools", []) or []), PLAN_TOOL]
+        def _on_tools(specs: list[dict]) -> None:
+            tool_specs[:] = specs
 
         async def browser_frame() -> dict:
-            from .gateway.browser.session import read_page
-            from .gateway.browser.tools import _render_snapshot
-            one = await browser._get((persona_id, lane))
-            snap = await read_page(one.session, screenshot=_l_vision_enabled(), ground=False)
-            frame = {"source": "browser", "lane": lane, "text": _render_snapshot(snap)[:4000]}
-            if snap.screenshot_png:
-                frame["image_url"] = "data:image/png;base64," + base64.b64encode(snap.screenshot_png).decode()
+            """The lane browser's current screen, taken by Agent TARS's own screenshot tool."""
+            call = engine.get("call")
+            if call is None:
+                return {"source": "browser", "lane": lane, "text": "engine starting"}
+            raw = await call("browser_screenshot", {})
+            frame = {"source": "browser", "lane": lane, "text": ""}
+            try:
+                info = _json.loads(raw)
+                path = info.get("filepath")
+                if path and os.path.exists(path):
+                    with open(path, "rb") as fh:
+                        frame["image_url"] = "data:image/png;base64," + base64.b64encode(fh.read()).decode()
+                    os.unlink(path)
+                else:
+                    frame["text"] = str(info.get("message") or info.get("error") or "")[:500]
+            except (ValueError, OSError):
+                frame["text"] = str(raw)[:500]
             return frame
         instructions = (
             f"You are Sawii's R line {lane}, working on one computer with the tools "
@@ -1019,7 +1059,14 @@ class HandsDeck:
         # reading "done" over work that never ran is the exact lie this deck
         # exists to prevent. A recovery (error, then a good call) clears it.
         last_tool_error = ""
-        names = {tool["function"]["name"] for tool in schemas}
+        def _all_tools() -> list[dict]:
+            seen, out = set(), []
+            for t in [*schemas, *tool_specs]:
+                n = t["function"]["name"]
+                if n not in seen:
+                    seen.add(n)
+                    out.append(t)
+            return out
         steps = 0
         initial_goal = c.goal
 
@@ -1041,53 +1088,57 @@ class HandsDeck:
                             "Updated user guidance for this lane: " + c.goal[:4000]}]
             _t0 = time.monotonic()
             reply = await asyncio.wait_for(
-                lobe.chat(messages, tools=schemas or None, max_tokens=4096, temperature=0.2),
+                lobe.chat(messages, tools=_all_tools() or None, max_tokens=4096, temperature=0.2),
                 timeout=GOAL_STEP_TIMEOUT)
             _lat(c, "think", (time.monotonic() - _t0) * 1000, out=getattr(reply, "out_tokens", 0))
             calls = []
             for tc in getattr(reply, "tool_calls", None) or []:
                 args = _json.loads(tc.arguments or "{}")
-                if tc.name not in names or not isinstance(args, dict):
+                if tc.name not in {t["function"]["name"] for t in _all_tools()} or not isinstance(args, dict):
                     raise RuntimeError("R requested an unadvertised tool or invalid arguments")
                 calls.append({"id": tc.id, "name": tc.name, "arguments": args})
             return {"text": getattr(reply, "text", "") or "", "tool_calls": calls,
                     "finish_reason": getattr(reply, "finish_reason", "stop")}
 
-        async def execute(name: str, args: dict) -> str:
-            nonlocal last_tool_error
+        approve_mode = os.getenv("SAWII_HANDS_APPROVE", "auto")
+        call_seq = [0]
+
+        async def approve(name: str, args: dict, mutating: bool) -> dict:
+            """Persona's gate in front of Agent TARS's own tools (the mind decides; the
+            engine executes). Also writes the tool_call to the shared timeline."""
             c = active()
+            call_seq[0] += 1
             timeline = getattr(self.mind, "shared_timeline", None)
-            call_id = f"{lane}:{len(receipts) + 1}"
             if timeline is not None:
                 await timeline.append(persona_id, producer=c.meta.get("lane_label") or lane,
                                       kind="tool_call", task_id=lane,
                                       payload={"tool": name, "args": str(args)[:1500],
-                                               "call_id": call_id, "part": goal[:500]})
-            _t0 = time.monotonic()
-            out = await asyncio.wait_for(
-                browser.run(persona_id, name, args, lane=lane) if browser is not None
-                else hub.call(persona_id, name, args, lane=lane),
-                                         timeout=GOAL_TOOL_TIMEOUT)
-            _lat(c, "tool", (time.monotonic() - _t0) * 1000, tool=name)
-            text = str(out)
+                                               "call_id": f"{lane}:{call_seq[0]}", "part": goal[:500]})
+            if approve_mode == "auto" or (approve_mode == "writes" and not mutating):
+                return {"allow": True}
+            return await self._ask_person(persona_id, c, lane, name, args)
+
+        async def on_receipt(name: str, args: dict, text: str) -> None:
+            """What Agent TARS actually returned: Persona records it (trace, timeline, V)."""
+            nonlocal last_tool_error
+            c = active()
+            timeline = getattr(self.mind, "shared_timeline", None)
             receipts.append(f"{name}: {text[:200]}")
             last_action[0] = f"{name} {_json.dumps(args)[:300]} -> {text[:200]}"
-            try:
-                parsed = _json.loads(text)
-                bad = isinstance(parsed, dict) and bool(parsed.get("error") or parsed.get("isError"))
-                last_tool_error = str(parsed.get("error") or "tool failed")[:300] if bad else ""
-            except ValueError:
-                last_tool_error = ""
+            from .tars_loop import receipt_failed
+            last_tool_error = ("tool failed: " + text[:260]) if receipt_failed(text) else ""
             c.meta["last_tools"] = receipts[-3:]
             _trace(c, name, args, text)
             self.emit(c, "court.updated", changed="trace")
             if timeline is not None:
                 await timeline.append(persona_id, producer=c.meta.get("lane_label") or lane,
                                       kind="tool_result", task_id=lane,
-                                      payload={"tool": name, "call_id": call_id, "part": goal[:500],
-                                               "result": {"text": text[:2000]}})
+                                      payload={"tool": name, "call_id": f"{lane}:{call_seq[0]}",
+                                               "part": goal[:500], "result": {"text": text[:2000]}})
             v_prefetch()
-            return text[:int(os.environ.get("HANDS_TOOL_RESULT_CHARS","2400"))]
+
+        async def execute(name: str, args: dict) -> str:
+            raise RuntimeError(f"{name} is not a Persona-side tool; Agent TARS executes it")
 
         v_reads: dict[str, str] = {}
         last_action = [""]
@@ -1101,8 +1152,7 @@ class HandsDeck:
             # reaches it through the shared mind on its next step.
             c = active()
             frame = await asyncio.wait_for(
-                browser_frame() if browser is not None else hub.observe(persona_id, place, lane=lane),
-                timeout=8 if browser is not None else 3)
+                browser_frame(), timeout=15)
             image = frame.get("image_url") if isinstance(frame, dict) else None
             if not image or not _l_vision_enabled():
                 return frame
@@ -1111,7 +1161,7 @@ class HandsDeck:
                 v_look._last = key
 
                 async def _feed():
-                    ok = await lobe.push_screen(image, str(frame.get("text") or ""), goal, last_action[0])
+                    ok = await lobe.push_screen(image, str(frame.get("text") or ""), goal, last_action[0], lane=str(lane or "main"))
                     screen_feed[0] = ok if screen_feed[0] is None else (screen_feed[0] or ok)
                     c.meta["v_feed"] = "live" if ok else "unavailable"
 
@@ -1160,12 +1210,14 @@ class HandsDeck:
             finally:
                 _lat(active(), "observe", (time.monotonic() - _t0) * 1000)
 
-        c.meta["agent_loop"] = "omni-tars"
+        c.meta["agent_loop"] = "agent-tars"
         try:
             try:
                 said = await run_tars_loop(
                     goal=goal[:4000], instructions=instructions, tools=schemas,
                     infer=infer, execute=execute, observe=observe,
+                    approve=approve, on_receipt=on_receipt, on_tools=_on_tools, handle=engine,
+                    tars=self._tars_config(c, persona_id, lane),
                     max_steps=MAX_LANE_STEPS,
                     timeout=max(GOAL_STEP_TIMEOUT, GOAL_TOOL_TIMEOUT) + 5,
                     autofire=os.getenv("SAWII_HANDS_AUTOFIRE", "1") != "0",
@@ -1466,6 +1518,20 @@ def register_court_routes(app) -> None:
             return _err(404, "unknown court")
         return JSONResponse(court.view(), status_code=202)
 
+    async def court_approve(request: Request):
+        deck = deck_of(request)
+        persona = await _persona(request)
+        if deck is None or persona is None:
+            return _err(503 if deck is None else 401, "deck not mounted" if deck is None else "invalid persona key")
+        try:
+            data = await _body(request)
+        except (ValueError, _json.JSONDecodeError):
+            data = {}
+        if not deck.resolve_approval(persona["id"], request.path_params["court_id"],
+                                     bool(data.get("allow")), str(data.get("reason") or "")):
+            return _err(404, "nothing is waiting for approval on that court")
+        return JSONResponse({"ok": True})
+
     async def court_cancel(request: Request):
         deck = deck_of(request)
         persona = await _persona(request)
@@ -1559,6 +1625,7 @@ def register_court_routes(app) -> None:
         Route("/v1/courts/{court_id}/spawn", court_spawn, methods=["POST"]),
         Route("/v1/courts/{court_id}/goal", court_goal, methods=["POST"]),
         Route("/v1/courts/{court_id}/cancel", court_cancel, methods=["POST"]),
+        Route("/v1/courts/{court_id}/approve", court_approve, methods=["POST"]),
         Route("/v1/courts/{court_id}/voice", court_voice, methods=["POST"]),
         Route("/v1/courts/{court_id}/events", court_events, methods=["GET"]),
         WebSocketRoute("/v1/court-events", court_events_ws),
