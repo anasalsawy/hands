@@ -58,11 +58,19 @@ class BrowserHub:
         self._lock = asyncio.Lock()
         self.tasks = None
 
-    async def _get(self, pid=None) -> _One:
+    async def engine(self, pid=None, workspace: str | None = None):
+        """The persona's Agent TARS engine (filesystem, commands, MCP, browser)."""
+        one = await self._get(pid, workspace)
+        eng = getattr(one.session, 'engine', None)
+        if eng is None:
+            raise RuntimeError('Agent TARS engine unavailable (dry-run browser)')
+        return eng
+
+    async def _get(self, pid=None, workspace: str | None = None) -> _One:
         async with self._lock:
             one = self._ones.get(pid)
             if one is None:
-                s = create_browser_session(dry_run=self.dry_run, cdp_url=self.cdp_url)
+                s = create_browser_session(dry_run=self.dry_run, cdp_url=self.cdp_url, workspace=workspace)
                 try:
                     await s.start()
                 except Exception:
