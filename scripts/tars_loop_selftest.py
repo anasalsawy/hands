@@ -619,5 +619,90 @@ class ModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("HELLO", self.run_("shout", {"text": "hello"}))
 
 
+class ResearchTests(unittest.TestCase):
+    """API-first execution surfaces added to TARS as native tools, against a local site that
+    really serves UCP, OpenAPI, GraphQL, an authorized endpoint, WebMCP and an accessible form."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(Path(__file__).parent))
+        from web_fixture_server import serve
+        cls.server, cls.site = serve()
+        host = cls.site.split("//")[1]
+        cls.loop = asyncio.new_event_loop()
+        from persona.tars_engine import TarsEngine
+        cls.engine = cls.loop.run_until_complete(TarsEngine(workspace=tempfile.mkdtemp(), tars={
+            "api_hosts": {host: {"headers": {"authorization": "Bearer sekrit"}}},
+            "ucp_agent_profile": "https://agent.example/profiles/sawii.json"}).start())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.loop.run_until_complete(cls.engine.close())
+        cls.loop.close()
+        cls.server.shutdown()
+
+    def call(self, name, args=None):
+        raw = self.loop.run_until_complete(self.engine.call(name, args or {}))
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return raw
+
+    def test_tools_are_native_tars_tools(self):
+        for name in ("api_request", "openapi_discover", "openapi_call", "graphql_query", "ucp_discover", "ucp_call",
+                     "webmcp_list_tools", "webmcp_call_tool", "browser_accessibility_snapshot", "web_plan"):
+            self.assertIn(name, self.engine.tools)
+
+    def test_rest_is_authorized_by_config_not_by_the_model(self):
+        ok = self.call("api_request", {"method": "GET", "url": self.site + "/secure"})
+        self.assertEqual((ok["status"], ok["body"]), (200, {"secret": 42}))
+        refused = self.call("api_request", {"method": "GET", "url": "http://127.0.0.1:9/x"})
+        self.assertEqual(refused["status"], "error")
+        self.assertIn("not an authorized API host", refused["message"])
+
+    def test_openapi_discover_and_call(self):
+        found = self.call("openapi_discover", {"spec_url": self.site + "/openapi.json"})
+        self.assertEqual({o["operationId"] for o in found["operations"]}, {"listItems", "createItem", "getItem"})
+        item = self.call("openapi_call", {"spec_url": self.site + "/openapi.json", "operation_id": "getItem", "path_params": {"id": 1}})
+        self.assertEqual(item["body"], {"id": 1, "name": "tea"})
+
+    def test_graphql(self):
+        listed = self.call("graphql_query", {"endpoint": self.site + "/graphql", "query": "{ items { id name } }"})
+        self.assertEqual(listed["status"], "success")
+        self.assertEqual(listed["body"]["data"]["items"][0]["name"], "tea")
+
+    def test_ucp_profile_and_checkout(self):
+        profile = self.call("ucp_discover", {"origin": self.site})
+        self.assertEqual(profile["status"], "success")
+        self.assertEqual(profile["services"][0]["transport"], "rest")
+        self.assertIn("dev.ucp.shopping.checkout", profile["capabilities"])
+        session = self.call("ucp_call", {"origin": self.site, "method": "POST", "path": "/checkout-sessions",
+                                         "body": {"line_items": [{"sku": "tea", "qty": 2}]}})
+        self.assertEqual(session["status"], 201)
+        self.assertIn("agent.example/profiles/sawii.json", session["body"]["agent"])
+
+    def test_webmcp_tools_run_in_the_page(self):
+        self.call("browser_navigate", {"url": self.site + "/webmcp"})
+        listed = self.call("webmcp_list_tools")
+        self.assertEqual([t["name"] for t in listed["tools"]], ["add-todo"])
+        self.assertEqual(self.call("webmcp_call_tool", {"name": "add-todo", "input": {"text": "buy tea"}})["status"], "success")
+        dom = self.call("browser_evaluate", {"script": "document.getElementById('list').innerText"})
+        self.assertIn("buy tea", str(dom))
+
+    def test_accessibility_tree_interaction(self):
+        self.call("browser_navigate", {"url": self.site + "/a11y"})
+        tree = self.call("browser_accessibility_snapshot")["tree"]
+        self.assertIn('button "Save profile"', tree)
+        self.call("browser_accessibility_fill", {"role": "textbox", "name": "Full name", "value": "Anas"})
+        self.call("browser_accessibility_click", {"role": "button", "name": "Save profile"})
+        self.assertIn("Saved Anas", str(self.call("browser_evaluate", {"script": "document.title"})))
+
+    def test_web_plan_prefers_structured_surfaces_then_falls_back(self):
+        rich = self.call("web_plan", {"url": self.site + "/webmcp", "goal": "add a todo"})
+        names = [s["surface"] for s in rich["surfaces"]]
+        self.assertEqual(rich["recommended"], "ucp")
+        self.assertEqual(names[:5], ["ucp", "webmcp", "openapi", "graphql", "dom"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

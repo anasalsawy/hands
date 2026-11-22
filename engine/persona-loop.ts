@@ -31,6 +31,7 @@ const toSchema = (schema: any) => {
 };
 
 import { desktopAvailable, desktopTools } from './desktop-tools.ts';
+import { researchTools, installWebMcp } from './research-tools.ts';
 
 // stdout is exclusively the private JSON-lines transport, never model logs.
 const realWrite = process.stdout.write.bind(process.stdout);
@@ -42,6 +43,7 @@ let sequence = 0;
 let started = false;
 let toolsMode = false;
 let engineAgent: any;
+const shimmed = new WeakSet<object>();
 let onClose: () => void = () => {};
 
 function request(type: string, payload: Record<string, unknown> = {}): Promise<any> {
@@ -61,13 +63,27 @@ const MUTATING = new Set([
   'desktop_vision_control', 'browser_close_tab', 'browser_switch_tab', 'browser_scroll', 'browser_go_back', 'browser_go_forward',
 ]);
 
+// Structured-surface tools are mutating unless the call is plainly a read.
+function isMutating(name: string, args: any): boolean {
+  if (MUTATING.has(name)) return true;
+  const method = String(args?.method || 'GET').toUpperCase();
+  switch (name) {
+    case 'api_request': case 'ucp_call': return !['GET', 'HEAD'].includes(method);
+    case 'openapi_call': return true;
+    case 'graphql_query': return /\bmutation\b/i.test(String(args?.query || ''));
+    case 'webmcp_call_tool': return true;
+    case 'browser_accessibility_click': case 'browser_accessibility_fill': return true;
+    default: return false;
+  }
+}
+
 let personaOnly = new Set<string>();
 let chain: Promise<unknown> = Promise.resolve();
 // One browser surface, one tool at a time: TARS's DOM mapping is global state, so a screenshot
 // for the live pane must never run in the middle of the loop's own click or element read.
 let browserChain: Promise<unknown> = Promise.resolve();
 function onBrowser<T>(name: string, run: () => Promise<T>): Promise<T> {
-  if (!name.startsWith('browser_')) return run();
+  if (!name.startsWith('browser_') && !name.startsWith('webmcp_') && name !== 'web_plan') return run();
   const mine = browserChain.then(run, run);
   browserChain = mine.catch(() => undefined);
   return mine;
@@ -82,8 +98,8 @@ function wrapNative(tool: any): any {
   wrapped.add(tool);
   const original = tool.function.bind(tool);
   originals.set(tool.name, original);
-  const mutating = MUTATING.has(tool.name);
   tool.function = async (args: any) => {
+    const mutating = isMutating(tool.name, args);
     const gate = await request('approve', { name: tool.name, args, mutating });
     if (!gate || gate.allow === false) {
       return JSON.stringify({ error: `denied: ${gate?.reason || 'not approved'}` });
@@ -113,7 +129,12 @@ class PersonaTARS extends AgentTARS {
   // TARS's pre/post tool hooks (lazy launch, liveness probe, recovery) touch the page too, so
   // they queue on the same browser lock as every tool.
   async onBeforeToolCall(id: string, toolCall: any, args: any): Promise<any> {
-    return onBrowser(toolCall.name, () => super.onBeforeToolCall(id, toolCall, args));
+    const needsPage = toolCall.name.startsWith('browser_') || toolCall.name.startsWith('webmcp_') || toolCall.name === 'web_plan';
+    return onBrowser(needsPage ? 'browser_pre' : toolCall.name, async () => {
+      const result = await super.onBeforeToolCall(id, toolCall, args);
+      if (needsPage) await installWebMcp(this, shimmed);  // browser is launched by now; shim goes in before the page loads
+      return result;
+    });
   }
 
   async onAfterToolCall(id: string, toolCall: any, result: any): Promise<any> {
@@ -170,6 +191,9 @@ async function boot(config: any) {
   registerPersonaTools(agent, config.tools || []);
   await agent.initialize();
   // Desktop GUI (UI-TARS nut-js operator) as native TARS tools, when a screen is available.
+  for (const tool of researchTools(Tool, () => agent, { api_hosts: config.tars?.api_hosts, ucp_agent_profile: config.tars?.ucp_agent_profile })) {
+    agent.registerTool(tool);
+  }
   if (config.tars?.desktop !== false && desktopAvailable()) {
     for (const tool of desktopTools(Tool)) agent.registerTool(tool);
   }
