@@ -287,16 +287,6 @@ def grab_jpeg(
         exclude = [e for e in exclude if e.hwnd != win.hwnd]
         bbox = {"left": win.left, "top": win.top, "width": win.width, "height": win.height}
         meta.update({"hwnd": win.hwnd, "pid": win.pid, "title": win.title, **bbox})
-        # The window's OWN pixels (PrintWindow): nothing that overlaps it can leak into the card.
-        try:
-            import winhand
-            img = winhand.Win32Backend().capture(win.hwnd)
-            buf = io.BytesIO()
-            img.convert("RGB").save(buf, "JPEG", quality=quality)
-            meta.update(backend="printwindow", bytes=buf.tell())
-            return buf.getvalue(), meta
-        except Exception as exc:  # noqa: BLE001 - fall back to a screen-rect grab
-            log.debug("PrintWindow capture failed (%s); using screen rect", exc)
     elif kind == "region":
         if None in (x, y, w, h):
             raise ValueError("region requires x,y,w,h")

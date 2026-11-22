@@ -9,6 +9,7 @@ native call parser, history and lifecycle are the production implementation.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 import sys
@@ -22,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from persona.court import HandsDeck
 from persona.llm import ChatResult, ToolCall
-from persona.link import AgentProfile, Link, LinkedLane
 from persona.tars_loop import LanePlan, PLAN_NAME, PLAN_TOOL, run_tars_loop
 
 TOOL = {"type": "function", "function": {
@@ -165,7 +165,7 @@ class LoopTests(unittest.IsolatedAsyncioTestCase):
             self.fail("inference must not run without the loop")
 
         with patch.dict(os.environ, {"SAWII_NODE": "/not-installed/node"}):
-            with self.assertRaisesRegex(RuntimeError, "npm ci --prefix engine"):
+            with self.assertRaisesRegex(RuntimeError, "npm run build:tars --prefix engine"):
                 await self.run_loop(infer)
 
     async def test_inference_failure_propagates(self):
@@ -287,168 +287,43 @@ class PlanningTests(unittest.IsolatedAsyncioTestCase):
                 LanePlan([TOOL]).prepare(arguments)
 
 
-class MotorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_stop_kills_descendants_before_delayed_mutation_without_stopping_other_lane(self):
-        profile = AgentProfile(name="test", strategy="spawn")
-        link = Link(profile)
-        with tempfile.TemporaryDirectory() as directory:
-            sentinel = Path(directory) / "must-not-exist"
-            child = ("import signal,time; from pathlib import Path; "
-                     "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                     "print('ready',flush=True); time.sleep(5); "
-                     f"Path({str(sentinel)!r}).write_text('SURVIVED')")
-            parent = ("import subprocess,sys,time; "
-                      f"p=subprocess.Popen([sys.executable,'-c',{child!r}],stdout=subprocess.PIPE); "
-                      "print(p.stdout.readline().decode().strip(),flush=True); time.sleep(60)")
-            async def motor(lane, code):
-                proc = await asyncio.create_subprocess_exec(
-                    sys.executable, "-c", code, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE, start_new_session=os.name != "nt")
-                linked = LinkedLane(lane_id=lane, agent=profile, process=proc, status="active",
-                                    _process_group=os.name != "nt")
-                link._lanes[lane] = linked
-                return proc
-            a = await motor("a", parent)
-            b = await motor("b", "import time; time.sleep(60)")
-            try:
-                ready = await asyncio.wait_for(a.stdout.readline(), 10)
-                self.assertEqual(ready.strip(), b"ready")
-                await link.stop("a")
-                self.assertIsNotNone(a.returncode)
-                self.assertIsNone(b.returncode)
-                await asyncio.sleep(5.2)
-                self.assertFalse(sentinel.exists(), "a stopped lane's child performed a later write")
-                self.assertEqual(link._lanes["a"].status, "stopped")
-            finally:
-                if a.returncode is None:
-                    await link.stop("a")
-                await link.stop("b")
-
-    async def test_intentional_sigterm_remains_stopped_not_failed(self):
-        profile = AgentProfile(name="test", strategy="spawn")
-        link = Link(profile)
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, "-c", "import time; time.sleep(60)",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        linked = LinkedLane(lane_id="test", agent=profile, process=process,
-                            status="active", connected=True)
-        exits = []
-        linked.on_exit = lambda rc, error: exits.append((rc, error))
-        link._lanes[linked.lane_id] = linked
-        monitor = asyncio.create_task(link._monitor_process(linked))
-        try:
-            self.assertTrue(await link.stop(linked.lane_id))
-            await monitor
-            self.assertIsNotNone(process.returncode)
-            self.assertEqual(linked.status, "stopped")
-            self.assertEqual(linked.error, "")
-            self.assertEqual(len(exits), 1)
-            self.assertEqual(exits[0][1], "")
-        finally:
-            if process.returncode is None:
-                process.kill()
-                await process.wait()
-
-    async def test_unexpected_exit_still_reports_failure(self):
-        profile = AgentProfile(name="test", strategy="spawn")
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, "-c", "raise SystemExit(3)",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        linked = LinkedLane(lane_id="test", agent=profile, process=process, status="active")
-        await Link(profile)._monitor_process(linked)
-        self.assertEqual(linked.status, "failed")
-        self.assertIn("code 3", linked.error)
-
-
 class CourtTests(unittest.IsolatedAsyncioTestCase):
-    async def test_first_goal_on_listening_motor_starts_r_and_steering_reuses_loop(self):
-        entered, release = asyncio.Event(), asyncio.Event()
-        seen, calls, steered = [], [], []
+    """Court tests run the REAL Agent TARS engine: its own filesystem, terminal and
+    browser tools execute; only Persona's inference (the lobe) is scripted."""
 
-        async def chat(messages, **kwargs):
-            seen.append(messages)
-            if len(seen) == 1:
-                entered.set()
-                await release.wait()
-                return ChatResult("", [ToolCall("c1", "computer_click", '{"x":1}')])
-            return ChatResult("clicked with guidance")
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+        import threading
 
-        async def call(pid, name, args, **kwargs):
-            calls.append((name, args))
-            return "receipt"
+        class Page(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"<html><body><h1>COURT-PAGE-OK</h1><a href='/x'>Learn more</a></body></html>"
+                self.send_response(200)
+                self.send_header("content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(body)
 
-        async def steer(lane, goal):
-            steered.append((lane, goal))
+            def log_message(self, *a):
+                pass
 
-        hub = SimpleNamespace(_key=lambda pid, place, lane: (pid, place, lane),
-                              runners={(7, "computer", "ready"): SimpleNamespace(tools=[TOOL])},
-                              call=call, observe=lambda *args, **kw: asyncio.sleep(0))
-        link = SimpleNamespace(agent=SimpleNamespace(place="computer"), steer=steer)
-        mind = SimpleNamespace(a=SimpleNamespace(chat=chat), hands=hub,
-                               links=SimpleNamespace(get=lambda name: link), bus=None)
-        deck = HandsDeck(mind)
-        court = deck.create(7, title="already started")
-        court.lane, court.link, court.status = "ready", "hands-engine", "running"
-        self.assertEqual(court.goal, "")
-        await deck.send(7, court.id, "click once")
-        self.assertEqual(len(deck._work_tasks), 1)
-        await asyncio.wait_for(entered.wait(), 10)
-        original = next(iter(deck._work_tasks))
-        await deck.send(7, court.id, "then report briefly")
-        self.assertEqual(list(deck._work_tasks), [original], "steering must not start a second loop")
-        self.assertEqual(steered, [("ready", "then report briefly")])
-        release.set()
-        await asyncio.wait_for(original, 10)
-        self.assertEqual(court.status, "done", court.error)
-        self.assertEqual(calls, [("computer_click", {"x": 1})])
-        self.assertIn("Updated user guidance for this lane: then report briefly", str(seen[1]))
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Page)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.url = f"http://127.0.0.1:{cls.server.server_address[1]}/"
+        cls.work = tempfile.mkdtemp(prefix="hands-court-")
+        cls.env = mock.patch.dict(os.environ, {
+            "HANDS_ROOT": cls.work, "HANDS_HEADLESS": "1", "SAWII_CHROME": os.getenv("SAWII_CHROME", "/usr/bin/google-chrome"),
+            "SAWII_HANDS_APPROVE": "auto"})
+        cls.env.start()
 
-    async def test_stop_cancels_only_own_r_task_and_never_emits_failure(self):
-        stopped = asyncio.Event()
-        link = SimpleNamespace()
-        mind = SimpleNamespace(bus=None, links=SimpleNamespace(get=lambda name: link))
-        deck = HandsDeck(mind)
-        court = deck.create(7, title="cancel")
-        court.status, court.lane, court.link = "running", "r-cancel", "hands-engine"
-        court.error = "old error"
-        events = deck.subscribe(7)
+    @classmethod
+    def tearDownClass(cls):
+        cls.env.stop()
+        cls.server.shutdown()
 
-        async def wait_for_cancel():
-            try:
-                await asyncio.Future()
-            finally:
-                stopped.set()
-
-        async def stop(lane):
-            self.assertEqual(lane, "r-cancel")
-            self.assertEqual(court.status, "stopped")
-            self.assertTrue(stopped.is_set(), "R must stop before killing its motor")
-            deck._motor_died(7, court.id)(-15, "intentional SIGTERM")
-
-        link.stop = stop
-        own = asyncio.create_task(wait_for_cancel(), name=f"court-work-{court.id}")
-        other = asyncio.create_task(asyncio.sleep(10), name="court-work-other")
-        deck._work_tasks.update([own, other])
-        await asyncio.sleep(0)
-        try:
-            await deck.cancel(7, court.id)
-            self.assertTrue(own.cancelled())
-            self.assertFalse(other.done())
-            self.assertEqual(court.status, "stopped")
-            self.assertEqual(court.error, "")
-            recorded = []
-            while not events.empty():
-                recorded.append(events.get_nowait())
-            self.assertFalse(any(ev.get('status') == 'failed' for ev in recorded))
-        finally:
-            other.cancel()
-            await asyncio.gather(other, return_exceptions=True)
-
-    async def drive(self, replies, outputs=("receipt",), *, lane="r-one", image=None, l_read="",
-                    l_seen=None):
-        seen, calls, frames, records = [], [], [], []
+    async def drive(self, replies, *, kind="browser", lane="r-one", l_read="", l_seen=None, goal="work", deck_out=None):
+        seen, advertised, records = [], [], []
         scripted = iter(replies)
-        results = iter(outputs)
 
         async def chat(messages, **kwargs):
             if kwargs["tools"] is None:
@@ -458,168 +333,426 @@ class CourtTests(unittest.IsolatedAsyncioTestCase):
                 if isinstance(l_read, Exception):
                     raise l_read
                 return ChatResult(l_read)
+            advertised.append({t["function"]["name"] for t in kwargs["tools"]})
             seen.append(messages)
-            self.assertEqual(kwargs["tools"], [TOOL, PLAN_TOOL])
             return next(scripted)
 
-        async def call(pid, name, args, **kwargs):
-            self.assertEqual(kwargs["lane"], lane)
-            calls.append((pid, name, args, kwargs["lane"]))
-            return next(results)
-
-        async def observe(pid, place, **kwargs):
-            self.assertEqual(kwargs["lane"], lane)
-            frames.append(kwargs["lane"])
-            frame = {"text": f"only-{lane}"}
-            shot = image.pop(0) if isinstance(image, list) else image
-            return {**frame, "image_url": shot} if shot else frame
-
         async def append(pid, **kwargs):
-            self.assertEqual(pid, 7)
-            self.assertEqual(kwargs['task_id'], lane)
             records.append(kwargs)
 
-        hub = SimpleNamespace(_key=lambda pid, place, lane: (pid, place, lane),
-                              runners={(7, "computer", lane): SimpleNamespace(tools=[TOOL])},
-                              call=call, observe=observe)
-        mind = SimpleNamespace(a=SimpleNamespace(chat=chat), hands=hub, links=None, bus=None,
-                               shared_timeline=SimpleNamespace(append=append))
+        async def push_screen(*args, **kwargs):
+            return False   # this brain has no V feed: L reads the frame itself
+
+        mind = SimpleNamespace(a=SimpleNamespace(chat=chat, push_screen=push_screen), hands=None, links=None,
+                               bus=None, shared_timeline=SimpleNamespace(append=append))
         deck = HandsDeck(mind)
-        court = deck.create(7, title="test")
+        if deck_out is not None:
+            deck_out.append(deck)
+        court = deck.create(7, title="test", kind=kind)
         court.lane, court.status = lane, "running"
-        await deck._drive(7, court.id, lane, "click")
-        self.assertEqual([record['kind'] for record in records if record['kind'] != 'l_vision'],
-                         ['tool_call', 'tool_result'] * len(calls),
-                         "L and R must share the real call/result receipts")
-        return court, calls, seen, frames
+        await deck._drive(7, court.id, lane, goal)
+        return court, seen, advertised, records
 
-    async def test_court_executes_on_explicit_lane_and_returns_real_receipt(self):
-        court, calls, seen, frames = await self.drive([
-            ChatResult("", [ToolCall("c1", "computer_click", '{"x":1}')]), ChatResult("clicked")])
-        self.assertEqual(court.status, "done")
-        self.assertEqual(court.meta["agent_loop"], "omni-tars")
-        self.assertEqual(court.meta["result"], "clicked")
-        self.assertEqual(calls, [(7, "computer_click", {"x": 1}, "r-one")])
-        self.assertIn("only-r-one", str(seen[0]))
-        self.assertIn("receipt", str(seen[1]))
-        self.assertEqual(frames, ["r-one", "r-one"])
-
-    async def test_screen_goes_through_l_and_r_gets_ls_words_with_pixels(self):
-        l_seen, img = [], "data:image/png;base64,AAAA"
-        court, calls, seen, _ = await self.drive([
-            ChatResult("", [ToolCall("c1", "computer_click", '{"x":1}')]), ChatResult("clicked")],
-            image=img, l_read="Login form; Submit button bottom right", l_seen=l_seen)
-        self.assertEqual(court.status, "done")
-        self.assertEqual(len(l_seen), 1, "an unchanged screen reuses L's read")
-        self.assertEqual(court.meta["l_vision_reused"], 1)
-        self.assertIn(img, str(l_seen[0]))
-        self.assertIn("only-r-one", str(l_seen[0]), "L reads only its own lane")
-        for messages in seen:
-            self.assertIn("L sees: Login form; Submit button bottom right", str(messages))
-            self.assertIn(img, str(messages), "R still gets the raw pixels")
-        self.assertEqual(len(calls), 1, "L never dispatches tools")
-        self.assertIn("l_vision_ms", court.meta)
-
-    async def test_v_rereads_changed_screen_and_never_lets_l_act(self):
-        l_seen, shots = [], ["data:image/png;base64,ONE", "data:image/png;base64,TWO"]
-        court, calls, seen, _ = await self.drive([
-            ChatResult("", [ToolCall("c1", "computer_click", '{"x":1}')]), ChatResult("clicked")],
-            image=shots, l_read="screen", l_seen=l_seen)
-        self.assertEqual(court.status, "done")
-        self.assertEqual(len(l_seen), 2)
-        self.assertIn("ONE", str(l_seen[0]))
-        self.assertIn("TWO", str(l_seen[1]))
-        self.assertIn("TWO", str(seen[1]), "R gets the frame captured after its action")
-        self.assertEqual(len(calls), 1)
-
-    async def test_browser_card_drives_its_own_lane_browser_and_l_reads_it(self):
-        import dataclasses
-        from persona.gateway.browser.routes import BrowserHub
-        from persona.gateway.browser.session import DryRunSession
-        original = DryRunSession.snapshot
-
-        async def snapshot(self, **kwargs):
-            return dataclasses.replace(await original(self, **kwargs), screenshot_png=b"PNG-" + self.current_url.encode())
-
-        r_seen, l_seen, advertised = [], [], []
-        replies = iter([ChatResult("", [ToolCall("b1", "browser_navigate", '{"url":"https://example.com"}')]),
-                        ChatResult("Learn more")])
-
-        async def chat(messages, **kwargs):
-            if kwargs["tools"] is None:
-                l_seen.append(messages)
-                return ChatResult("Example Domain page with a Learn more link")
-            advertised.append([t["function"]["name"] for t in kwargs["tools"]])
-            r_seen.append(messages)
-            return next(replies)
-
-        async def append(pid, **kwargs):
-            pass
-
-        browser = BrowserHub(dry_run=True)
-        hub = SimpleNamespace(_key=lambda pid, place, lane: (pid, place, lane), runners={})
-        mind = SimpleNamespace(a=SimpleNamespace(chat=chat), hands=hub, links=None, bus=None,
-                               browser_hub=browser, shared_timeline=SimpleNamespace(append=append))
-        deck = HandsDeck(mind)
-        court = deck.create(7, title="web", kind="browser")
-        court.lane, court.status = "r-web", "running"
-        with patch.object(DryRunSession, "snapshot", snapshot):
-            await deck._drive(7, court.id, "r-web", "open example.com")
+    async def test_agent_tars_executes_real_tools_and_persona_sees_real_receipts(self):
+        target = os.path.join(self.work, "court.txt")
+        court, seen, advertised, records = await self.drive([
+            ChatResult("", [ToolCall("c1", "write_file", json.dumps({"path": target, "content": "from-tars"}))]),
+            ChatResult("", [ToolCall("c2", "run_command", json.dumps({"command": f"cat {target}"}))]),
+            ChatResult("wrote and read the file")])
         self.assertEqual(court.status, "done", court.error)
-        self.assertIn("browser_navigate", advertised[0])
-        self.assertNotIn("computer_shell", advertised[0])
-        lane_browser = browser._ones[(7, "r-web")].session
-        self.assertEqual(lane_browser.current_url, "https://example.com")
-        self.assertNotIn(7, browser._ones, "the persona's own pane browser is untouched")
-        self.assertIn("example.com", str(l_seen[0]))
-        self.assertIn("L sees: Example Domain page", str(r_seen[1]))
-        self.assertIn("persona_prepare_next_actions", str(r_seen[0]), "R is told to plan ahead")
-        deck.remove(7, court.id)
-        for _ in range(20):
-            if (7, "r-web") not in browser._ones:
-                break
-            await asyncio.sleep(0.01)
-        self.assertNotIn((7, "r-web"), browser._ones, "removing the card closes its lane browser")
-        await browser.shutdown()
+        self.assertEqual(court.meta["agent_loop"], "agent-tars")
+        self.assertEqual(open(target).read(), "from-tars", "Agent TARS itself wrote the file")
+        self.assertIn("from-tars", str(seen[2]), "the terminal receipt reached Persona's next decision")
+        # TARS's own tool catalog is what the lobe is offered (browser, files, terminal, search).
+        self.assertTrue({"write_file", "run_command", "browser_navigate", "browser_get_markdown",
+                         "persona_prepare_next_actions"} <= advertised[0])
+        self.assertEqual([r["kind"] for r in records if r["kind"] in ("tool_call", "tool_result")],
+                         ["tool_call", "tool_result"] * 2, "L and R share the real call/result receipts")
 
-    async def test_l_vision_failure_falls_back_to_raw_frame(self):
-        l_seen, img = [], "data:image/png;base64,BBBB"
-        court, _, seen, _ = await self.drive([ChatResult("nothing to do")], image=img,
-                                             l_read=RuntimeError("L down"), l_seen=l_seen)
-        self.assertEqual(court.status, "done")
-        self.assertIn(img, str(seen[0]))
-        self.assertNotIn("L sees:", str(seen[0]))
-        self.assertIn("L down", court.meta["l_vision_error"])
+    async def test_dom_browser_runs_inside_agent_tars_and_card_frame_comes_from_it(self):
+        l_seen = []
+        court, seen, _, _ = await self.drive([
+            ChatResult("", [ToolCall("b1", "browser_navigate", json.dumps({"url": self.url}))]),
+            ChatResult("", [ToolCall("b2", "browser_get_markdown", "{}")]),
+            ChatResult("saw the page")], l_read="Page titled COURT-PAGE-OK", l_seen=l_seen)
+        self.assertEqual(court.status, "done", court.error)
+        self.assertIn("COURT-PAGE-OK", str(seen[2]), "DOM markdown extraction by TARS reached Persona")
+        self.assertTrue(l_seen, "the card's frame (a TARS screenshot) was read by L/V")
+        self.assertIn("data:image/png;base64,", str(l_seen[0]))
 
-    async def test_dead_hand_cannot_be_hidden_by_final_answer(self):
+    async def test_tool_error_receipt_fails_the_card_and_recovery_clears_it(self):
+        missing = os.path.join(self.work, "nope", "missing.txt")
         court, _, _, _ = await self.drive([
-            ChatResult("", [ToolCall("c1", "computer_click", "{}")]), ChatResult("could not click")],
-            outputs=('{"error":"hand disconnected"}',))
-        self.assertEqual(court.status, "failed")
-        self.assertIn("hand disconnected", court.error)
-
-    async def test_successful_recovery_clears_tool_error(self):
-        court, calls, _, _ = await self.drive([
-            ChatResult("", [ToolCall("c1", "computer_click", "{}")]),
-            ChatResult("", [ToolCall("c2", "computer_click", "{}")]), ChatResult("recovered")],
-            outputs=('{"error":"temporary"}', "receipt"))
-        self.assertEqual(court.status, "done")
-        self.assertEqual(len(calls), 2)
+            ChatResult("", [ToolCall("c1", "read_file", json.dumps({"path": missing}))]),
+            ChatResult("could not read it")])
+        self.assertEqual(court.status, "failed", "a failed tool cannot be hidden by a polite final answer")
+        good = os.path.join(self.work, "ok.txt")
+        court, _, _, _ = await self.drive([
+            ChatResult("", [ToolCall("c1", "read_file", json.dumps({"path": missing}))]),
+            ChatResult("", [ToolCall("c2", "write_file", json.dumps({"path": good, "content": "x"}))]),
+            ChatResult("recovered")])
+        self.assertEqual(court.status, "done", court.error)
 
     async def test_unknown_tool_and_malformed_arguments_fail_before_dispatch(self):
-        for name, args in [("unadvertised", "{}"), ("computer_click", "[]"), ("computer_click", "bad")]:
+        for name, args in [("unadvertised", "{}"), ("write_file", "[]"), ("write_file", "bad")]:
             with self.subTest(name=name, args=args):
-                court, calls, _, _ = await self.drive([ChatResult("", [ToolCall("c1", name, args)])])
+                court, _, _, _ = await self.drive([ChatResult("", [ToolCall("c1", name, args)])])
                 self.assertEqual(court.status, "failed")
-                self.assertEqual(calls, [])
+
+    async def test_person_can_decline_an_action_and_agent_tars_does_not_run_it(self):
+        target = os.path.join(self.work, "declined.txt")
+        decks = []
+        with mock.patch.dict(os.environ, {"SAWII_HANDS_APPROVE": "ask"}):
+            task = asyncio.create_task(self.drive([
+                ChatResult("", [ToolCall("c1", "write_file", json.dumps({"path": target, "content": "no"}))]),
+                ChatResult("it was declined")], deck_out=decks))
+            for _ in range(1200):
+                await asyncio.sleep(0.05)
+                if decks and decks[0]._approvals:
+                    break
+            self.assertTrue(decks and decks[0]._approvals, "the card must be waiting for the person")
+            cid = next(iter(decks[0]._approvals))
+            self.assertEqual(decks[0].get(7, cid).status, "waiting")
+            self.assertTrue(decks[0].resolve_approval(7, cid, False, "not now"))
+            await task
+        self.assertFalse(os.path.exists(target), "a declined action must never execute")
 
     async def test_two_courts_never_cross_lanes(self):
         results = await asyncio.gather(*[
-            self.drive([ChatResult("", [ToolCall("c1", "computer_click", "{}")]),
+            self.drive([ChatResult("", [ToolCall("c1", "list_directory", json.dumps({"path": self.work}))]),
                         ChatResult("done")], lane=lane)
             for lane in ["r-one", "r-two"]])
-        self.assertEqual([result[0].status for result in results], ["done", "done"])
-        self.assertEqual([result[1][0][-1] for result in results], ["r-one", "r-two"])
+        self.assertEqual([r[0].status for r in results], ["done", "done"])
+        for r, lane in zip(results, ["r-one", "r-two"]):
+            self.assertTrue(all(rec["task_id"] == lane for rec in r[3] if rec["kind"] in ("tool_call", "tool_result")))
+
+
+PAGE = ("data:text/html,<title>Form</title><h1>Sign</h1><input id=n placeholder=name>"
+        "<button onclick=\"document.title='Hello '+document.getElementById('n').value\">Go</button>")
+
+
+class HubTests(unittest.IsolatedAsyncioTestCase):
+    """Persona's browser hub is Agent TARS: real Chrome, real TARS tools, no other browser stack."""
+
+    async def asyncSetUp(self):
+        from persona.gateway.browser.routes import BrowserHub
+        self.hub = BrowserHub()
+
+    async def asyncTearDown(self):
+        await self.hub.shutdown()
+
+    async def test_hub_drives_real_browser_through_tars_tools(self):
+        await self.hub.run(1, "browser_navigate", {"url": PAGE})
+        snap = json.loads(await self.hub.run(1, "browser_snapshot", {}))
+        self.assertEqual(snap["title"], "Form")
+        self.assertEqual([e["tag"] for e in snap["elements"]], ["input", "button"])
+        await self.hub.run(1, "browser_type", {"index": 0, "text": "Anas"})
+        await self.hub.run(1, "browser_click", {"index": 1})
+        self.assertEqual(json.loads(await self.hub.run(1, "browser_snapshot", {}))["title"], "Hello Anas")
+
+    async def test_tars_loop_runs_on_the_hubs_engine(self):
+        from persona.gateway.browser.tasks import BrowserTasks
+        steps = [
+            ("browser_navigate", {"url": PAGE}),
+            ("browser_get_markdown", {}),  # let the page settle, as a model reading the page would
+            ("browser_get_clickable_elements", {}),
+            ("browser_form_input_fill", {"index": 0, "value": "Loop"}),
+            ("browser_click", {"index": 1}),
+        ]
+        seen_tools, position, attempts = [], [0], [0]
+
+        async def infer(messages, tools):
+            # A model reads the last receipt and retries a failed step: so does this one.
+            seen_tools.append({t["function"]["name"] for t in tools}); tool_msgs = [m for m in messages if m.get("role") == "tool"]
+            last = str(tool_msgs[-1].get("content", "")) if tool_msgs else ""
+            if "Failed" in last[:80] and attempts[0] < 5:
+                attempts[0] += 1
+                await asyncio.sleep(0.5)
+            elif seen_tools[1:]:
+                position[0] += 1
+            if position[0] >= len(steps):
+                return {"text": "opened the form and said hello", "tool_calls": [], "finish_reason": "stop"}
+            name, args = steps[position[0]]
+            return {"text": "", "tool_calls": [{"id": f"c{len(seen_tools)}", "name": name, "arguments": args}],
+                    "finish_reason": "stop"}
+        published = []
+        mind = SimpleNamespace(bus=SimpleNamespace(publish=lambda pid, ev: published.append(ev)), a=None)
+        tasks = self.hub.tasks = BrowserTasks(self.hub, mind, infer_factory=infer)
+        receipts = []
+
+        async def on_receipt(name, args, result):
+            receipts.append((name, str(result)[:100]))
+        tasks.on_receipt = on_receipt
+        tasks.start(1, "open the form and say hello")
+        await asyncio.wait_for(tasks.jobs[1]["task"], 120)
+        self.assertEqual(tasks.status(1)["state"], "finished", tasks.status(1))
+        self.assertIn("browser_vision_control", seen_tools[0])  # the full TARS tool set, vision included
+        # The loop and the hub share ONE browser: the hub sees what the TARS loop did.
+        snap = json.loads(await self.hub.run(1, "browser_snapshot", {}))
+        self.assertEqual(snap["title"], "Hello Loop", receipts)
+
+
+class DesktopTests(unittest.IsolatedAsyncioTestCase):
+    """The desktop GUI operator (UI-TARS nut-js) as native TARS tools, on a real X display."""
+
+    async def asyncSetUp(self):
+        import shutil, subprocess
+        if not shutil.which("Xvfb"):
+            self.skipTest("Xvfb not installed")
+        try:
+            import Xlib  # noqa: F401
+        except ImportError:
+            self.skipTest("python-xlib not installed")
+        self.display = ":71"
+        self.xvfb = subprocess.Popen(["Xvfb", self.display, "-screen", "0", "1280x800x24"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await asyncio.sleep(1.5)
+        env = {**os.environ, "DISPLAY": self.display}
+        self.app = subprocess.Popen([sys.executable, str(Path(__file__).parent / "x11_testapp.py"), "Counter"],
+                                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await asyncio.sleep(1.0)
+        self._old = os.environ.get("DISPLAY")
+        os.environ["DISPLAY"] = self.display
+        from persona.tars_engine import TarsEngine
+        self.engine = await TarsEngine(workspace=tempfile.mkdtemp()).start()
+
+    async def asyncTearDown(self):
+        if getattr(self, "engine", None):
+            await self.engine.close()
+        for p in (getattr(self, "app", None), getattr(self, "xvfb", None)):
+            if p:
+                p.kill()
+        if getattr(self, "_old", None) is None:
+            os.environ.pop("DISPLAY", None)
+        else:
+            os.environ["DISPLAY"] = self._old
+
+    async def _frame(self) -> bytes:
+        info = json.loads(await self.engine.call("desktop_screenshot", {}))
+        with open(info["filepath"], "rb") as fh:
+            data = fh.read()
+        os.unlink(info["filepath"])
+        return data
+
+    async def test_desktop_tools_are_native_tars_tools(self):
+        self.assertIn("desktop_vision_control", self.engine.tools)
+        self.assertIn("browser_vision_control", self.engine.tools)
+
+    async def test_click_and_type_in_a_real_x11_app(self):
+        before = await self._frame()
+        # Control: a click on the empty desktop changes nothing, so a changed frame below is the app's doing.
+        await self.engine.call("desktop_vision_control", {"action": "click(start_box='(900,900)')"})
+        await asyncio.sleep(0.4)
+        self.assertEqual(before, await self._frame())
+        # Window sits at (20,20) 420x260 on a 1280x800 screen: click its middle on the 0-1000 grid.
+        out = await self.engine.call("desktop_vision_control", {
+            "thought": "click the counter", "action": "click(start_box='(164,162)')"})
+        self.assertIn('"status":"success"', out)
+        await asyncio.sleep(0.5)
+        after_click = await self._frame()
+        self.assertNotEqual(before, after_click, "the click must change the app's pixels (clicks=1)")
+        out = await self.engine.call("desktop_vision_control", {"thought": "type", "action": "type(content='hi')"})
+        self.assertIn('"status":"success"', out)
+        await asyncio.sleep(0.5)
+        self.assertNotEqual(after_click, await self._frame(), "typing must change the app's pixels")
+
+
+BIG = ("data:text/html,<title>v0</title><button style='position:absolute;left:100px;top:100px;"
+       "width:200px;height:100px' onclick=\"document.title='clicked'\">Big</button>"
+       "<input id=t style='position:absolute;left:100px;top:300px' placeholder=x>")
+
+
+class ModeTests(unittest.IsolatedAsyncioTestCase):
+    """Every TARS execution mode, each on its own and then together, through the real engine."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.loop = asyncio.new_event_loop()
+        from persona.tars_engine import TarsEngine
+        cls.work = tempfile.mkdtemp()
+        cls.engine = cls.loop.run_until_complete(TarsEngine(workspace=cls.work, tars={"mcp_servers": {
+            "fixture": {"command": sys.executable, "args": [str(Path(__file__).parent / "mcp_fixture_server.py")]}}}).start())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.loop.run_until_complete(cls.engine.close())
+        cls.loop.close()
+
+    def run_(self, name, args=None):
+        return self.loop.run_until_complete(self.engine.call(name, args or {}))
+
+    def title(self):
+        return json.loads(self.run_("browser_tab_list"))[0]["text"].split("Current Tab: [0] ")[1].split("\n")[0]
+
+    def test_dom(self):
+        self.run_("browser_navigate", {"url": BIG})
+        self.run_("browser_get_clickable_elements")
+        self.run_("browser_click", {"index": 0})
+        self.assertEqual(self.title(), "clicked")
+
+    def test_visual(self):
+        self.run_("browser_navigate", {"url": BIG})
+        out = self.run_("browser_vision_control", {"thought": "t", "step": "s",
+                                                   "action": "click(point='<point>200 150</point>')"})
+        self.assertIn('"success":true', out)
+        self.assertEqual(self.title(), "clicked")
+
+    def test_hybrid_visual_then_dom_on_one_page(self):
+        self.run_("browser_navigate", {"url": BIG})
+        self.run_("browser_vision_control", {"thought": "t", "step": "s", "action": "click(point='<point>200 150</point>')"})
+        self.assertEqual(self.title(), "clicked")
+        self.run_("browser_get_clickable_elements")
+        self.run_("browser_form_input_fill", {"index": 1, "value": "dom"})
+        value = self.run_("browser_evaluate", {"script": "document.getElementById('t').value"})
+        self.assertIn("dom", value)
+
+    def test_terminal_and_filesystem(self):
+        self.run_("write_file", {"path": os.path.join(self.work, "n.txt"), "content": "tars"})
+        self.assertIn("tars", self.run_("read_file", {"path": os.path.join(self.work, "n.txt")}))
+        out = self.run_("run_command", {"command": "cat n.txt", "cwd": self.work})
+        self.assertIn("tars", out)
+        denied = self.run_("read_file", {"path": "/etc/hostname"})
+        self.assertIn("outside allowed", denied)
+
+    def test_mcp_server_tool(self):
+        self.assertIn("shout", self.engine.tools)
+        self.assertIn("HELLO", self.run_("shout", {"text": "hello"}))
+
+
+class ResearchTests(unittest.TestCase):
+    """API-first execution surfaces added to TARS as native tools, against a local site that
+    really serves UCP, OpenAPI, GraphQL, an authorized endpoint, WebMCP and an accessible form."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(Path(__file__).parent))
+        from web_fixture_server import serve
+        cls.server, cls.site = serve()
+        host = cls.site.split("//")[1]
+        cls.loop = asyncio.new_event_loop()
+        from persona.tars_engine import TarsEngine
+        cls.engine = cls.loop.run_until_complete(TarsEngine(workspace=tempfile.mkdtemp(), tars={
+            "api_hosts": {host: {"headers": {"authorization": "Bearer sekrit"}}},
+            "ucp_agent_profile": "https://agent.example/profiles/sawii.json"}).start())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.loop.run_until_complete(cls.engine.close())
+        cls.loop.close()
+        cls.server.shutdown()
+
+    def call(self, name, args=None):
+        raw = self.loop.run_until_complete(self.engine.call(name, args or {}))
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return raw
+
+    def test_tools_are_native_tars_tools(self):
+        for name in ("api_request", "openapi_discover", "openapi_call", "graphql_query", "ucp_discover", "ucp_call",
+                     "webmcp_list_tools", "webmcp_call_tool", "browser_accessibility_snapshot", "web_plan"):
+            self.assertIn(name, self.engine.tools)
+
+    def test_rest_is_authorized_by_config_not_by_the_model(self):
+        ok = self.call("api_request", {"method": "GET", "url": self.site + "/secure"})
+        self.assertEqual((ok["status"], ok["body"]), (200, {"secret": 42}))
+        refused = self.call("api_request", {"method": "GET", "url": "http://127.0.0.1:9/x"})
+        self.assertEqual(refused["status"], "error")
+        self.assertIn("not an authorized API host", refused["message"])
+
+    def test_openapi_discover_and_call(self):
+        found = self.call("openapi_discover", {"spec_url": self.site + "/openapi.json"})
+        self.assertEqual({o["operationId"] for o in found["operations"]}, {"listItems", "createItem", "getItem"})
+        item = self.call("openapi_call", {"spec_url": self.site + "/openapi.json", "operation_id": "getItem", "path_params": {"id": 1}})
+        self.assertEqual(item["body"], {"id": 1, "name": "tea"})
+
+    def test_graphql(self):
+        listed = self.call("graphql_query", {"endpoint": self.site + "/graphql", "query": "{ items { id name } }"})
+        self.assertEqual(listed["status"], "success")
+        self.assertEqual(listed["body"]["data"]["items"][0]["name"], "tea")
+
+    def test_ucp_profile_and_checkout(self):
+        profile = self.call("ucp_discover", {"origin": self.site})
+        self.assertEqual(profile["status"], "success")
+        self.assertEqual(profile["services"][0]["transport"], "rest")
+        self.assertIn("dev.ucp.shopping.checkout", profile["capabilities"])
+        session = self.call("ucp_call", {"origin": self.site, "method": "POST", "path": "/checkout-sessions",
+                                         "body": {"line_items": [{"sku": "tea", "qty": 2}]}})
+        self.assertEqual(session["status"], 201)
+        self.assertIn("agent.example/profiles/sawii.json", session["body"]["agent"])
+
+    def test_webmcp_tools_run_in_the_page(self):
+        self.call("browser_navigate", {"url": self.site + "/webmcp"})
+        listed = self.call("webmcp_list_tools")
+        self.assertEqual([t["name"] for t in listed["tools"]], ["add-todo"])
+        self.assertEqual(self.call("webmcp_call_tool", {"name": "add-todo", "input": {"text": "buy tea"}})["status"], "success")
+        dom = self.call("browser_evaluate", {"script": "document.getElementById('list').innerText"})
+        self.assertIn("buy tea", str(dom))
+
+    def test_accessibility_tree_interaction(self):
+        self.call("browser_navigate", {"url": self.site + "/a11y"})
+        tree = self.call("browser_accessibility_snapshot")["tree"]
+        self.assertIn('button "Save profile"', tree)
+        self.call("browser_accessibility_fill", {"role": "textbox", "name": "Full name", "value": "Anas"})
+        self.call("browser_accessibility_click", {"role": "button", "name": "Save profile"})
+        self.assertIn("Saved Anas", str(self.call("browser_evaluate", {"script": "document.title"})))
+
+    def test_web_plan_prefers_structured_surfaces_then_falls_back(self):
+        rich = self.call("web_plan", {"url": self.site + "/webmcp", "goal": "add a todo"})
+        names = [s["surface"] for s in rich["surfaces"]]
+        self.assertEqual(rich["recommended"], "ucp")
+        self.assertEqual(names[:5], ["ucp", "webmcp", "openapi", "graphql", "dom"])
+
+
+class CollaborationTests(unittest.IsolatedAsyncioTestCase):
+    """Collaborative Hands, executed by Agent TARS: several hands share one tab and one mind
+    (their page actions stay ordered, their reads overlap), and separate lanes browse at once."""
+
+    async def asyncSetUp(self):
+        from persona.gateway.browser.routes import BrowserHub
+        sys.path.insert(0, str(Path(__file__).parent))
+        from web_fixture_server import serve
+        self.server, self.site = serve()
+        self.hub = BrowserHub()
+
+    async def asyncTearDown(self):
+        await self.hub.shutdown()
+        self.server.shutdown()
+
+    async def test_two_hands_share_one_tab_on_tars(self):
+        from persona import shared_mind
+        from persona.court import tars_page_tools
+        from persona.gateway.browser.session import read_page
+        one = await self.hub._get((1, "R1"))
+        evaluate, find, press_enter = tars_page_tools(one.session.engine)
+
+        async def run_tool(name, args):
+            return str(await self.hub.run(1, name, args, lane="R1"))
+
+        async def read():
+            return await read_page(one.session, screenshot=False)
+        tab = shared_mind.TabHands(run_tool, read, find, press_enter, evaluate)
+        await tab.act("goto", {"url": self.site + "/shared"})
+        # Hand 1 reads while hand 2 and hand 3 act; the tab's lock orders the page changes.
+        hits, a, b = await asyncio.gather(
+            tab.act("find", {"text": "1889"}),
+            tab.act("click", {"id": 0}),
+            tab.act("click", {"id": 1}))
+        self.assertIn("1889", hits)
+        self.assertNotIn("error", a.lower()[:20])
+        self.assertNotIn("error", b.lower()[:20])
+        texts = await evaluate("[...document.querySelectorAll('button')].map(b => b.textContent)")
+        self.assertEqual(texts, ["A done", "B done"])
+
+    async def test_separate_lanes_browse_at_the_same_time(self):
+        pages = {"R1": self.site + "/one", "R2": self.site + "/two"}
+
+        async def hand(lane):
+            await self.hub.run(1, "browser_navigate", {"url": pages[lane]}, lane=lane)
+            return json.loads(await self.hub.run(1, "browser_snapshot", {}, lane=lane))["title"]
+        self.assertEqual(await asyncio.gather(hand("R1"), hand("R2")), ["one", "two"])
+        await self.hub.close_lane(1, "R1")
+        await self.hub.close_lane(1, "R2")
 
 
 if __name__ == "__main__":

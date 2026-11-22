@@ -16,7 +16,7 @@ for p in psutil.process_iter(["pid", "cmdline"]):
         cmd = " ".join(p.info.get("cmdline") or [])
     except Exception:  # noqa: BLE001
         continue
-    if NEEDLE in cmd and ("stitch.py" in cmd or "sawii_hands.py" in cmd):
+    if NEEDLE in cmd and ("stitch.py" in cmd or "persona-loop.ts" in cmd):
         me.add(p)
 
 if "--dry" in sys.argv:

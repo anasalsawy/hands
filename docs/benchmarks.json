@@ -1,0 +1,100 @@
+{
+ "dom (navigate+map+click)": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 134,
+  "p95_ms": 149,
+  "min_ms": 115
+ },
+ "visual (vision click)": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 1833,
+  "p95_ms": 1845,
+  "min_ms": 1812
+ },
+ "hybrid (visual then DOM)": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 1870,
+  "p95_ms": 1886,
+  "min_ms": 1843
+ },
+ "terminal (run_command)": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 4,
+  "p95_ms": 4,
+  "min_ms": 3
+ },
+ "filesystem (write+read)": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 2,
+  "p95_ms": 19,
+  "min_ms": 1
+ },
+ "mcp (stdio server tool)": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 0,
+  "p95_ms": 1,
+  "min_ms": 0
+ },
+ "surface: WebMCP tool": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 121,
+  "p95_ms": 151,
+  "min_ms": 112
+ },
+ "surface: accessibility tree": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 238,
+  "p95_ms": 283,
+  "min_ms": 217
+ },
+ "surface: REST": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 2,
+  "p95_ms": 5,
+  "min_ms": 2
+ },
+ "surface: GraphQL": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 2,
+  "p95_ms": 3,
+  "min_ms": 1
+ },
+ "surface: OpenAPI operation": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 2,
+  "p95_ms": 2,
+  "min_ms": 2
+ },
+ "surface: UCP checkout": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 2,
+  "p95_ms": 3,
+  "min_ms": 2
+ },
+ "planner (web_plan)": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 4,
+  "p95_ms": 5,
+  "min_ms": 3
+ },
+ "desktop (nut-js click)": {
+  "runs": 10,
+  "success": 10,
+  "median_ms": 287,
+  "p95_ms": 324,
+  "min_ms": 277
+ }
+}

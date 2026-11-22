@@ -19,6 +19,7 @@ import json
 from typing import TYPE_CHECKING
 
 from .session import read_page
+from ...kernel.screen_plan import ground_index
 
 if TYPE_CHECKING:
     from .session import BrowserSessionProto

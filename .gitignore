@@ -2,9 +2,7 @@
 __pycache__/
 *.pyc
 *.egg-info/
-vendor/persona-lanes/build/
 node_modules/
-.browser-use-sdk/
 
 # Runtime data and databases
 data/
@@ -24,3 +22,4 @@ Thumbs.db
 dist-release/
 build-portable/
 build-windows/
+engine/images/

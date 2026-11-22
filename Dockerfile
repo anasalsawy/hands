@@ -8,22 +8,21 @@ RUN npm run build --prefix desktop
 
 FROM node:22-bookworm-slim AS engine
 WORKDIR /src
-COPY engine/package.json engine/package-lock.json engine/
-RUN npm ci --prefix engine
+COPY engine engine
+RUN npm ci --prefix engine && npm run build:tars --prefix engine
 
 FROM python:3.12-slim-bookworm
-ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 HANDS_CLOUD=1 HANDS_DATA_DIR=/data HANDS_SUPERVISED=0
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 HANDS_CLOUD=1 HANDS_DATA_DIR=/data HANDS_SUPERVISED=0 SAWII_CHROME=/usr/bin/chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git ca-certificates chromium fonts-liberation fonts-noto-color-emoji curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=engine /usr/local/bin/node /usr/local/bin/node
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install -r requirements.txt && pip install playwright
+RUN pip install -r requirements.txt
 COPY . .
-COPY --from=engine /src/engine/node_modules engine/node_modules
+COPY --from=engine /src/engine engine
 COPY --from=ui /src/desktop/dist ui
-RUN python scripts/install_browser_sdk.py || echo "browser SDK not installed: Browser cards will be unavailable"
 RUN useradd -m -u 1000 hands && mkdir -p /data && chown -R hands /data /app
 USER hands
 EXPOSE 8800

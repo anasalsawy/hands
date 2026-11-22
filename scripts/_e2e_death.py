@@ -60,7 +60,7 @@ for _ in range(10):
 me = psutil.Process()
 victims = [p for p in psutil.process_iter(["pid", "cmdline"])
            if f"--lane {lane}" in " ".join(p.info.get("cmdline") or [])
-           and "sawii_hands.py" in " ".join(p.info.get("cmdline") or [])]
+           and "persona-loop.ts" in " ".join(p.info.get("cmdline") or [])]
 print("engine for this lane:", [v.pid for v in victims])
 if not victims:
     print("NOT HONEST: no engine was ever started for this lane")

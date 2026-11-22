@@ -93,31 +93,20 @@ def apply_brain_env(cfg: dict) -> bool:
     return True
 
 
-def computer_use_ready() -> bool:
-    """Screen/mouse/keyboard tools come from the open-computer-use npm server."""
-    return bool(os.environ.get("SAWII_OCU_COMMAND") or shutil.which("open-computer-use")
-                or shutil.which("open-computer-use.cmd"))
+def engine_ready() -> bool:
+    """The Agent TARS engine: Node 22+, the loop's dependencies and the built TARS core."""
+    return ((shutil.which("node") or shutil.which("node.exe")) is not None
+            and (ROOT / "engine" / "node_modules").exists()
+            and (ROOT / "engine/ui-tars-desktop/multimodal/agent-tars/core/dist/index.js").exists())
 
 
 def missing_parts() -> list[str]:
     """What the cards need that this machine does not have yet (shown in the UI)."""
     out = []
-    if CLOUD:
-        if not (shutil.which("node") or shutil.which("node.exe")) or not (ROOT / "engine" / "node_modules").exists():
-            out.append("Omni-TARS loop (Node 22 + engine dependencies)")
-        return out
     if not (shutil.which("node") or shutil.which("node.exe")):
-        out.append("Node.js 22+ (runs the Omni-TARS loop)")
-    elif not (ROOT / "engine" / "node_modules").exists():
-        out.append("engine dependencies (npm ci --prefix engine)")
-    if not computer_use_ready():
-        out.append("screen/mouse/keyboard helper (npm install -g open-computer-use)")
-    try:
-        import importlib.util
-        if importlib.util.find_spec("browser_use") is None:
-            out.append("browser SDK for Browser cards (python scripts/install_browser_sdk.py)")
-    except Exception:  # noqa: BLE001
-        pass
+        out.append("Node.js 22+ (runs the Agent TARS engine)")
+    elif not (ROOT / "engine" / "node_modules").exists() or not engine_ready():
+        out.append("Agent TARS engine (npm ci --prefix engine && npm run build:tars --prefix engine)")
     return out
 
 
@@ -139,7 +128,7 @@ def _loopback(request) -> bool:
 
 
 # ---------------------------------------------------------------------- routes
-def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int, roots, approve, ui_dir):
+def build_routes(*, app, rt, settings, persona_key, persona_id, links=None, port: int, roots, approve, ui_dir):
     from starlette.responses import FileResponse, JSONResponse, RedirectResponse
     from starlette.routing import Mount, Route
     from starlette.staticfiles import StaticFiles
@@ -175,7 +164,7 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
             "port": port,
             "lan": bool(cfg.get("lan")),
             "cloud": CLOUD,
-            "computer_use": computer_use_ready(),
+            "engine": "agent-tars", "engine_ready": engine_ready(),
             "missing": missing_parts(),
         })
 
@@ -303,14 +292,6 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
             out["tools"] = {"supported": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
         return JSONResponse(out)
 
-    async def lane_windows(request):
-        """Which window each lane owns, so a card can show exactly that window."""
-        auth = (request.headers.get("authorization") or "")[7:].strip()
-        if auth != persona_key and not owner(request):
-            return deny()
-        import winhand
-        return JSONResponse({"lanes": winhand.LaneWindows().all()})
-
     ws_root = Path(roots[0]).expanduser().resolve() if roots else Path.cwd()
     SKIP = {".git", "node_modules", "__pycache__", ".cache", ".venv"}
 
@@ -370,7 +351,6 @@ def build_routes(*, app, rt, settings, persona_key, persona_id, links, port: int
         Route("/hands/pair-info", pair_info, methods=["GET"]),
         Route("/hands/pair", pair_claim, methods=["POST"]),
         Route("/hands/brain-check", brain_check, methods=["POST"]),
-        Route("/hands/lane-windows", lane_windows, methods=["GET"]),
         Route("/hands/workspace", ws_tree, methods=["GET"]),
         Route("/hands/workspace/file", ws_file, methods=["GET"]),
         Route("/", index, methods=["GET"]),
@@ -480,8 +460,6 @@ def main() -> None:
     roots = [str(Path(r).expanduser()) for r in roots]
     approve = a.approve or cfg.get("approve") or "auto"
     has_brain = apply_brain_env(cfg)
-    if computer_use_ready() and not CLOUD:
-        os.environ.setdefault("SAWII_HANDS_COMPUTER_USE", "1")
 
     ui_dir = a.ui_dir or next((str(p) for p in (ROOT / "ui", ROOT / "desktop" / "dist") if (p / "index.html").exists()),
                               str(ROOT / "ui"))
