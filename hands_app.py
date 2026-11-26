@@ -31,7 +31,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-DEFAULT_BRAIN_URL = "https://anasalsawy--persona-crossing-personacrossing-web.us-east.modal.run/v1"
+DEFAULT_BRAIN_URL = "https://dl-companion-production.up.railway.app/v1"
 DEFAULT_MODEL = "persona-l"
 CLOUD = os.environ.get("HANDS_CLOUD") == "1"   # hosted: no computer, a sandbox workspace
 ACCESS_KEY = ""                                   # cloud login secret (set in main)
