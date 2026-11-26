@@ -62,10 +62,8 @@ export function frameBlob(data: Record<string, unknown>): Blob | null {
 export function paintBitmap(canvas: HTMLCanvasElement, bitmap: ImageBitmap) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  const scale = Math.min(canvas.width / bitmap.width, canvas.height / bitmap.height);
-  const dw = Math.round(bitmap.width * scale);
-  const dh = Math.round(bitmap.height * scale);
-  ctx.drawImage(bitmap, (canvas.width - dw) / 2, (canvas.height - dh) / 2, dw, dh);
+  // Keep the captured pixel dimensions; CSS handles fitting the view.
+  if (canvas.width !== bitmap.width) canvas.width = bitmap.width;
+  if (canvas.height !== bitmap.height) canvas.height = bitmap.height;
+  ctx.drawImage(bitmap, 0, 0);
 }
