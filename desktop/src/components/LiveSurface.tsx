@@ -34,19 +34,15 @@ export function LiveSurface({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [state, setState] = useState<StreamState>("probing");
   const [note, setNote] = useState("connecting");
-  const [frames, setFrames] = useState(0);
 
   useEffect(() => {
     let alive = true;
     let gotFrame = false;
     let sock: WebSocket | null = null;
     let timer = 0;
-    let count = 0;
-    let lastUpdate = 0;
     let failureNote = "";
     setState("probing");
     setNote("connecting");
-    setFrames(0);
 
     const paintPlaceholder = (message: string) => {
       if (!alive) return;
@@ -67,12 +63,6 @@ export function LiveSurface({
         window.clearTimeout(timer);
         setState("live");
         setNote("live capture");
-        count += 1;
-        const now = performance.now();
-        if (count === 1 || now - lastUpdate >= 1000) {
-          lastUpdate = now;
-          setFrames(count);
-        }
       },
       onError: () => {
         failureNote = "invalid capture frame";
@@ -186,7 +176,6 @@ export function LiveSurface({
     <div className="screen">
       <canvas ref={canvasRef} width={960} height={540} aria-label={`live ${kind} surface`} />
       {state !== "live" && <div className="screen-note">{note}</div>}
-      {state === "live" && <div className="screen-note">{frames} frames · {target.kind}</div>}
     </div>
   );
 }
